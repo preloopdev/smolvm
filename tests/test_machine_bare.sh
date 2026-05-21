@@ -748,4 +748,61 @@ run_test "Shell: machine shell opens interactive shell" test_machine_shell || tr
 run_test "Exec: large stdout does not crash VM (bare)" test_exec_large_stdout_does_not_crash_vm || true
 run_test "Docker-in-VM: overlay2 + bridge networking + build + restart persistence" test_docker_in_vm || true
 
+# =============================================================================
+# Exec stdin null — stdin-blocking commands exit cleanly
+# =============================================================================
+
+_EXEC_STDIN_MACHINE="exec-stdin-$$"
+
+test_exec_cat_no_interactive() {
+    "$SMOLVM" machine stop --name "$_EXEC_STDIN_MACHINE" 2>/dev/null || true
+    "$SMOLVM" machine delete "$_EXEC_STDIN_MACHINE" -f 2>/dev/null || true
+    "$SMOLVM" machine create "$_EXEC_STDIN_MACHINE" 2>/dev/null || return 1
+    "$SMOLVM" machine start --name "$_EXEC_STDIN_MACHINE" 2>/dev/null || return 1
+
+    local out exit_code=0
+    out=$(run_with_timeout 10 "$SMOLVM" machine exec --name "$_EXEC_STDIN_MACHINE" -- cat 2>&1) \
+        || exit_code=$?
+
+    "$SMOLVM" machine stop --name "$_EXEC_STDIN_MACHINE" 2>/dev/null || true
+    "$SMOLVM" machine delete "$_EXEC_STDIN_MACHINE" -f 2>/dev/null || true
+
+    if echo "$out" | grep -qi "connection closed"; then
+        echo "FAIL: got 'connection closed'"
+        return 1
+    fi
+    [[ $exit_code -eq 0 ]] || { echo "FAIL: exit $exit_code (expected 0)"; return 1; }
+}
+
+run_test "Exec: 'exec -- cat' exits cleanly with null stdin" test_exec_cat_no_interactive || true
+
+# =============================================================================
+# Named machine survives observer Drop
+# =============================================================================
+
+_DROP_MACHINE="drop-safe-$$"
+
+test_machine_survives_rapid_exec() {
+    "$SMOLVM" machine stop --name "$_DROP_MACHINE" 2>/dev/null || true
+    "$SMOLVM" machine delete "$_DROP_MACHINE" -f 2>/dev/null || true
+    "$SMOLVM" machine create "$_DROP_MACHINE" 2>/dev/null || return 1
+    "$SMOLVM" machine start --name "$_DROP_MACHINE" 2>/dev/null || return 1
+
+    local i
+    for i in 1 2 3 4 5; do
+        local out exit_code=0
+        out=$(run_with_timeout 15 "$SMOLVM" machine exec --name "$_DROP_MACHINE" -- echo "alive-$i" 2>/dev/null) \
+            || exit_code=$?
+        [[ $exit_code -eq 0 ]] || {
+            "$SMOLVM" machine delete "$_DROP_MACHINE" -f 2>/dev/null || true
+            echo "FAIL: exec #$i failed (exit $exit_code)"; return 1
+        }
+    done
+
+    "$SMOLVM" machine stop --name "$_DROP_MACHINE" 2>/dev/null || true
+    "$SMOLVM" machine delete "$_DROP_MACHINE" -f 2>/dev/null || true
+}
+
+run_test "Drop-safety: machine survives 5 rapid execs" test_machine_survives_rapid_exec || true
+
 print_summary "Bare VM Tests"

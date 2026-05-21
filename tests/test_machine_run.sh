@@ -628,4 +628,34 @@ run_test "Ephemeral run: no state leaks between runs" test_ephemeral_runs_do_not
 run_test "Ephemeral run: volume mount shows correct host contents" test_ephemeral_volume_mount_reflects_host || true
 run_test "Init: skipped on restart after first successful run" test_init_skipped_on_restart || true
 
+# =============================================================================
+# Piped stdin EOF detection
+# =============================================================================
+
+test_piped_stdin_cat() {
+    local out exit_code=0
+    out=$(echo "hello" | run_with_timeout 15 "$SMOLVM" machine run -i -- cat 2>/dev/null) \
+        || exit_code=$?
+    [[ $exit_code -eq 0 ]] || { echo "FAIL: exit $exit_code (expected 0)"; return 1; }
+    [[ "$out" == *"hello"* ]] || { echo "FAIL: expected 'hello', got: $out"; return 1; }
+}
+
+run_test "Stdin: piped 'echo hello | run -i cat' returns data" test_piped_stdin_cat || true
+
+# =============================================================================
+# Status messages go to stderr, not stdout
+# =============================================================================
+
+test_stdout_no_status_messages() {
+    local out
+    out=$("$SMOLVM" machine run --image alpine -- echo PAYLOAD_ONLY 2>/dev/null) || true
+    if echo "$out" | grep -qiE "^Starting|^Pulling"; then
+        echo "FAIL: status messages in stdout: $(echo "$out" | grep -iE 'Starting|Pulling' | head -1)"
+        return 1
+    fi
+    [[ "$out" == *"PAYLOAD_ONLY"* ]] || { echo "FAIL: missing payload in: $out"; return 1; }
+}
+
+run_test "Output: stdout has only command output, no status" test_stdout_no_status_messages || true
+
 print_summary "Machine Run Tests"
