@@ -622,6 +622,14 @@ pub async fn stop_machine(
         )));
     }
 
+    // The VM process is confirmed dead, but the long-lived registry manager for
+    // this machine still holds the per-VM `vm.lock` flock in this serve process.
+    // Release it so a subsequent start can re-acquire the lock; otherwise start
+    // fails with "another process is already starting or running this VM".
+    if let Ok(entry) = state.get_machine(&name) {
+        entry.lock().manager.mark_stopped();
+    }
+
     // Persist state to database and get updated record — only after confirmed stop
     let record = db
         .update_vm(&name, |r| {

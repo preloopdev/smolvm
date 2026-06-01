@@ -502,6 +502,25 @@ impl AgentManager {
         }
     }
 
+    /// Force the in-memory state back to `Stopped` and release the per-VM lock,
+    /// after the VM process has already been stopped out-of-band (the HTTP stop
+    /// path kills the recorded PID directly rather than via this manager).
+    ///
+    /// The serve process holds the `vm.lock` flock for the lifetime of the
+    /// registry's `AgentManager`; if `vm_lock_handle` is not dropped here, the
+    /// serve process keeps holding the lock and a subsequent start fails to
+    /// re-acquire it ("another process is already starting or running this VM").
+    /// Only call once the process is confirmed dead.
+    pub fn mark_stopped(&self) {
+        let mut inner = self.inner.lock();
+        inner.state = AgentState::Stopped;
+        inner.child = None;
+        #[cfg(unix)]
+        {
+            inner.vm_lock_handle = None;
+        }
+    }
+
     /// Return consistent (state, pid) for API status responses.
     ///
     /// Clears the PID when effective state is `Stopped`, so clients never
