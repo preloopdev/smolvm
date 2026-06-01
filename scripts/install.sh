@@ -207,7 +207,7 @@ get_download_url() {
 # Get checksum URL for a version and platform
 get_checksum_url() {
     local version="$1"
-    echo "https://github.com/${GITHUB_REPO}/releases/download/v${version}/checksums.txt"
+    echo "https://github.com/${GITHUB_REPO}/releases/download/v${version}/checksums.sha256"
 }
 
 # Verify file checksum
@@ -263,7 +263,7 @@ install_smolvm() {
     local archive_name
     archive_name=$(basename "$url")
     local archive="${tmp_dir}/${archive_name}"
-    local checksums="${tmp_dir}/checksums.txt"
+    local checksums="${tmp_dir}/checksums.sha256"
 
     # Download archive
     download "$url" "$archive" || {
