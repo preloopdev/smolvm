@@ -4,13 +4,14 @@ version = "0.8.2"
 edition = "2021"
 description = "Guest agent for smolvm VMs (handles OCI operations and command execution)"
 license = "Apache-2.0"
+repository = "https://github.com/smol-machines/smolvm"
 
 [[bin]]
 name = "smolvm-agent"
 path = "src/main.rs"
 
 [dependencies]
-smolvm-protocol = { path = "../smolvm-protocol" }
+smolvm-protocol = { path = "../smolvm-protocol", version = "0.8.2" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

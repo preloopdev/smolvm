@@ -16,7 +16,7 @@ version = "0.8.2"
 edition = "2021"
 description = "OCI-native microVM runtime"
 license = "Apache-2.0"
-repository = "https://github.com/smolvm/smolvm"
+repository = "https://github.com/smol-machines/smolvm"
 keywords = ["microvm", "container", "virtualization"]
 categories = ["virtualization", "command-line-utilities"]
 
@@ -29,11 +29,11 @@ name = "smolvm"
 path = "src/main.rs"
 
 [dependencies]
-smolvm-network = { path = "crates/smolvm-network" }
-smolvm-protocol = { path = "crates/smolvm-protocol" }
-smolvm-pack = { path = "crates/smolvm-pack" }
-smolvm-registry = { path = "crates/smolvm-registry" }
-smolfile = { path = "crates/smolvm-smolfile" }
+smolvm-network = { path = "crates/smolvm-network", version = "0.8.2" }
+smolvm-protocol = { path = "crates/smolvm-protocol", version = "0.8.2" }
+smolvm-pack = { path = "crates/smolvm-pack", version = "0.8.2" }
+smolvm-registry = { path = "crates/smolvm-registry", version = "0.8.2" }
+smolfile = { path = "crates/smolvm-smolfile", version = "0.8.2" }
 thiserror = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -76,7 +76,7 @@ landlock = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
-smolvm-protocol = { path = "crates/smolvm-protocol" }
+smolvm-protocol = { path = "crates/smolvm-protocol", version = "0.8.2" }
 regex = "1"
 
 [build-dependencies]
