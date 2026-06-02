@@ -15,6 +15,10 @@ Cargo.lock
 # Build artifacts
 *.so
 *.a
+# ...except the vendored runtime libs (else base libkrun.so/libkrunfw.so get
+# dropped, leaving dangling symlinks that break `hashFiles` in release CI).
+!lib/linux-x86_64/*.so
+!lib/linux-aarch64/*.so
 
 # Distribution build output
 /dist/smolvm-*/
