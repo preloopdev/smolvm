@@ -53,6 +53,7 @@
 use crate::device::VirtioNetworkDevice;
 use crate::dns;
 use crate::egress::EgressPolicy;
+use crate::icmp_relay;
 use crate::queues::NetworkFrameQueues;
 use crate::tcp_listeners::AcceptedTcpConnection;
 use crate::tcp_relay::{spawn_tcp_relay, TcpRelayTable};
@@ -61,15 +62,18 @@ use crate::{virtio_net_log, DEFAULT_DNS_ADDR};
 use smoltcp::iface::{
     Config, Interface, PollIngressSingleResult, PollResult, SocketHandle, SocketSet,
 };
+use smoltcp::socket::raw::{
+    PacketBuffer as RawPacketBuffer, PacketMetadata as RawPacketMetadata, Socket as RawSocket,
+};
 use smoltcp::socket::udp::{PacketBuffer, PacketMetadata, Socket as UdpSocket, UdpMetadata};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
     EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress, IpAddress, IpCidr,
-    Ipv4Packet, Ipv6Packet, TcpPacket, UdpPacket,
+    IpProtocol, IpVersion, Ipv4Packet, Ipv6Packet, TcpPacket, UdpPacket,
 };
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as HostUdpSocket};
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant as StdInstant};
@@ -78,6 +82,10 @@ const DNS_SOCKET_PORT: u16 = 53;
 const DNS_PACKET_SLOTS: usize = 8;
 const DNS_BUFFER_BYTES: usize = 2048;
 const DEFAULT_IDLE_TIMEOUT_MS: i32 = 100;
+/// Packet slots per ICMP raw socket buffer (per direction).
+const ICMP_PACKET_SLOTS: usize = 16;
+/// Payload bytes per ICMP raw socket buffer (per direction).
+const ICMP_BUFFER_BYTES: usize = 32 * 1024;
 
 /// Resolved network parameters for one guest NIC.
 ///
@@ -173,12 +181,27 @@ fn run_network_stack(
     let mut interface = create_interface(&mut device, &config);
     let mut sockets = SocketSet::new(vec![]);
     let dns_socket_handle = add_dns_socket(&mut sockets);
+    let (icmp4_handle, icmp6_handle) = add_icmp_raw_sockets(&mut sockets);
+    // Gateway addresses answer their own pings locally; everything else is
+    // relayed out to real host ICMP sockets.
+    let gateway_addrs = [
+        IpAddr::V4(config.gateway_ipv4),
+        IpAddr::V6(config.gateway_ipv6),
+        IpAddr::V6(link_local_from_mac(config.gateway_mac)),
+    ];
     let relay_wake = Arc::new(queues.relay_wake.clone());
     let mut relays = TcpRelayTable::new(None, egress.clone());
     let mut udp_sockets = udp_relay::UdpSocketTable::new();
     let udp_channels = {
         let shutdown_queues = queues.clone();
         udp_relay::start_udp_relay(
+            relay_wake.clone(),
+            Arc::new(move || shutdown_queues.is_shutting_down()),
+        )
+    };
+    let icmp_channels = {
+        let shutdown_queues = queues.clone();
+        icmp_relay::start_icmp_relay(
             relay_wake.clone(),
             Arc::new(move || shutdown_queues.is_shutting_down()),
         )
@@ -286,6 +309,36 @@ fn run_network_stack(
         }
         udp_sockets.deliver_replies(&mut sockets, &udp_channels.from_relay);
         udp_sockets.expire_idle(&mut sockets);
+
+        // ICMP echo: the raw sockets captured any guest echo requests during
+        // ingress above. Forward external pings to the relay (answering gateway
+        // pings locally), then send back any replies it produced.
+        let mut woke_icmp = false;
+        woke_icmp |= drain_icmp_echo(
+            &mut sockets,
+            icmp4_handle,
+            false,
+            &egress,
+            &gateway_addrs,
+            &icmp_channels.to_relay,
+        );
+        woke_icmp |= drain_icmp_echo(
+            &mut sockets,
+            icmp6_handle,
+            true,
+            &egress,
+            &gateway_addrs,
+            &icmp_channels.to_relay,
+        );
+        if woke_icmp {
+            icmp_channels.relay_thread_wake.wake();
+        }
+        deliver_icmp_replies(
+            &mut sockets,
+            icmp4_handle,
+            icmp6_handle,
+            &icmp_channels.from_relay,
+        );
 
         // Once the guest-side TCP handshake is established inside smoltcp, we
         // can spawn the corresponding host relay thread.
@@ -420,6 +473,125 @@ fn add_dns_socket(sockets: &mut SocketSet<'_>) -> SocketHandle {
         })
         .expect("failed to bind gateway DNS socket");
     sockets.add(socket)
+}
+
+/// Add the two raw IP sockets that capture guest ICMP echo traffic.
+///
+/// A `raw::Socket` receives a copy of every matching IP packet *before* the
+/// interface's "is this addressed to me?" check, so these capture the guest's
+/// echo requests even though their destination is some external host. The same
+/// sockets carry the relayed echo *replies* back out, fully addressed (source =
+/// the pinged host), letting smoltcp own the Ethernet framing and ARP/NDP.
+fn add_icmp_raw_sockets(sockets: &mut SocketSet<'_>) -> (SocketHandle, SocketHandle) {
+    fn raw_socket(version: IpVersion, protocol: IpProtocol) -> RawSocket<'static> {
+        let rx = RawPacketBuffer::new(
+            vec![RawPacketMetadata::EMPTY; ICMP_PACKET_SLOTS],
+            vec![0u8; ICMP_BUFFER_BYTES],
+        );
+        let tx = RawPacketBuffer::new(
+            vec![RawPacketMetadata::EMPTY; ICMP_PACKET_SLOTS],
+            vec![0u8; ICMP_BUFFER_BYTES],
+        );
+        RawSocket::new(Some(version), Some(protocol), rx, tx)
+    }
+
+    let v4 = sockets.add(raw_socket(IpVersion::Ipv4, IpProtocol::Icmp));
+    let v6 = sockets.add(raw_socket(IpVersion::Ipv6, IpProtocol::Icmpv6));
+    (v4, v6)
+}
+
+/// Drain guest echo requests captured on one ICMP raw socket. Gateway-destined
+/// pings are answered locally (the gateway *is* the source), external ones are
+/// forwarded to the relay thread subject to egress policy, and denied
+/// destinations are dropped. Returns true if anything was sent to the relay.
+fn drain_icmp_echo(
+    sockets: &mut SocketSet<'_>,
+    handle: SocketHandle,
+    is_ipv6: bool,
+    egress: &EgressPolicy,
+    gateway_addrs: &[IpAddr],
+    to_relay: &SyncSender<icmp_relay::IcmpEcho>,
+) -> bool {
+    // Phase 1: drain received requests into owned values so the socket can be
+    // re-borrowed below to emit local gateway replies.
+    let mut echoes = Vec::new();
+    {
+        let socket = sockets.get_mut::<RawSocket>(handle);
+        while socket.can_recv() {
+            let Ok(packet) = socket.recv() else {
+                break;
+            };
+            let parsed = if is_ipv6 {
+                icmp_relay::parse_guest_echo_v6(packet)
+            } else {
+                icmp_relay::parse_guest_echo_v4(packet)
+            };
+            if let Some(echo) = parsed {
+                echoes.push(echo);
+            }
+        }
+    }
+
+    // Phase 2: route each echo.
+    let mut woke = false;
+    let mut local_replies = Vec::new();
+    for echo in echoes {
+        if gateway_addrs.contains(&echo.destination) {
+            local_replies.push(echo);
+        } else if icmp_relay::should_relay_icmp(echo.destination, egress) {
+            match to_relay.try_send(echo) {
+                Ok(()) => woke = true,
+                Err(TrySendError::Full(_)) => {
+                    virtio_net_log!("virtio-net: dropping guest ICMP echo (relay queue full)");
+                }
+                Err(TrySendError::Disconnected(_)) => return woke,
+            }
+        }
+        // else: egress policy denies the destination — silent black hole.
+    }
+
+    // Phase 3: answer gateway pings straight back out the raw socket.
+    if !local_replies.is_empty() {
+        let socket = sockets.get_mut::<RawSocket>(handle);
+        for reply in local_replies {
+            let frame = if is_ipv6 {
+                icmp_relay::build_echo_reply_v6(&reply)
+            } else {
+                icmp_relay::build_echo_reply_v4(&reply)
+            };
+            if let Some(frame) = frame {
+                let _ = socket.send_slice(&frame);
+            }
+        }
+    }
+    woke
+}
+
+/// Deliver echo replies produced by the relay thread, sending each as a
+/// fully-addressed IP packet (source = the pinged host) out the matching raw
+/// socket so smoltcp frames it back to the guest.
+fn deliver_icmp_replies(
+    sockets: &mut SocketSet<'_>,
+    icmp4_handle: SocketHandle,
+    icmp6_handle: SocketHandle,
+    from_relay: &Receiver<icmp_relay::IcmpEcho>,
+) {
+    while let Ok(reply) = from_relay.try_recv() {
+        let (handle, frame) = match reply.guest {
+            IpAddr::V4(_) => (icmp4_handle, icmp_relay::build_echo_reply_v4(&reply)),
+            IpAddr::V6(_) => (icmp6_handle, icmp_relay::build_echo_reply_v6(&reply)),
+        };
+        let Some(frame) = frame else {
+            continue;
+        };
+        let socket = sockets.get_mut::<RawSocket>(handle);
+        if socket.send_slice(&frame).is_err() {
+            virtio_net_log!(
+                "virtio-net: dropping ICMP reply to {} (raw socket buffer full)",
+                reply.guest
+            );
+        }
+    }
 }
 
 /// Receive the accepted TCP connection from the tcp_channel, and then relay it to

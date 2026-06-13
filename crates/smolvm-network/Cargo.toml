@@ -18,8 +18,12 @@ smoltcp = { version = "0.13", default-features = false, features = [
     "proto-ipv6",
     "socket-tcp",
     "socket-udp",
+    # Raw IP sockets capture the guest's ICMP echo traffic so the gateway can
+    # relay ping to real host ICMP sockets (see `icmp_relay`).
+    "socket-raw",
     # The gateway interface owns three addresses: IPv4, IPv6 ULA, and the
     # IPv6 link-local (default cap is 2).
     "iface-max-addr-count-3",
 ] }
+socket2 = "0.6"
 tracing = { workspace = true }

@@ -61,6 +61,7 @@ pub mod device;
 pub mod dns;
 pub mod egress;
 pub mod frame_stream;
+pub mod icmp_relay;
 pub mod queues;
 pub mod stack;
 pub mod tcp_listeners;

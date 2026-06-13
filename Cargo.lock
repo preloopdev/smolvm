@@ -2116,6 +2116,7 @@ dependencies = [
  "humantime",
  "libc",
  "smoltcp",
+ "socket2",
  "tracing",
 ]
 
