@@ -1879,17 +1879,25 @@ impl AgentManager {
                 return Ok(());
             }
 
-            // After long grace, fall back to socket ping for very old agents
-            // that don't write the ready marker at all.
+            // After long grace, fall back to socket ping. This is the intended
+            // path only for pre-marker agents; for a current agent the marker
+            // never appearing is a real fault (e.g. a Landlock rule denying the
+            // marker write — see internal_boot.rs) that silently cost us the
+            // whole probe grace. Logged at WARN so the degradation can't hide.
             if start.elapsed() >= socket_probe_grace && self.vsock_socket.exists() {
                 if let Ok(mut client) =
                     super::AgentClient::connect_with_boot_probe_timeout(&self.vsock_socket)
                 {
                     if client.ping().is_ok() {
                         let elapsed = start.elapsed();
-                        tracing::info!(
+                        let landlock = std::env::var("SMOLVM_LANDLOCK").unwrap_or_default();
+                        tracing::warn!(
                             elapsed_ms = elapsed.as_millis(),
-                            "agent ready (socket fallback)"
+                            landlock = %landlock,
+                            "agent ready via SOCKET FALLBACK — ready marker never appeared; \
+                             boot was delayed by the probe grace. If a current agent, this is a \
+                             fault (under SMOLVM_LANDLOCK=enforce the ready-marker carve-out in \
+                             internal_boot.rs is likely broken)"
                         );
                         return Ok(());
                     }
