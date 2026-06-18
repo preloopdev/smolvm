@@ -94,10 +94,11 @@ test_start_nonexistent_name_rejected() {
 }
 
 test_auto_generated_names() {
-    # Auto-generate: create with no name, verify format + appears in list
+    # Auto-generate: create with no --name at all (omitting --name triggers the
+    # vm-XXXXXXXX auto-name; `--name` with no value is a CLI error, not auto-gen).
     local result1 result2
-    result1=$($SMOLVM machine create --name 2>&1) || return 1
-    result2=$($SMOLVM machine create --name 2>&1) || return 1
+    result1=$($SMOLVM machine create 2>&1) || { echo "auto-name create #1 failed: $result1"; return 1; }
+    result2=$($SMOLVM machine create 2>&1) || { echo "auto-name create #2 failed: $result2"; return 1; }
 
     local name1 name2
     name1=$(echo "$result1" | grep "Created machine:" | grep -oE "vm-[a-f0-9]{8}" | head -1)
@@ -119,8 +120,9 @@ test_auto_generated_names() {
         return 1
     }
 
-    # Explicit name still works
-    local explicit="explicit-test-$$"
+    # Explicit name still works. Use a unique suffix so a dirty/concurrent box
+    # (leftover machines) can't collide or false-match.
+    local explicit="explicit-test-$$-$RANDOM"
     $SMOLVM machine create --name "$explicit" 2>&1 || { echo "Explicit name failed"; return 1; }
     list_result=$($SMOLVM machine ls --json 2>&1)
     [[ "$list_result" == *"$explicit"* ]] || { echo "Explicit name not in list"; return 1; }
