@@ -68,13 +68,13 @@ pub fn plan_launch_network(
     // to TSI here would make the egress flags a silent no-op — a security hole —
     // so a policy forces virtio-net unless the caller explicitly picked a backend.
     let fleet_mode = std::env::var_os("SMOLVM_PUBLISH_ADDR").is_some();
-    let backend = resources
-        .network_backend
-        .unwrap_or(if has_ports || fleet_mode || has_cidr_policy || has_dns_filter {
+    let backend = resources.network_backend.unwrap_or(
+        if has_ports || fleet_mode || has_cidr_policy || has_dns_filter {
             NetworkBackend::VirtioNet
         } else {
             NetworkBackend::Tsi
-        });
+        },
+    );
     match backend {
         NetworkBackend::Tsi => LaunchNetworkPlan {
             backend: EffectiveNetworkBackend::Tsi,

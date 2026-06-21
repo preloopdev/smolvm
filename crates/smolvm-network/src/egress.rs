@@ -380,7 +380,7 @@ mod tests {
     #[test]
     fn metadata_floor_blocks_mapped_and_v6_link_local() {
         let p = EgressPolicy::unrestricted(); // MetadataOnly default
-        // mapped metadata + v6 link-local are denied...
+                                              // mapped metadata + v6 link-local are denied...
         assert!(!p.allows_v6("::ffff:169.254.169.254".parse().unwrap()));
         assert!(!p.allows_v6("fe80::1".parse().unwrap()));
         // ...but v6 ULA (the LAN equivalent) and global unicast are reachable.
@@ -452,8 +452,16 @@ mod tests {
     #[test]
     fn floor_off_blocks_nothing() {
         // Trusted override: even metadata/loopback/private pass.
-        for ip in [v4(8, 8, 8, 8), v4(169, 254, 169, 254), v4(192, 168, 1, 5), v4(127, 0, 0, 1)] {
-            assert!(!is_floored(ip, FloorMode::Off), "{ip} should not be floored when Off");
+        for ip in [
+            v4(8, 8, 8, 8),
+            v4(169, 254, 169, 254),
+            v4(192, 168, 1, 5),
+            v4(127, 0, 0, 1),
+        ] {
+            assert!(
+                !is_floored(ip, FloorMode::Off),
+                "{ip} should not be floored when Off"
+            );
         }
     }
 
@@ -463,11 +471,23 @@ mod tests {
         // host's LAN, loopback and the public internet stay reachable.
         assert!(is_floored(v4(169, 254, 169, 254), FloorMode::MetadataOnly));
         assert!(is_floored(v4(169, 254, 0, 1), FloorMode::MetadataOnly));
-        for ip in [v4(8, 8, 8, 8), v4(192, 168, 1, 5), v4(10, 0, 0, 7), v4(127, 0, 0, 1), v4(172, 16, 5, 5)] {
-            assert!(!is_floored(ip, FloorMode::MetadataOnly), "{ip} should be reachable locally");
+        for ip in [
+            v4(8, 8, 8, 8),
+            v4(192, 168, 1, 5),
+            v4(10, 0, 0, 7),
+            v4(127, 0, 0, 1),
+            v4(172, 16, 5, 5),
+        ] {
+            assert!(
+                !is_floored(ip, FloorMode::MetadataOnly),
+                "{ip} should be reachable locally"
+            );
         }
         // IPv4-mapped metadata must not slip past.
-        assert!(is_floored("::ffff:169.254.169.254".parse().unwrap(), FloorMode::MetadataOnly));
+        assert!(is_floored(
+            "::ffff:169.254.169.254".parse().unwrap(),
+            FloorMode::MetadataOnly
+        ));
     }
 
     #[test]
@@ -478,10 +498,13 @@ mod tests {
             v4(192, 168, 1, 5),     // RFC1918
             v4(10, 0, 0, 7),
             v4(172, 16, 5, 5),
-            v4(127, 0, 0, 1),       // loopback
-            v4(100, 64, 0, 1),      // CGNAT gateway range
+            v4(127, 0, 0, 1),  // loopback
+            v4(100, 64, 0, 1), // CGNAT gateway range
         ] {
-            assert!(is_floored(ip, FloorMode::Strict), "{ip} should be floored under Strict");
+            assert!(
+                is_floored(ip, FloorMode::Strict),
+                "{ip} should be floored under Strict"
+            );
         }
         // Public + just-outside-CGNAT stay reachable.
         assert!(!is_floored(v4(8, 8, 8, 8), FloorMode::Strict));
@@ -489,7 +512,13 @@ mod tests {
         // IPv6 internal ranges + mapped private.
         assert!(is_floored("fe80::1".parse().unwrap(), FloorMode::Strict));
         assert!(is_floored("fc00::1".parse().unwrap(), FloorMode::Strict));
-        assert!(is_floored("::ffff:10.0.0.1".parse().unwrap(), FloorMode::Strict));
-        assert!(!is_floored("2606:4700::1111".parse().unwrap(), FloorMode::Strict));
+        assert!(is_floored(
+            "::ffff:10.0.0.1".parse().unwrap(),
+            FloorMode::Strict
+        ));
+        assert!(!is_floored(
+            "2606:4700::1111".parse().unwrap(),
+            FloorMode::Strict
+        ));
     }
 }
