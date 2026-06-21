@@ -209,6 +209,51 @@ pub fn machine_layers_cache_dir(name: &str) -> PathBuf {
     vm_data_dir(name).join("pack")
 }
 
+/// Per-VM egress telemetry file: `<vm_data_dir>/egress`. The launcher (running
+/// in the VM subprocess) periodically writes the NIC's cumulative egress byte
+/// count here; serve (the parent) reads it when building `MachineInfo`, so
+/// egress reaches the node API through the same per-VM dir that already bridges
+/// sockets and console between the two processes. Resolved from the name on both
+/// sides, so no path needs to be threaded across the process boundary.
+pub fn egress_telemetry_file(name: &str) -> PathBuf {
+    vm_data_dir(name).join("egress")
+}
+
+/// How often the VM subprocess flushes its egress counter to disk. The control
+/// plane's egress rollup runs on a multi-minute cadence, so a value this small
+/// keeps the file comfortably fresh while writing only a few bytes.
+const EGRESS_FLUSH_SECS: u64 = 15;
+
+/// Spawn a detached thread (in the VM subprocess) that periodically writes the
+/// NIC's cumulative egress byte count to the per-VM telemetry file. serve reads
+/// that file when building `MachineInfo`, so egress reaches the node API the
+/// same way disk size does. The thread exits when the subprocess does; the last
+/// value persists in the file even after exit, so a stopped machine's final
+/// egress is still readable. Best-effort: a write error never affects the VM.
+pub fn spawn_egress_flush(
+    path: std::path::PathBuf,
+    counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) {
+    std::thread::spawn(move || loop {
+        let bytes = counter.load(std::sync::atomic::Ordering::Relaxed);
+        if let Err(e) = std::fs::write(&path, bytes.to_string()) {
+            tracing::debug!(path = ?path, error = %e, "egress telemetry flush failed");
+        }
+        std::thread::sleep(std::time::Duration::from_secs(EGRESS_FLUSH_SECS));
+    });
+}
+
+/// Read the per-VM egress telemetry file written by [`spawn_egress_flush`].
+/// Returns `None` if the file is absent (TSI VM, or not yet flushed) or
+/// unparseable — egress is simply unavailable for that machine.
+pub fn read_egress_telemetry(name: &str) -> Option<u64> {
+    std::fs::read_to_string(egress_telemetry_file(name))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// Cache root: `<cache_dir>/smolvm/vms/`.
 pub fn vm_cache_root() -> PathBuf {
     dirs::cache_dir()

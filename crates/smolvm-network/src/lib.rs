@@ -287,6 +287,23 @@ pub fn start_virtio_network(
     })
 }
 
+impl VirtioNetworkRuntime {
+    /// Cumulative guest-outbound (egress) bytes on this NIC since boot, at the
+    /// ethernet-frame level. The launcher polls this to surface per-machine
+    /// egress to the node API for billing. TSI VMs have no virtio runtime, so
+    /// egress is unavailable for them (a documented metering gap).
+    pub fn egress_bytes(&self) -> u64 {
+        self.queues.egress_bytes()
+    }
+
+    /// A cheap, cloneable read handle to this NIC's egress counter, so the
+    /// launcher can spawn a thread that periodically flushes the value to the
+    /// VM's runtime dir for the node API to read (the runtime is not `Clone`).
+    pub fn egress_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        self.queues.egress_counter()
+    }
+}
+
 impl Drop for VirtioNetworkRuntime {
     /// Shut down the worker threads in a bounded, cooperative way.
     ///

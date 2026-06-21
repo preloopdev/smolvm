@@ -52,7 +52,7 @@
 
 use crossbeam_queue::ArrayQueue;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -84,6 +84,12 @@ pub struct NetworkFrameQueues {
     pub relay_wake: WakePipe,
     /// Signals that the helper process should shut down.
     shutting_down: AtomicBool,
+    /// Cumulative guest-outbound (egress) bytes for this NIC since boot, at the
+    /// ethernet-frame level — every guest frame accepted into the stack is
+    /// counted. Used for per-machine egress billing/telemetry. Held behind an
+    /// `Arc` so the runtime owner can hand a cheap read handle to a flush thread
+    /// without exposing the rest of the queue set.
+    egress_bytes: Arc<AtomicU64>,
 }
 
 impl NetworkFrameQueues {
@@ -96,7 +102,25 @@ impl NetworkFrameQueues {
             host_wake: WakePipe::new(),
             relay_wake: WakePipe::new(),
             shutting_down: AtomicBool::new(false),
+            egress_bytes: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Add `n` guest-outbound bytes to the egress counter. Relaxed ordering is
+    /// fine: the counter is a monotonic statistic, not a synchronization point.
+    pub fn add_egress_bytes(&self, n: u64) {
+        self.egress_bytes.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Cumulative guest-outbound bytes for this NIC since boot.
+    pub fn egress_bytes(&self) -> u64 {
+        self.egress_bytes.load(Ordering::Relaxed)
+    }
+
+    /// A cheap, cloneable read handle to the egress counter, for a flush thread
+    /// owned by the launcher (the runtime itself is not `Clone`).
+    pub fn egress_counter(&self) -> Arc<AtomicU64> {
+        self.egress_bytes.clone()
     }
 
     /// Mark the runtime as shutting down and wake all waiters.

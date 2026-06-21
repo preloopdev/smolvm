@@ -519,6 +519,13 @@ pub struct MachineInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 2)]
     pub overlay_gb: Option<u64>,
+    /// Cumulative guest-outbound (egress) bytes since boot, for billing. Present
+    /// only for virtio-net machines that have reported a value; omitted for TSI
+    /// or machines that haven't flushed yet. Surfaced the same way `storage_gb`
+    /// is, so the control plane reads both from the machine list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 1048576)]
+    pub egress_bytes: Option<u64>,
     /// Creation timestamp (seconds since Unix epoch).
     pub created_at: u64,
 }

@@ -271,6 +271,11 @@ pub struct LaunchConfig<'a> {
     /// libkrun. This keeps the egress allow-list accurate for long-running VMs
     /// hitting CDN-backed hosts whose IPs rotate.
     pub egress_refresh_hosts: Option<Vec<String>>,
+    /// Where to flush this VM's cumulative egress byte count (virtio-net only).
+    /// A background thread writes it here every few seconds; serve reads it to
+    /// surface `egressBytes` in the machine info, the same per-VM-dir bridge the
+    /// vsock/console paths use. `None` disables egress telemetry (e.g. TSI).
+    pub egress_telemetry: Option<&'a Path>,
 }
 
 /// Launch the agent VM using libkrun.
@@ -305,6 +310,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         extra_disks,
         dns_filter_enabled,
         egress_refresh_hosts,
+        egress_telemetry,
     } = config;
 
     crate::network::validate_requested_network_backend(resources, None, port_mappings.len())?;
@@ -630,6 +636,14 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     ));
                 }
 
+                // Flush this NIC's egress counter to the per-VM dir so serve can
+                // bill it (parity with how disk size reaches the node API).
+                if let Some(path) = egress_telemetry {
+                    crate::agent::manager::spawn_egress_flush(
+                        path.to_path_buf(),
+                        runtime.egress_counter(),
+                    );
+                }
                 virtio_network_runtime = Some(runtime);
 
                 tracing::info!("network backend: virtio-net");

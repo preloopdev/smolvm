@@ -106,6 +106,10 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         // when unset.
         storage_gb: Some(record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB)),
         overlay_gb: Some(record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB)),
+        // Cumulative egress, read from the per-VM telemetry file the subprocess
+        // flushes. Surfaced here so the control plane reads it from the machine
+        // list exactly like disk size — no bespoke endpoint.
+        egress_bytes: crate::agent::read_egress_telemetry(name),
         created_at: record.created_at,
     }
 }

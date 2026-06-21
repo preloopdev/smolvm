@@ -1093,6 +1093,7 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
     } else {
         "stopped"
     };
+    let egress_bytes = crate::agent::read_egress_telemetry(&name);
 
     MachineInfo {
         name,
@@ -1117,6 +1118,7 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
         allowed_cidrs: entry.resources.allowed_cidrs.clone(),
         storage_gb: entry.resources.storage_gb,
         overlay_gb: entry.resources.overlay_gb,
+        egress_bytes,
         created_at: 0,
     }
 }

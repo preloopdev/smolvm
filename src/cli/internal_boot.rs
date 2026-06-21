@@ -353,11 +353,17 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
 
     proc_timing!("ready to launch");
 
+    // Egress telemetry lands in the per-VM dir (the vsock socket's parent), the
+    // same dir serve resolves from the machine name — so no name needs threading
+    // across the process boundary.
+    let egress_telemetry_path = config.vsock_socket.parent().map(|dir| dir.join("egress"));
+
     let result = launch_agent_vm(&LaunchConfig {
         rootfs_path: &config.rootfs_path,
         disks: &disks,
         vsock_socket: &config.vsock_socket,
         console_log: config.console_log.as_deref(),
+        egress_telemetry: egress_telemetry_path.as_deref(),
         mounts: &config.mounts,
         port_mappings: &config.ports,
         resources: config.resources,
