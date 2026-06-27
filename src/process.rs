@@ -131,8 +131,55 @@ mod win {
         if ok == 0 {
             None
         } else {
-            Some(((creation.dwHighDateTime as u64) << 32) | (creation.dwLowDateTime as u64))
+            Some(filetime_to_u64(&creation))
         }
+    }
+
+    /// Combine a FILETIME's high/low halves into a single u64 (100 ns ticks).
+    fn filetime_to_u64(ft: &windows_sys::Win32::Foundation::FILETIME) -> u64 {
+        ((ft.dwHighDateTime as u64) << 32) | (ft.dwLowDateTime as u64)
+    }
+
+    /// Sample cumulative CPU time (ns) and resident set size (bytes) for a
+    /// process. Mirrors the Linux `/proc/<pid>/{stat,statm}` and macOS
+    /// `proc_pidinfo` sampling so `machine monitor` reports live CPU/RSS on
+    /// Windows too. Returns `None` if the process is gone or stats are
+    /// unavailable.
+    pub fn process_stats(pid: u32) -> Option<(u64, u64)> {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::ProcessStatus::{
+            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+        };
+        use windows_sys::Win32::System::Threading::GetProcessTimes;
+
+        let handle = open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+
+        let zero = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let (mut creation, mut exit, mut kernel, mut user) = (zero, zero, zero, zero);
+        // SAFETY: handle is live for the call; all four FILETIME out-params are
+        // valid, writable locals.
+        let times_ok =
+            unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+
+        let mut pmc: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+        let pmc_size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        pmc.cb = pmc_size;
+        // SAFETY: handle is live; pmc is a valid, correctly-sized counters buffer.
+        let mem_ok = unsafe { GetProcessMemoryInfo(handle, &mut pmc, pmc_size) };
+
+        unsafe { CloseHandle(handle) };
+        if times_ok == 0 || mem_ok == 0 {
+            return None;
+        }
+
+        // GetProcessTimes' kernel/user are 100 ns ticks; sum and scale to ns.
+        let cpu_time_ns = filetime_to_u64(&kernel)
+            .saturating_add(filetime_to_u64(&user))
+            .saturating_mul(100);
+        Some((cpu_time_ns, pmc.WorkingSetSize as u64))
     }
 }
 
@@ -1570,9 +1617,20 @@ pub fn process_stats(pid: Pid) -> Option<ProcessStats> {
     })
 }
 
+/// Sample CPU time and RSS for a process on Windows via the Win32 process APIs
+/// (`GetProcessTimes` + `GetProcessMemoryInfo`).
+#[cfg(windows)]
+pub fn process_stats(pid: Pid) -> Option<ProcessStats> {
+    let (cpu_time_ns, rss_bytes) = win::process_stats(pid as u32)?;
+    Some(ProcessStats {
+        cpu_time_ns,
+        rss_bytes,
+    })
+}
+
 /// Sample CPU time and RSS for a process (stub on platforms without a
-/// supported implementation; e.g. Windows). Always returns `None`.
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// supported implementation). Always returns `None`.
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 pub fn process_stats(_pid: Pid) -> Option<ProcessStats> {
     None
 }
@@ -2569,6 +2627,32 @@ mod tests {
         assert!(
             drained,
             "registry should drain: real child reaped, bogus PID dropped on ECHILD"
+        );
+    }
+
+    /// `process_stats` must report live CPU/RSS for our own (alive) process on
+    /// every supported host — macOS, Linux, and Windows (where it previously
+    /// returned None). RSS is always > 0 for a running process; CPU time is
+    /// cumulative and may legitimately read 0 very early, so we only assert RSS.
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[test]
+    fn process_stats_samples_self() {
+        let me = std::process::id() as Pid;
+        let stats = process_stats(me).expect("process_stats must sample the current process");
+        assert!(
+            stats.rss_bytes > 0,
+            "a live process must have non-zero RSS, got {}",
+            stats.rss_bytes
+        );
+    }
+
+    /// A PID that does not exist must yield None, not a bogus sample.
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[test]
+    fn process_stats_dead_pid_is_none() {
+        assert!(
+            process_stats(i32::MAX as Pid).is_none(),
+            "stats for a non-existent PID must be None"
         );
     }
 }
