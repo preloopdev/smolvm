@@ -349,46 +349,136 @@ impl PackRunCmd {
             );
         }
 
-        // 9. Fork child → launch VM with dynamically loaded libkrun
+        // 9. Launch VM with dynamically loaded libkrun.
+        //
+        // On Unix we fork a session-leader child that dlopen's libkrun directly.
+        // On Windows there is no usable fork, so we mirror the non-packed
+        // launcher's subprocess model: serialize a `BootConfig` and re-spawn this
+        // executable as `current_exe _boot-vm <config.json>`, which loads libkrun
+        // from `SMOLVM_LIB_DIR` and boots the VM. See `src/agent/manager.rs`.
         smolvm::process::install_sigchld_handler();
 
         let console_log_path = runtime_dir.path().join("console.log");
-        let vsock_path_clone = vsock_path.clone();
-        let child_pid = smolvm::process::fork_session_leader(move || {
-            // Child process: load libkrun via dlopen and launch VM
-            let krun = match unsafe { KrunFunctions::load(&lib_dir) } {
-                Ok(k) => k,
-                Err(e) => {
-                    eprintln!("failed to load libkrun: {}", e);
-                    smolvm::process::exit_child(1);
+
+        #[cfg(unix)]
+        let child_pid = {
+            let vsock_path_clone = vsock_path.clone();
+            smolvm::process::fork_session_leader(move || {
+                // Child process: load libkrun via dlopen and launch VM
+                let krun = match unsafe { KrunFunctions::load(&lib_dir) } {
+                    Ok(k) => k,
+                    Err(e) => {
+                        eprintln!("failed to load libkrun: {}", e);
+                        smolvm::process::exit_child(1);
+                    }
+                };
+
+                let config = PackedLaunchConfig {
+                    rootfs_path: &rootfs_path,
+                    storage_path: &storage_path,
+                    vsock_socket: &vsock_path_clone,
+                    layers_dir,
+                    mounts: &packed_mounts,
+                    port_mappings: &port_mappings,
+                    resources,
+                    overlay_path: overlay_runtime_path.as_deref(),
+                    debug: self.debug,
+                    console_log: console_log_path,
+                };
+
+                // Detach from parent's terminal so libkrun doesn't
+                // steal keystrokes or corrupt terminal state.
+                smolvm::process::detach_stdio();
+
+                if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
+                    let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);
+                    let _ = std::fs::write(&config.console_log, &msg);
                 }
+
+                smolvm::process::exit_child(1);
+            })
+            .map_err(|e| Error::agent("fork VM process", e.to_string()))?
+        };
+
+        #[cfg(not(unix))]
+        let child_pid = {
+            // These bindings are consumed by the Unix fork closure above; on
+            // Windows the BootConfig carries the same data, so silence the
+            // unused-variable warnings rather than reshape the surrounding code.
+            let _ = (&packed_mounts, &port_mappings);
+
+            // The overlay file is always created on disk before this point
+            // (`setup_vm_overlay`); fall back to the well-known runtime path when
+            // the helper returned None so the boot subprocess attaches it.
+            let overlay_disk_path = overlay_runtime_path
+                .clone()
+                .unwrap_or_else(|| runtime_dir.path().join("overlay.raw"));
+
+            let boot_config = smolvm::agent::boot_config::BootConfig {
+                rootfs_path: rootfs_path.clone(),
+                storage_disk_path: storage_path.clone(),
+                overlay_disk_path,
+                vsock_socket: vsock_path.clone(),
+                console_log: Some(console_log_path.clone()),
+                startup_error_log: runtime_dir.path().join("startup-error.log"),
+                storage_size_gb: storage_gib.unwrap_or(smolvm::storage::DEFAULT_STORAGE_SIZE_GIB),
+                overlay_size_gb: self
+                    .overlay
+                    .unwrap_or(smolvm::storage::DEFAULT_OVERLAY_SIZE_GIB),
+                mounts: mounts.clone(),
+                ports: self.port.clone(),
+                resources: resources.clone(),
+                ssh_agent_socket: None,
+                dns_filter_hosts: None,
+                packed_layers_dir: Some(layers_dir.to_path_buf()),
+                extra_disks: vec![],
             };
 
-            let config = PackedLaunchConfig {
-                rootfs_path: &rootfs_path,
-                storage_path: &storage_path,
-                vsock_socket: &vsock_path_clone,
-                layers_dir,
-                mounts: &packed_mounts,
-                port_mappings: &port_mappings,
-                resources,
-                overlay_path: overlay_runtime_path.as_deref(),
-                debug: self.debug,
-                console_log: console_log_path,
-            };
+            let config_path = runtime_dir.path().join("boot-config.json");
+            let config_json = serde_json::to_vec(&boot_config)
+                .map_err(|e| Error::agent("serialize boot config", e.to_string()))?;
+            std::fs::write(&config_path, &config_json)
+                .map_err(|e| Error::agent("write boot config", e.to_string()))?;
 
-            // Detach from parent's terminal so libkrun doesn't
-            // steal keystrokes or corrupt terminal state.
-            smolvm::process::detach_stdio();
-
-            if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
-                let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);
-                let _ = std::fs::write(&config.console_log, &msg);
+            let exe = std::env::current_exe()
+                .map_err(|e| Error::agent("find smolvm binary", e.to_string()))?;
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.args(["_boot-vm", &config_path.to_string_lossy()])
+                // The boot subprocess loads libkrun/libkrunfw from here.
+                .env("SMOLVM_LIB_DIR", &lib_dir)
+                // The CLI detaches the VM; don't arm the parent-death watchdog.
+                .env("SMOLVM_BOOT_WATCH_PARENT", "0")
+                // Per-VM readiness marker name so the agent writes its own marker.
+                .env(
+                    smolvm_protocol::guest_env::READY_MARKER,
+                    smolvm_protocol::AGENT_READY_MARKER,
+                );
+            if self.debug {
+                cmd.stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::inherit())
+                    .stderr(std::process::Stdio::inherit());
+            } else {
+                cmd.stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
             }
-
-            smolvm::process::exit_child(1);
-        })
-        .map_err(|e| Error::agent("fork VM process", e.to_string()))?;
+            // Detach from the launching console and give the VM its own process
+            // group so a Ctrl-C in the launcher isn't forwarded — mirrors the
+            // `_boot-vm` spawn in `src/agent/manager.rs`.
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                const DETACHED_PROCESS: u32 = 0x0000_0008;
+                const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+                cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+            }
+            let child = cmd
+                .spawn()
+                .map_err(|e| Error::agent("spawn boot subprocess", e.to_string()))?;
+            // `Pid` is `i32` on Windows while `Child::id` returns `u32`; the
+            // downstream liveness/start-time/kill helpers take `Pid`.
+            child.id() as smolvm::process::Pid
+        };
 
         // Capture the child's start time so we can verify PID identity
         // later (guards against PID reuse).  The proc info may not be
@@ -455,7 +545,7 @@ impl PackRunCmd {
 /// RAII guard that terminates the VM child process and cleans up the
 /// per-invocation runtime directory on drop.
 struct ChildGuard {
-    pid: libc::pid_t,
+    pid: smolvm::process::Pid,
     start_time: Option<u64>,
     runtime_dir: tempfile::TempDir,
 }
@@ -1251,6 +1341,7 @@ fn run_from_cache(
 
     let console_log_path = runtime_dir.path().join("console.log");
     let vsock_path_clone = vsock_path.clone();
+    #[cfg(unix)]
     let child_pid = smolvm::process::fork_session_leader(move || {
         let krun = match unsafe { KrunFunctions::load(&lib_dir) } {
             Ok(k) => k,
@@ -1284,6 +1375,71 @@ fn run_from_cache(
         smolvm::process::exit_child(1);
     })
     .map_err(|e| Error::agent("fork VM process", e.to_string()))?;
+
+    // Windows has no fork(): re-spawn this executable as `_boot-vm <config>`,
+    // mirroring the non-packed launcher and the `--sidecar` path. BootConfig
+    // carries the same packed launch data (rootfs/disks/layers/ports).
+    #[cfg(not(unix))]
+    let child_pid = {
+        let _ = (&packed_mounts, &port_mappings, &vsock_path_clone);
+        let overlay_disk_path = overlay_runtime_path
+            .clone()
+            .unwrap_or_else(|| runtime_dir.path().join("overlay.raw"));
+        let boot_config = smolvm::agent::boot_config::BootConfig {
+            rootfs_path: rootfs_path.clone(),
+            storage_disk_path: storage_path.clone(),
+            overlay_disk_path,
+            vsock_socket: vsock_path.clone(),
+            console_log: Some(console_log_path.clone()),
+            startup_error_log: runtime_dir.path().join("startup-error.log"),
+            storage_size_gb: storage_gib.unwrap_or(smolvm::storage::DEFAULT_STORAGE_SIZE_GIB),
+            overlay_size_gb: args
+                .overlay
+                .unwrap_or(smolvm::storage::DEFAULT_OVERLAY_SIZE_GIB),
+            mounts: mounts.clone(),
+            ports: args.port.clone(),
+            resources: resources.clone(),
+            ssh_agent_socket: None,
+            dns_filter_hosts: None,
+            packed_layers_dir: Some(layers_dir.to_path_buf()),
+            extra_disks: vec![],
+        };
+        let config_path = runtime_dir.path().join("boot-config.json");
+        let config_json = serde_json::to_vec(&boot_config)
+            .map_err(|e| Error::agent("serialize boot config", e.to_string()))?;
+        std::fs::write(&config_path, &config_json)
+            .map_err(|e| Error::agent("write boot config", e.to_string()))?;
+        let exe = std::env::current_exe()
+            .map_err(|e| Error::agent("find smolvm binary", e.to_string()))?;
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(["_boot-vm", &config_path.to_string_lossy()])
+            .env("SMOLVM_LIB_DIR", &lib_dir)
+            .env("SMOLVM_BOOT_WATCH_PARENT", "0")
+            .env(
+                smolvm_protocol::guest_env::READY_MARKER,
+                smolvm_protocol::AGENT_READY_MARKER,
+            );
+        if debug {
+            cmd.stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::inherit());
+        } else {
+            cmd.stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        }
+        let child = cmd
+            .spawn()
+            .map_err(|e| Error::agent("spawn boot subprocess", e.to_string()))?;
+        child.id() as smolvm::process::Pid
+    };
 
     let child_start_time = {
         let mut st = smolvm::process::process_start_time(child_pid);
@@ -1391,12 +1547,12 @@ fn daemon_dir(checksum: u32) -> smolvm::Result<PathBuf> {
 ///
 /// The PID file format is: `{pid}\n{start_time}`.
 /// Returns `None` if the file doesn't exist or is malformed.
-fn read_daemon_pid(checksum: u32) -> Option<(libc::pid_t, Option<u64>)> {
+fn read_daemon_pid(checksum: u32) -> Option<(smolvm::process::Pid, Option<u64>)> {
     let dir = daemon_dir(checksum).ok()?;
     let pid_path = dir.join("agent.pid");
     let contents = std::fs::read_to_string(&pid_path).ok()?;
     let mut lines = contents.lines();
-    let pid: libc::pid_t = lines.next()?.parse().ok()?;
+    let pid: smolvm::process::Pid = lines.next()?.parse().ok()?;
     let start_time: Option<u64> = lines.next().and_then(|s| s.parse().ok());
     Some((pid, start_time))
 }
@@ -1404,7 +1560,7 @@ fn read_daemon_pid(checksum: u32) -> Option<(libc::pid_t, Option<u64>)> {
 /// Write PID and start time to the daemon PID file.
 fn write_daemon_pid(
     checksum: u32,
-    pid: libc::pid_t,
+    pid: smolvm::process::Pid,
     start_time: Option<u64>,
 ) -> smolvm::Result<()> {
     let dir = daemon_dir(checksum)?;

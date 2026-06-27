@@ -259,11 +259,49 @@ pub(crate) fn write_last_byte(
 ) -> Result<()> {
     assert!(size_bytes > 0, "disk size must be greater than 0");
 
+    // On Windows/NTFS a file is dense by default: seeking past the end and
+    // writing a tail byte allocates every block in between (a 20 GiB disk would
+    // need 20 GiB free, failing with ERROR_DISK_FULL). Mark the file sparse
+    // first so only written extents consume host space — matching the implicit
+    // sparse behavior of Unix filesystems.
+    #[cfg(windows)]
+    mark_file_sparse(file).map_err(|e| Error::storage("mark disk sparse", e.to_string()))?;
+
     file.seek(SeekFrom::Start(size_bytes - 1))
         .map_err(|e| Error::storage(seek_context, e.to_string()))?;
     file.write_all(&[0])
         .map_err(|e| Error::storage(write_context, e.to_string()))?;
     Ok(())
+}
+
+/// Mark an open file as sparse (Windows/NTFS) so writing a tail byte at a large
+/// offset doesn't allocate every intermediate block. No-op semantics elsewhere
+/// (Unix filesystems are sparse by default and never call this).
+#[cfg(windows)]
+fn mark_file_sparse(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    // FSCTL_SET_SPARSE control code (winioctl.h).
+    const FSCTL_SET_SPARSE: u32 = 0x000900C4;
+    let mut returned: u32 = 0;
+    // SAFETY: `file` is a valid open handle; FSCTL_SET_SPARSE uses no in/out buffers.
+    let ok = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle(),
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 /// Clone a file using the platform-optimal copy method.

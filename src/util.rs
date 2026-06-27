@@ -50,6 +50,8 @@ pub fn libkrunfw_filename() -> &'static str {
     let lib_name = "libkrunfw.5.dylib";
     #[cfg(target_os = "linux")]
     let lib_name = "libkrunfw.so.5";
+    #[cfg(target_os = "windows")]
+    let lib_name = "libkrunfw.dll";
     lib_name
 }
 
@@ -59,6 +61,8 @@ pub fn libkrun_filename() -> &'static str {
     let lib_name = "libkrun.dylib";
     #[cfg(target_os = "linux")]
     let lib_name = "libkrun.so";
+    #[cfg(target_os = "windows")]
+    let lib_name = "krun.dll";
     lib_name
 }
 

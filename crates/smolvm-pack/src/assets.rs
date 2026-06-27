@@ -109,6 +109,10 @@ impl AssetCollector {
 
         let lib_names = if cfg!(target_os = "macos") {
             vec!["libkrun.dylib", "libkrunfw.5.dylib"]
+        } else if cfg!(target_os = "windows") {
+            // Must match smolvm's loader (util::libkrun_filename): WHP uses the
+            // Windows DLL names, not the Linux .so names.
+            vec!["krun.dll", "libkrunfw.dll"]
         } else {
             vec!["libkrun.so", "libkrunfw.so.5"]
         };
@@ -326,6 +330,10 @@ impl AssetCollector {
 
         // Create sparse file
         let mut file = File::create(&template_path)?;
+        // On Windows/NTFS, File::create makes a dense file; seeking past the end
+        // and writing a tail byte would allocate every intermediate block.
+        #[cfg(windows)]
+        crate::extract::mark_file_sparse(&file)?;
         file.seek(SeekFrom::Start(TEMPLATE_SIZE - 1))?;
         file.write_all(&[0])?;
         file.sync_all()?;
@@ -352,11 +360,24 @@ impl AssetCollector {
                 }
             })
             .ok_or_else(|| {
-                PackError::AssetNotFound(
-                    "mkfs.ext4 not found. Install e2fsprogs or place a pre-formatted \
-                     storage-template.ext4 in ~/.smolvm/"
-                        .into(),
-                )
+                // Windows has no host mkfs.ext4, so point the user at the
+                // guest-VM recipe for staging a template (the agent rootfs has
+                // e2fsprogs). On Unix the fix is just installing e2fsprogs.
+                #[cfg(windows)]
+                let msg = "storage-template.ext4 not found, and Windows has no host \
+                     mkfs.ext4 to create one. Format a small template inside a guest VM \
+                     once and place it next to smolvm.exe (or in %USERPROFILE%\\.smolvm\\):\n  \
+                     smolvm machine create --name mktmpl --volume <dir>:/out\n  \
+                     smolvm machine start --name mktmpl\n  \
+                     smolvm machine exec --name mktmpl -- /bin/busybox sh -c \
+                     \"truncate -s 512M /out/storage-template.ext4 && \
+                     mkfs.ext4 -F -q -m 0 /out/storage-template.ext4\"\n  \
+                     smolvm machine delete --name mktmpl --force\n  \
+                     then copy <dir>\\storage-template.ext4 next to smolvm.exe";
+                #[cfg(not(windows))]
+                let msg = "mkfs.ext4 not found. Install e2fsprogs or place a pre-formatted \
+                     storage-template.ext4 in ~/.smolvm/";
+                PackError::AssetNotFound(msg.into())
             })?;
 
         // Format with ext4
@@ -520,6 +541,13 @@ fn sparse_copy_overlay(src: &Path, dst: &Path) -> std::io::Result<(u64, u64)> {
 
     // Create destination as a sparse skeleton; keep the handle for writing.
     let mut dst_file = File::create(dst)?;
+    // On Windows/NTFS, File::create makes a non-sparse file: set_len-ing to the
+    // (large) truncated size and then writing a chunk at a high offset would
+    // zero-fill/allocate the entire gap, ballooning a ~50 MB overlay to ~10 GiB
+    // of real disk. Mark it sparse first so only written extents consume space —
+    // matching the implicit sparse behavior of Unix filesystems.
+    #[cfg(windows)]
+    crate::extract::mark_file_sparse(&dst_file)?;
     dst_file.set_len(truncated_size)?;
 
     if truncated_size == 0 {

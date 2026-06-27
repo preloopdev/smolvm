@@ -23,10 +23,10 @@ pub fn control_socket_path(name: &str) -> PathBuf {
 
 /// Send a single line command to a VM control socket and return its reply line.
 pub fn control_socket_cmd(sock: &Path, cmd: &str) -> Result<String> {
+    use crate::platform::uds::UdsStream;
     use std::io::{Read, Write};
-    use std::os::unix::net::UnixStream;
 
-    let mut stream = UnixStream::connect(sock)
+    let mut stream = UdsStream::connect(sock)
         .map_err(|e| Error::agent("connect control socket", e.to_string()))?;
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(60)))
@@ -297,6 +297,17 @@ fn clone_fork_disks(gdir: &Path, clone_dir: &Path) -> Result<()> {
             }
         }
     }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        // Fork-clone disk overlays rely on libkrun's qcow2 overlay (Linux) or
+        // APFS clonefile (macOS); neither is wired up on Windows.
+        let _ = (&disks, clone_dir);
+        return Err(Error::agent(
+            "clone disk",
+            "live fork is not supported on this platform",
+        ));
+    }
+    #[allow(unreachable_code)]
     Ok(())
 }
 

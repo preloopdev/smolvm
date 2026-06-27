@@ -37,11 +37,16 @@
 
 mod traits;
 
+pub mod uds;
+
 #[cfg(target_os = "macos")]
 pub mod macos;
 
 #[cfg(target_os = "linux")]
 pub mod linux;
+
+#[cfg(target_os = "windows")]
+pub mod windows;
 
 pub use traits::{RosettaSupport, VmExecutor};
 
@@ -52,6 +57,8 @@ pub enum Os {
     MacOs,
     /// Linux
     Linux,
+    /// Windows
+    Windows,
 }
 
 impl Os {
@@ -67,6 +74,12 @@ impl Os {
         Os::Linux
     }
 
+    /// Get the current OS at compile time.
+    #[cfg(target_os = "windows")]
+    pub const fn current() -> Self {
+        Os::Windows
+    }
+
     /// Returns true if running on macOS.
     pub const fn is_macos(&self) -> bool {
         matches!(self, Os::MacOs)
@@ -76,6 +89,11 @@ impl Os {
     pub const fn is_linux(&self) -> bool {
         matches!(self, Os::Linux)
     }
+
+    /// Returns true if running on Windows.
+    pub const fn is_windows(&self) -> bool {
+        matches!(self, Os::Windows)
+    }
 }
 
 impl std::fmt::Display for Os {
@@ -83,6 +101,7 @@ impl std::fmt::Display for Os {
         match self {
             Os::MacOs => write!(f, "macos"),
             Os::Linux => write!(f, "linux"),
+            Os::Windows => write!(f, "windows"),
         }
     }
 }
@@ -179,6 +198,8 @@ impl Platform {
             (Os::MacOs, Arch::X86_64) => "darwin/amd64",
             (Os::Linux, Arch::Arm64) => "linux/arm64",
             (Os::Linux, Arch::X86_64) => "linux/amd64",
+            (Os::Windows, Arch::Arm64) => "windows/arm64",
+            (Os::Windows, Arch::X86_64) => "windows/amd64",
         }
     }
 
@@ -267,6 +288,18 @@ pub fn rosetta() -> macos::MacOsRosetta {
 #[cfg(target_os = "linux")]
 pub fn rosetta() -> linux::LinuxRosetta {
     linux::rosetta_support()
+}
+
+/// Get the platform-specific VM executor.
+#[cfg(target_os = "windows")]
+pub fn vm_executor() -> windows::WindowsExecutor {
+    windows::WindowsExecutor
+}
+
+/// Get the platform-specific Rosetta support handler.
+#[cfg(target_os = "windows")]
+pub fn rosetta() -> windows::WindowsRosetta {
+    windows::rosetta_support()
 }
 
 #[cfg(test)]

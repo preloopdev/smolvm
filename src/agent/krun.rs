@@ -6,7 +6,6 @@
 //! libraries and load them from the cache.
 
 use crate::util::{libkrun_filename, libkrunfw_filename};
-use std::ffi::{CStr, CString};
 use std::path::Path;
 
 /// Function pointers loaded from libkrun.
@@ -15,8 +14,13 @@ use std::path::Path;
 /// `Option` so callers can report feature-specific errors.
 #[allow(missing_docs)]
 pub struct KrunFunctions {
-    _handle: *mut libc::c_void,
-    _fw_handle: *mut libc::c_void,
+    // Keep the loaded libraries resident for the lifetime of the function
+    // table: the raw symbol pointers below borrow from these. `libloading`
+    // unloads (dlclose / FreeLibrary) on drop, so these must outlive the fns.
+    _handle: libloading::Library,
+    // Wrapped in `Option` so `Drop` can `take()` and `forget()` it, keeping
+    // libkrunfw resident (never unloaded) for any libkrun-owned references.
+    _fw_handle: Option<libloading::Library>,
     pub set_log_level: unsafe extern "C" fn(u32) -> i32,
     pub create_ctx: unsafe extern "C" fn() -> i32,
     pub free_ctx: unsafe extern "C" fn(u32),
@@ -81,86 +85,97 @@ impl KrunFunctions {
         preload_linux_gpu_dependencies(lib_dir);
 
         let fw_lib_path = lib_dir.join(libkrunfw_filename());
-        let fw_lib_path_c = CString::new(fw_lib_path.to_string_lossy().as_bytes())
-            .map_err(|_| "invalid library path")?;
-
-        let fw_handle = libc::dlopen(fw_lib_path_c.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
-        if fw_handle.is_null() {
-            return Err(format!(
-                "failed to load {}: {}",
-                fw_lib_path.display(),
-                dlerror_message()
-            ));
-        }
+        // libkrunfw must be loaded with RTLD_GLOBAL on Unix so libkrun can
+        // resolve it later by soname; `libloading` only exposes that via the
+        // os-specific `Library::open`. On Windows there is no RTLD_GLOBAL
+        // concept, so a plain `Library::new` is used.
+        let fw_handle = load_library_global(&fw_lib_path)
+            .map_err(|e| format!("failed to load {}: {}", fw_lib_path.display(), e))?;
 
         let lib_path = lib_dir.join(libkrun_filename());
-        let lib_path_c = CString::new(lib_path.to_string_lossy().as_bytes())
-            .map_err(|_| "invalid library path")?;
-
-        // RTLD_LAZY (not RTLD_NOW): a single libkrun built with the GPU feature
-        // references virglrenderer, but on Linux that NEEDED entry is stripped at
-        // package time so a host without virglrenderer can still load it. Lazy
-        // binding defers the virgl symbols until the GPU path actually calls them;
-        // preload_linux_gpu_dependencies() loads virglrenderer first when a GPU
-        // host has it. Non-GPU hosts never bind those symbols.
-        let handle = libc::dlopen(lib_path_c.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL);
-        if handle.is_null() {
-            let err = dlerror_message();
-            libc::dlclose(fw_handle);
-            return Err(format!("failed to load {}: {}", lib_path.display(), err));
-        }
+        // RTLD_LAZY (not RTLD_NOW) on Unix: a single libkrun built with the GPU
+        // feature references virglrenderer, but on Linux that NEEDED entry is
+        // stripped at package time so a host without virglrenderer can still
+        // load it. Lazy binding defers the virgl symbols until the GPU path
+        // actually calls them; preload_linux_gpu_dependencies() loads
+        // virglrenderer first when a GPU host has it. Non-GPU hosts never bind
+        // those symbols.
+        let handle = libloading::Library::new(&lib_path)
+            .map_err(|e| format!("failed to load {}: {}", lib_path.display(), e))?;
 
         macro_rules! load_sym {
             ($name:ident) => {{
-                let sym_name = CString::new(stringify!($name)).expect("symbol name is static");
-                let sym = libc::dlsym(handle, sym_name.as_ptr());
-                if sym.is_null() {
-                    libc::dlclose(handle);
-                    libc::dlclose(fw_handle);
-                    return Err(format!("symbol not found: {}", stringify!($name)));
-                }
+                let sym: libloading::Symbol<*mut std::ffi::c_void> = handle
+                    .get(concat!(stringify!($name), "\0").as_bytes())
+                    .map_err(|_| format!("symbol not found: {}", stringify!($name)))?;
+                // The raw pointer outlives the `Symbol` borrow; the backing
+                // `Library` is kept resident in `_handle`/`_fw_handle`.
                 #[allow(clippy::missing_transmute_annotations)]
-                std::mem::transmute(sym)
+                std::mem::transmute(*sym)
             }};
         }
 
         macro_rules! load_optional_sym {
             ($name:literal) => {{
-                let sym_name = CString::new($name).expect("symbol name is static");
-                let sym = libc::dlsym(handle, sym_name.as_ptr());
-                if sym.is_null() {
-                    None
-                } else {
-                    #[allow(clippy::missing_transmute_annotations)]
-                    Some(std::mem::transmute(sym))
+                match handle.get::<*mut std::ffi::c_void>(concat!($name, "\0").as_bytes()) {
+                    Ok(sym) =>
+                    {
+                        #[allow(clippy::missing_transmute_annotations)]
+                        Some(std::mem::transmute(*sym))
+                    }
+                    Err(_) => None,
                 }
             }};
         }
 
+        // Resolve all symbols (borrowing `handle`) before moving the libraries
+        // into the struct, so the moves don't conflict with the borrows.
+        let set_log_level = load_sym!(krun_set_log_level);
+        let create_ctx = load_sym!(krun_create_ctx);
+        let free_ctx = load_sym!(krun_free_ctx);
+        let set_vm_config = load_sym!(krun_set_vm_config);
+        let set_workdir = load_sym!(krun_set_workdir);
+        let set_exec = load_sym!(krun_set_exec);
+        let set_port_map = load_sym!(krun_set_port_map);
+        let add_disk2 = load_sym!(krun_add_disk2);
+        let add_vsock_port2 = load_sym!(krun_add_vsock_port2);
+        let add_virtiofs = load_sym!(krun_add_virtiofs);
+        let add_virtiofs3 = load_optional_sym!("krun_add_virtiofs3");
+        let start_enter = load_sym!(krun_start_enter);
+        let add_vsock = load_sym!(krun_add_vsock);
+        let add_virtio_console_default = load_sym!(krun_add_virtio_console_default);
+        let set_egress_policy = load_optional_sym!("krun_set_egress_policy");
+        let add_net_unixstream = load_optional_sym!("krun_add_net_unixstream");
+        let get_egress_handle = load_optional_sym!("krun_get_egress_handle");
+        let set_gpu_options2 = load_optional_sym!("krun_set_gpu_options2");
+        let set_control_socket = load_optional_sym!("krun_set_control_socket");
+        let set_snapshot = load_optional_sym!("krun_set_snapshot");
+        let create_disk_overlay = load_optional_sym!("krun_create_disk_overlay");
+
         Ok(Self {
             _handle: handle,
-            _fw_handle: fw_handle,
-            set_log_level: load_sym!(krun_set_log_level),
-            create_ctx: load_sym!(krun_create_ctx),
-            free_ctx: load_sym!(krun_free_ctx),
-            set_vm_config: load_sym!(krun_set_vm_config),
-            set_workdir: load_sym!(krun_set_workdir),
-            set_exec: load_sym!(krun_set_exec),
-            set_port_map: load_sym!(krun_set_port_map),
-            add_disk2: load_sym!(krun_add_disk2),
-            add_vsock_port2: load_sym!(krun_add_vsock_port2),
-            add_virtiofs: load_sym!(krun_add_virtiofs),
-            add_virtiofs3: load_optional_sym!("krun_add_virtiofs3"),
-            start_enter: load_sym!(krun_start_enter),
-            add_vsock: load_sym!(krun_add_vsock),
-            add_virtio_console_default: load_sym!(krun_add_virtio_console_default),
-            set_egress_policy: load_optional_sym!("krun_set_egress_policy"),
-            add_net_unixstream: load_optional_sym!("krun_add_net_unixstream"),
-            get_egress_handle: load_optional_sym!("krun_get_egress_handle"),
-            set_gpu_options2: load_optional_sym!("krun_set_gpu_options2"),
-            set_control_socket: load_optional_sym!("krun_set_control_socket"),
-            set_snapshot: load_optional_sym!("krun_set_snapshot"),
-            create_disk_overlay: load_optional_sym!("krun_create_disk_overlay"),
+            _fw_handle: Some(fw_handle),
+            set_log_level,
+            create_ctx,
+            free_ctx,
+            set_vm_config,
+            set_workdir,
+            set_exec,
+            set_port_map,
+            add_disk2,
+            add_vsock_port2,
+            add_virtiofs,
+            add_virtiofs3,
+            start_enter,
+            add_vsock,
+            add_virtio_console_default,
+            set_egress_policy,
+            add_net_unixstream,
+            get_egress_handle,
+            set_gpu_options2,
+            set_control_socket,
+            set_snapshot,
+            create_disk_overlay,
         })
     }
 }
@@ -177,6 +192,7 @@ impl KrunFunctions {
     ///
     /// # Safety
     /// `ctx` must be a valid libkrun context that has not yet been started.
+    #[cfg(unix)]
     pub unsafe fn console_output_to_file(&self, ctx: u32, path: &Path) -> i32 {
         use std::os::fd::IntoRawFd;
         let Ok(out) = std::fs::OpenOptions::new()
@@ -192,24 +208,60 @@ impl KrunFunctions {
         let null_fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
         unsafe { (self.add_virtio_console_default)(ctx, null_fd, out_fd, out_fd) }
     }
+
+    /// Windows stub: the virtio-console redirection relies on POSIX file
+    /// descriptors passed to libkrun. The Windows libkrun ABI/console wiring is
+    /// not implemented here, so this is a no-op that reports failure.
+    ///
+    /// # Safety
+    /// `unsafe` only to match the Unix signature (which dereferences libkrun
+    /// function pointers). This stub touches nothing and is always sound to call.
+    #[cfg(not(unix))]
+    pub unsafe fn console_output_to_file(&self, _ctx: u32, _path: &Path) -> i32 {
+        -1
+    }
 }
 
+// libkrun's `_handle` is unloaded automatically when `KrunFunctions` is
+// dropped (libloading calls dlclose / FreeLibrary). libkrunfw (`_fw_handle`)
+// is intentionally kept resident for any libkrun-owned references, so we leak
+// it rather than letting it unload.
 impl Drop for KrunFunctions {
     fn drop(&mut self) {
-        unsafe {
-            libc::dlclose(self._handle);
-            // Keep libkrunfw resident for any libkrun-owned references.
+        // Leak libkrunfw rather than unloading it: libkrun may still hold
+        // references resolved against it. `_handle` (libkrun itself) is dropped
+        // normally, unloading it.
+        if let Some(fw) = self._fw_handle.take() {
+            std::mem::forget(fw);
         }
     }
 }
 
+/// Load a dynamic library with global symbol visibility where the platform
+/// supports it (RTLD_GLOBAL on Unix). On Windows there is no equivalent flag,
+/// so a normal load is performed.
+unsafe fn load_library_global(path: &Path) -> Result<libloading::Library, String> {
+    #[cfg(unix)]
+    {
+        use libloading::os::unix::{Library, RTLD_GLOBAL, RTLD_NOW};
+        Library::open(Some(path), RTLD_NOW | RTLD_GLOBAL)
+            .map(Into::into)
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        libloading::Library::new(path).map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn dlerror_message() -> String {
     unsafe {
         let err = libc::dlerror();
         if err.is_null() {
             "unknown error".to_string()
         } else {
-            CStr::from_ptr(err).to_string_lossy().to_string()
+            std::ffi::CStr::from_ptr(err).to_string_lossy().to_string()
         }
     }
 }
@@ -242,6 +294,7 @@ fn preload_linux_gpu_dependencies(lib_dir: &Path) {
 
 #[cfg(target_os = "linux")]
 fn dlopen_global(path: &Path) -> bool {
+    use std::ffi::CString;
     let Ok(path_c) = CString::new(path.to_string_lossy().as_bytes()) else {
         return false;
     };
@@ -267,6 +320,7 @@ fn dlopen_global(path: &Path) -> bool {
 /// non-GPU host the library is absent, which is expected and not an error.
 #[cfg(target_os = "linux")]
 fn dlopen_global_soname(soname: &str) -> bool {
+    use std::ffi::CString;
     let Ok(soname_c) = CString::new(soname) else {
         return false;
     };

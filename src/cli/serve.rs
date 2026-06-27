@@ -3,6 +3,7 @@
 use axum::Router;
 use clap::Parser;
 use std::net::SocketAddr;
+#[cfg(unix)]
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -216,6 +217,9 @@ impl ServeStartCmd {
     }
 
     async fn run_server(self, listen_target: ListenTarget) -> Result<()> {
+        // On Windows `ListenTarget` has only the `Tcp` variant (Unix-socket
+        // listening is unix-gated), making this match irrefutable there.
+        #[cfg_attr(not(unix), allow(irrefutable_let_patterns))]
         if let ListenTarget::Tcp(addr) = &listen_target {
             if addr.ip().is_unspecified() {
                 eprintln!(

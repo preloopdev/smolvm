@@ -4,6 +4,7 @@
 //! and receiving responses.
 
 use crate::error::{Error, Result};
+use crate::platform::uds::UdsStream;
 use crate::registry::{extract_registry, rewrite_image_registry, RegistryAuth};
 use crate::settings::SmolSettings;
 use smolvm_protocol::normalize_image_ref;
@@ -13,7 +14,6 @@ use smolvm_protocol::{
     PROTOCOL_VERSION,
 };
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
@@ -115,13 +115,13 @@ const DISCONNECT_EXIT_CODE: i32 = 130;
 /// returns early due to an error. Uses a cloned UnixStream handle
 /// (shares the underlying fd) to avoid borrow conflicts.
 pub struct ReadTimeoutGuard {
-    stream: UnixStream,
+    stream: UdsStream,
 }
 
 impl ReadTimeoutGuard {
     /// Create a guard from a reference to the stream.
     /// Clones the underlying fd so the guard doesn't borrow the original.
-    fn new(stream: &UnixStream) -> Option<Self> {
+    fn new(stream: &UdsStream) -> Option<Self> {
         stream.try_clone().ok().map(|s| Self { stream: s })
     }
 }
@@ -342,6 +342,29 @@ impl<F: FnMut(usize, usize, &str)> PullOptions<F> {
     }
 }
 
+/// Raw descriptor of the process's stdin, in the portable form the terminal
+/// poll loop expects. Unix: the real fd; Windows: the `STD_INPUT_HANDLE`
+/// console handle cast into the portable `Fd`.
+fn stdin_raw_fd() -> crate::agent::terminal::Fd {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        std::io::stdin().as_raw_fd()
+    }
+    #[cfg(not(unix))]
+    {
+        // SAFETY: GetStdHandle has no preconditions; it returns the process's
+        // standard-input HANDLE (or INVALID_HANDLE_VALUE), which the Windows
+        // poll loop interprets.
+        let handle = unsafe {
+            windows_sys::Win32::System::Console::GetStdHandle(
+                windows_sys::Win32::System::Console::STD_INPUT_HANDLE,
+            )
+        };
+        handle as crate::agent::terminal::Fd
+    }
+}
+
 /// Check if a shutdown receive error is a benign race condition.
 ///
 /// During shutdown the VM may tear down before the ack response is flushed,
@@ -357,7 +380,7 @@ fn is_benign_shutdown_error(error_str: &str) -> bool {
 
 /// Client for communicating with the smolvm-agent.
 pub struct AgentClient {
-    stream: UnixStream,
+    stream: UdsStream,
     /// Trace ID for correlating this client session's requests with host API calls.
     trace_id: Option<String>,
 }
@@ -407,8 +430,8 @@ impl AgentClient {
     ///
     /// Test-only: production code must go through [`AgentClient::connect`]
     /// so socket timeouts are configured correctly. Used by the regression
-    /// tests that drive the client against a `UnixStream::pair()`.
-    pub(crate) fn from_stream(stream: UnixStream) -> Self {
+    /// tests that drive the client against a `UdsStream::pair()`.
+    pub(crate) fn from_stream(stream: UdsStream) -> Self {
         Self {
             stream,
             trace_id: None,
@@ -516,7 +539,7 @@ impl AgentClient {
 
     /// Connect to the agent socket and configure read/write timeouts (in milliseconds).
     fn connect_with_timeouts_ms(socket_path: &Path, read_ms: u64, write_ms: u64) -> Result<Self> {
-        let stream = UnixStream::connect(socket_path)
+        let stream = UdsStream::connect(socket_path)
             .map_err(|e| Error::agent("connect to agent", e.to_string()))?;
 
         stream
@@ -960,6 +983,21 @@ impl AgentClient {
         Ok(pid)
     }
 
+    /// Raw descriptor of the underlying agent socket, in the portable form the
+    /// terminal poll loop expects. Unix: the socket fd; Windows: the underlying
+    /// WinSock `SOCKET` cast into the portable `Fd`.
+    fn stream_raw_fd(&self) -> crate::agent::terminal::Fd {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            self.stream.as_raw_fd()
+        }
+        #[cfg(not(unix))]
+        {
+            self.stream.raw_socket() as crate::agent::terminal::Fd
+        }
+    }
+
     /// Run an interactive I/O session.
     ///
     /// Sends `request`, waits for `Started`, then runs the poll loop
@@ -970,7 +1008,6 @@ impl AgentClient {
             stdin_is_tty, write_all_retry, NonBlockingStdin, RawModeGuard,
         };
         use std::io::{stderr, stdin, stdout, Read};
-        use std::os::unix::io::AsRawFd;
 
         // Disable socket read timeout for interactive sessions — the poll loop
         // handles readiness checking, and the session runs until the user exits.
@@ -995,7 +1032,7 @@ impl AgentClient {
         // Enable raw mode if TTY requested and stdin is a TTY
         // The guard will restore terminal settings on drop (even on panic)
         let _raw_mode = if tty && stdin_is_tty() {
-            RawModeGuard::new(stdin().as_raw_fd())
+            RawModeGuard::new(stdin_raw_fd())
         } else {
             None
         };
@@ -1016,8 +1053,8 @@ impl AgentClient {
         // read/write completes immediately. This avoids partial-read/write bugs
         // that occur with non-blocking read_exact/write_all.
         let mut stdin_handle = stdin();
-        let stdin_fd = stdin_handle.as_raw_fd();
-        let socket_fd = self.stream.as_raw_fd();
+        let stdin_fd = stdin_raw_fd();
+        let socket_fd = self.stream_raw_fd();
         let mut stdin_buf = [0u8; STDIN_BUF_SIZE];
         let mut stdin_eof = false;
 
@@ -1342,7 +1379,6 @@ impl AgentClient {
         F: FnMut(InteractiveOutput),
     {
         use crate::agent::terminal::poll_io;
-        use std::os::unix::io::AsRawFd;
 
         // No socket read timeout — the poll loop handles readiness and the
         // session runs until the command exits or the peer hangs up.
@@ -1357,7 +1393,7 @@ impl AgentClient {
             _ => return Err(Error::agent(op, "expected Started response")),
         }
 
-        let socket_fd = self.stream.as_raw_fd();
+        let socket_fd = self.stream_raw_fd();
         let mut input_eof_sent = false;
 
         let exit_code = loop {
@@ -2200,7 +2236,7 @@ mod run_background_tests {
 
     #[test]
     fn run_background_sends_background_true_and_returns_pid() {
-        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let (client_stream, mut server_stream) = UdsStream::pair().unwrap();
 
         // Fake agent: read one request, assert it's a background Run, respond
         // with a Completed PID. Mirrors what the real agent does in
@@ -2274,7 +2310,7 @@ mod run_background_tests {
         // If the agent fails to spawn the container, it returns a non-zero
         // exit_code. The client must turn that into an error rather than
         // silently returning a bogus PID.
-        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let (client_stream, mut server_stream) = UdsStream::pair().unwrap();
 
         let server = thread::spawn(move || {
             let mut len_buf = [0u8; 4];
@@ -2324,7 +2360,7 @@ mod run_streaming_tests {
 
     #[test]
     fn run_streaming_sends_interactive_run_and_collects_events() {
-        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let (client_stream, mut server_stream) = UdsStream::pair().unwrap();
 
         let server = thread::spawn(move || {
             let mut len_buf = [0u8; 4];

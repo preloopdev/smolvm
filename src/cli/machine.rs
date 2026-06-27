@@ -24,7 +24,6 @@ use smolvm::data::storage::HostMount;
 use smolvm::network::{validate_requested_network_backend, NetworkBackend};
 use smolvm::{DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD};
 use std::io::Write;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -154,19 +153,23 @@ fn try_spawn_detached_cleanup(
         Ok(p) => p,
         Err(_) => return false,
     };
-    let result = std::process::Command::new(exe)
-        .arg("_cleanup-ephemeral")
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("_cleanup-ephemeral")
         .arg(vm_name)
         .arg(pid.to_string())
         .arg(start_time_val.to_string())
         .arg(ephemeral_name)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        // New process group so the helper is immune to SIGHUP when the
-        // parent terminal closes. pgid = child pid.
-        .process_group(0)
-        .spawn();
+        .stderr(std::process::Stdio::null());
+    // New process group so the helper is immune to SIGHUP when the parent
+    // terminal closes (pgid = child pid). POSIX-only; no Windows equivalent.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let result = cmd.spawn();
     // Drop the Child handle without waiting — we exit immediately after this.
     // The OS will not create a zombie because the helper outlives us and its
     // real parent (launchd/init) reaps it when it exits.
@@ -1751,6 +1754,13 @@ pub struct ExecCmd {
     /// Stream output in real-time (prints as it arrives)
     #[arg(long)]
     pub stream: bool,
+
+    /// Detach: spawn the command in the background and return its PID
+    /// immediately. The process keeps running (it is not killed when this
+    /// command returns), so it can host long-lived services — e.g. a server
+    /// bound to a published port. Incompatible with -i/-t and --stream.
+    #[arg(short = 'd', long, conflicts_with_all = ["interactive", "tty", "stream"])]
+    pub detach: bool,
 }
 
 impl ExecCmd {
@@ -1826,6 +1836,17 @@ impl ExecCmd {
             // Use machine name as persistent overlay ID so filesystem changes
             // (e.g. package installs) survive across exec sessions.
             let machine_name = name.clone();
+            if self.detach {
+                let config = smolvm::agent::RunConfig::new(image, self.command.clone())
+                    .with_env(defaults.env)
+                    .with_workdir(defaults.workdir)
+                    .with_user(defaults.user)
+                    .with_mounts(mount_bindings)
+                    .with_persistent_overlay(Some(machine_name));
+                let pid = client.run_background(config)?;
+                println!("{pid}");
+                return Ok(());
+            }
             if self.interactive || self.tty {
                 let config = smolvm::agent::RunConfig::new(image, self.command.clone())
                     .with_env(defaults.env.clone())
@@ -1865,6 +1886,14 @@ impl ExecCmd {
             // Bare VM: exec directly in the VM rootfs.
             // Merge record env + resolved secrets with CLI env, same as image path.
             let env = vm_common::merge_env_overrides(&record_env, &env);
+            if self.detach {
+                // Spawn detached in the guest root netns — no setsid/killpg, so
+                // a daemon (e.g. a server on a published port) survives. TSI sees
+                // the listen() and opens the host-side forward.
+                let pid = client.vm_exec_background(self.command.clone(), env, workdir.clone())?;
+                println!("{pid}");
+                return Ok(());
+            }
             if self.interactive || self.tty {
                 let exit_code = client.vm_exec_interactive(
                     self.command.clone(),
@@ -1960,6 +1989,7 @@ impl ShellCmd {
             interactive: true,
             tty: true,
             stream: false,
+            detach: false,
         }
         .run()
     }

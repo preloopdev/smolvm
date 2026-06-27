@@ -11,11 +11,13 @@
 //!
 //! They need two kinds of coordination:
 //! 1. lock-free frame handoff between threads
-//! 2. a way to wake a thread that is blocked in `poll(2)` or waiting for work
+//! 2. a way to wake a thread that is blocked waiting on socket readiness
 //!
 //! This module provides both:
 //! - `ArrayQueue<Vec<u8>>` for frame ownership transfer
-//! - `WakePipe` as a tiny readiness primitive built from `pipe(2)` + `poll(2)`
+//! - `WakePipe` as a tiny readiness primitive built on a cross-platform poller
+//!   (`polling`, which maps to epoll/kqueue/IOCP). Its `notify()` is the
+//!   cross-thread wakeup, replacing the old self-pipe.
 //!
 //! Data flow:
 //!
@@ -51,7 +53,7 @@
 //! ```
 
 use crossbeam_queue::ArrayQueue;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use polling::{Events, Poller};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -77,6 +79,11 @@ pub struct NetworkFrameQueues {
     /// Raw ethernet frames emitted by smoltcp and waiting for libkrun.
     pub host_to_guest: ArrayQueue<Vec<u8>>,
     /// Wake the smoltcp poll loop when a guest frame arrives.
+    ///
+    /// `guest_wake` and `relay_wake` deliberately share one underlying poller:
+    /// the smoltcp loop blocks on that single poller and either wake unblocks
+    /// it. The loop re-runs its whole pipeline on every wakeup, so it does not
+    /// need to know which side fired.
     pub guest_wake: WakePipe,
     /// Wake the libkrun writer thread when a host frame is ready.
     pub host_wake: WakePipe,
@@ -95,12 +102,16 @@ pub struct NetworkFrameQueues {
 impl NetworkFrameQueues {
     /// Create a new shared queue set wrapped in `Arc`.
     pub fn shared(capacity: usize) -> Arc<Self> {
+        // The smoltcp poll loop waits on a single poller; both the guest-frame
+        // wake and the relay wake notify it, so they share one poller instance.
+        let poll_loop = WakePipe::new();
+        let relay_wake = poll_loop.share();
         Arc::new(Self {
             guest_to_host: ArrayQueue::new(capacity),
             host_to_guest: ArrayQueue::new(capacity),
-            guest_wake: WakePipe::new(),
+            guest_wake: poll_loop,
             host_wake: WakePipe::new(),
-            relay_wake: WakePipe::new(),
+            relay_wake,
             shutting_down: AtomicBool::new(false),
             egress_bytes: Arc::new(AtomicU64::new(0)),
         })
@@ -126,8 +137,8 @@ impl NetworkFrameQueues {
     /// Mark the runtime as shutting down and wake all waiters.
     ///
     /// The wakes are part of shutdown correctness. Without them, a thread
-    /// blocked in `poll(2)` could sleep indefinitely even though the shutdown
-    /// flag was already set.
+    /// blocked waiting on socket readiness could sleep indefinitely even though
+    /// the shutdown flag was already set.
     pub fn begin_shutdown(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
         self.guest_wake.wake();
@@ -141,137 +152,88 @@ impl NetworkFrameQueues {
     }
 }
 
-/// Wake notification built on `pipe(2)`.
+/// Cross-thread wake notification built on a cross-platform poller.
 ///
 /// The pattern is:
-/// - one thread blocks on the read end with `poll(2)`
-/// - another thread writes one byte to the write end to signal "work exists"
-/// - the waiter drains pending bytes before going back to sleep
+/// - one thread blocks waiting on the poller (optionally alongside registered
+///   socket sources)
+/// - another thread calls [`WakePipe::wake`] to unblock it
+/// - the waiter resumes; the wake is auto-cleared by the next `wait`
 ///
-/// Why use a pipe here:
-/// - it gives us a real file descriptor that integrates with `poll(2)`
-/// - it works on the Unix platforms smolvm targets
-/// - it is simpler than building a custom condvar + timeout scheme around the
-///   smoltcp loop and Unix-stream writer
-#[derive(Debug)]
+/// Why a poller rather than a self-pipe: `polling::Poller::notify()` is a
+/// portable cross-thread wakeup that works on Windows (where a `pipe(2)` is not
+/// pollable by the IOCP/wepoll backend) as well as Unix. The same poller can
+/// have socket sources registered on it, which lets the ICMP/UDP relay loops
+/// wait on "wake OR any flow socket readable" in a single blocking call.
+#[derive(Clone, Debug)]
 pub struct WakePipe {
-    read_fd: OwnedFd,
-    write_fd: OwnedFd,
+    poller: Arc<Poller>,
 }
 
 impl WakePipe {
-    /// Create a non-blocking wake pipe.
-    ///
-    /// Low-level steps:
-    ///
-    /// ```text
-    /// pipe()               -> create read/write fds
-    /// fcntl(F_SETFL)       -> add O_NONBLOCK
-    /// fcntl(F_SETFD)       -> add FD_CLOEXEC
-    /// wrap in OwnedFd      -> move fd lifetime into Rust ownership
-    /// ```
+    /// Create a wake notification with its own poller.
     pub fn new() -> Self {
-        let mut fds = [0i32; 2];
-
-        // SAFETY: `pipe` initializes both file descriptors on success.
-        let result = unsafe { libc::pipe(fds.as_mut_ptr()) };
-        assert_eq!(
-            result,
-            0,
-            "pipe() failed: {}",
-            std::io::Error::last_os_error()
-        );
-
-        // SAFETY: both descriptors are valid after a successful `pipe`.
-        unsafe {
-            set_nonblock_cloexec(fds[0]);
-            set_nonblock_cloexec(fds[1]);
-        }
-
         Self {
-            // SAFETY: ownership of the raw file descriptors transfers here.
-            read_fd: unsafe { OwnedFd::from_raw_fd(fds[0]) },
-            write_fd: unsafe { OwnedFd::from_raw_fd(fds[1]) },
+            poller: Arc::new(Poller::new().expect("create poller for wake notification")),
         }
+    }
+
+    /// Create another handle that shares this wake's underlying poller.
+    ///
+    /// Two `WakePipe`s built this way notify the same waiter: useful when one
+    /// loop must wake on either of two logical events (the smoltcp loop wakes on
+    /// guest frames or relay data).
+    pub fn share(&self) -> Self {
+        Self {
+            poller: self.poller.clone(),
+        }
+    }
+
+    /// The underlying poller, so a caller can register socket sources on it and
+    /// block on "this wake OR a socket" in a single `wait`.
+    pub fn poller(&self) -> &Arc<Poller> {
+        &self.poller
     }
 
     /// Signal the waiting side.
     ///
-    /// Writing one byte is enough. The byte value itself does not matter; only
-    /// readability of the pipe matters. Multiple writes coalesce naturally into
-    /// "there is pending wake state".
+    /// Multiple wakes coalesce: until the waiter next blocks, repeated notifies
+    /// collapse into a single "there is pending wake state".
     pub fn wake(&self) {
-        let byte = [1u8; 1];
-        // SAFETY: the write end is valid and non-blocking.
-        unsafe {
-            libc::write(self.write_fd.as_raw_fd(), byte.as_ptr().cast(), byte.len());
-        }
+        // A failed notify only means the waiter will rely on its poll timeout;
+        // it is never fatal.
+        let _ = self.poller.notify();
     }
 
-    /// Drain all pending wake bytes.
+    /// Drain pending wake state.
     ///
-    /// This resets the readiness state after a wake. Because the pipe is
-    /// non-blocking, `read <= 0` means "nothing more to drain right now".
-    pub fn drain(&self) {
-        let mut buf = [0u8; 256];
-        loop {
-            // SAFETY: the read end is valid and non-blocking.
-            let read =
-                unsafe { libc::read(self.read_fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-            if read <= 0 {
-                break;
-            }
-        }
-    }
+    /// With a poller-backed waker the notification is consumed by `wait`
+    /// itself, so this is a no-op kept for API symmetry with the old self-pipe.
+    pub fn drain(&self) {}
 
-    /// Wait until the pipe is readable or the timeout elapses.
+    /// Wait until woken or the timeout elapses.
     ///
-    /// This is the low-level equivalent of "sleep until another thread signals
-    /// me or the timeout expires", but implemented in file-descriptor space so
-    /// it composes with other polling logic.
+    /// Returns `Ok(true)` if the wait ended because of a wake (a `notify` or a
+    /// registered source becoming ready), `Ok(false)` if the timeout elapsed.
+    ///
+    /// A `notify`-driven wakeup reports no events (the poller consumes the
+    /// notification internally), so a pure wake is detected as either a
+    /// non-empty event set or an early return: the wait unblocked before the
+    /// requested deadline.
     pub fn wait(&self, timeout: Option<Duration>) -> std::io::Result<bool> {
-        let timeout_ms = timeout
-            .map(|duration| duration.as_millis().min(i32::MAX as u128) as i32)
-            .unwrap_or(-1);
-        let mut pollfd = libc::pollfd {
-            fd: self.read_fd.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-
-        // SAFETY: `pollfd` points to a valid descriptor and struct.
-        let result = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
-        if result < 0 {
-            return Err(std::io::Error::last_os_error());
+        let mut events = Events::new();
+        let start = std::time::Instant::now();
+        let count = self.poller.wait(&mut events, timeout)?;
+        if count > 0 {
+            return Ok(true);
         }
-
-        Ok(result > 0 && pollfd.revents & libc::POLLIN != 0)
-    }
-
-    /// File descriptor for `poll(2)`.
-    ///
-    /// Callers should treat this as a borrowed readiness handle, not as an fd
-    /// they own or may close.
-    pub fn as_raw_fd(&self) -> RawFd {
-        self.read_fd.as_raw_fd()
-    }
-}
-
-impl Clone for WakePipe {
-    /// Clone by duplicating both file descriptors.
-    ///
-    /// Each clone refers to the same underlying pipe objects, so waking or
-    /// draining from any clone affects the shared readiness state.
-    fn clone(&self) -> Self {
-        let read_fd = self
-            .read_fd
-            .try_clone()
-            .expect("wake pipe read fd should be clonable");
-        let write_fd = self
-            .write_fd
-            .try_clone()
-            .expect("wake pipe write fd should be clonable");
-        Self { read_fd, write_fd }
+        match timeout {
+            // Without a deadline, the only way `wait` returns is a wake.
+            None => Ok(true),
+            // With a deadline, an early return means a `notify` woke us; a
+            // return at/after the deadline is a genuine timeout.
+            Some(timeout) => Ok(start.elapsed() < timeout),
+        }
     }
 }
 
@@ -279,49 +241,6 @@ impl Default for WakePipe {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Set `O_NONBLOCK` and `FD_CLOEXEC` on a file descriptor.
-///
-/// # Safety
-///
-/// `fd` must be a valid open file descriptor.
-///
-/// Why these flags matter:
-/// - `O_NONBLOCK`: wake helpers should never hang the runtime on a read/write
-///   path that is supposed to be just a signal
-/// - `FD_CLOEXEC`: if smolvm later `exec`s another process, these internal
-///   coordination fds should not leak into that child
-unsafe fn set_nonblock_cloexec(fd: RawFd) {
-    // SAFETY: caller guarantees `fd` is valid.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    assert!(
-        flags >= 0,
-        "fcntl(F_GETFL) failed: {}",
-        std::io::Error::last_os_error()
-    );
-    // SAFETY: caller guarantees `fd` is valid.
-    let result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-    assert!(
-        result >= 0,
-        "fcntl(F_SETFL) failed: {}",
-        std::io::Error::last_os_error()
-    );
-
-    // SAFETY: caller guarantees `fd` is valid.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    assert!(
-        flags >= 0,
-        "fcntl(F_GETFD) failed: {}",
-        std::io::Error::last_os_error()
-    );
-    // SAFETY: caller guarantees `fd` is valid.
-    let result = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
-    assert!(
-        result >= 0,
-        "fcntl(F_SETFD) failed: {}",
-        std::io::Error::last_os_error()
-    );
 }
 
 #[cfg(test)]
@@ -335,6 +254,17 @@ mod tests {
         assert!(pipe.wait(Some(Duration::from_millis(10))).unwrap());
         pipe.drain();
         assert!(!pipe.wait(Some(Duration::from_millis(1))).unwrap());
+    }
+
+    #[test]
+    fn shared_wake_notifies_same_waiter() {
+        let a = WakePipe::new();
+        let b = a.share();
+        // Waking the shared handle unblocks a waiter on the original.
+        b.wake();
+        assert!(a.wait(Some(Duration::from_millis(10))).unwrap());
+        a.drain();
+        assert!(!a.wait(Some(Duration::from_millis(1))).unwrap());
     }
 
     #[test]

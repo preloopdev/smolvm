@@ -353,8 +353,8 @@ impl SmolvmDb {
                 .optional()
                 .db_err(format!("read create reservation '{}'", name))?
             {
-                let pid_alive =
-                    existing_pid > 0 && crate::process::is_alive(existing_pid as libc::pid_t);
+                let pid_alive = existing_pid > 0
+                    && crate::process::is_alive(existing_pid as crate::process::Pid);
                 if !pid_alive || created_at <= stale_before {
                     tx.execute(
                         "DELETE FROM vm_create_reservations WHERE name = ?1",

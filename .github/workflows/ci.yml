@@ -221,6 +221,50 @@ jobs:
       # Run integration tests locally on a machine with KVM access.
 
   # ==========================================================================
+  # Windows Build & Lint (cross-compiled from Linux, mingw-w64 / GNU target)
+  # ==========================================================================
+  windows:
+    name: Windows (x86_64, cross)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: x86_64-pc-windows-gnu
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: windows-gnu-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: windows-gnu-cargo-
+
+      - name: Install mingw-w64 cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64 clang libclang-dev
+
+      # The Windows host dlopens libkrun at runtime (libloading), so unlike the
+      # macOS/Linux jobs there is no link-time libkrun dependency and no stub is
+      # needed. This gate catches host-side compile + lint regressions on
+      # Windows; WHP VM integration tests run out-of-band on real hardware via
+      # the WHP QA harness (unit tests can additionally be run under Wine with
+      # CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine).
+      - name: Build
+        run: cargo build --release --target x86_64-pc-windows-gnu
+
+      - name: Clippy
+        run: cargo clippy --release --target x86_64-pc-windows-gnu --all-targets -- -D warnings
+
+  # ==========================================================================
   # Build agent (Linux musl for static binary)
   # ==========================================================================
   agent:
@@ -266,7 +310,7 @@ jobs:
   # ==========================================================================
   ci-success:
     name: CI Success
-    needs: [fmt, macos, linux, agent]
+    needs: [fmt, macos, linux, windows, agent]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -275,6 +319,7 @@ jobs:
           if [[ "${{ needs.fmt.result }}" != "success" ]] || \
              [[ "${{ needs.macos.result }}" != "success" ]] || \
              [[ "${{ needs.linux.result }}" != "success" ]] || \
+             [[ "${{ needs.windows.result }}" != "success" ]] || \
              [[ "${{ needs.agent.result }}" != "success" ]]; then
             echo "One or more jobs failed"
             exit 1

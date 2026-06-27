@@ -60,6 +60,10 @@
 pub mod device;
 pub mod dns;
 pub mod egress;
+// The libkrun frame bridge speaks over a Unix-domain stream socket, so it only
+// exists on Unix hosts. The rest of the stack (smoltcp loop, TCP/UDP/ICMP
+// relays) is cross-platform.
+#[cfg(unix)]
 pub mod frame_stream;
 pub mod icmp_relay;
 pub mod queues;
@@ -71,16 +75,26 @@ pub mod udp_relay;
 pub use egress::EgressPolicy;
 
 use std::fmt;
+// `io` and the stack/listener constructors below are only used by the Unix-only
+// `start_virtio_network` entry point.
+#[cfg(unix)]
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+#[cfg(unix)]
 use std::os::fd::RawFd;
 use std::thread::JoinHandle;
 use std::time::SystemTime;
 
+#[cfg(unix)]
 use frame_stream::{start_frame_stream_bridge, FrameStreamBridge};
-use queues::{NetworkFrameQueues, DEFAULT_FRAME_QUEUE_CAPACITY};
+use queues::NetworkFrameQueues;
+#[cfg(unix)]
+use queues::DEFAULT_FRAME_QUEUE_CAPACITY;
+#[cfg(unix)]
 use stack::{start_network_stack, VirtioPollConfig};
-use tcp_listeners::{create_tcp_channel, TcpPortListeners};
+#[cfg(unix)]
+use tcp_listeners::create_tcp_channel;
+use tcp_listeners::TcpPortListeners;
 
 /// Default upstream DNS resolver used by the gateway runtime.
 pub const DEFAULT_DNS_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
@@ -202,6 +216,7 @@ pub(crate) use virtio_net_log;
 /// as shutting down, wakes blocked workers, and joins the poll thread.
 pub struct VirtioNetworkRuntime {
     queues: std::sync::Arc<NetworkFrameQueues>,
+    #[cfg(unix)]
     _frame_bridge: FrameStreamBridge,
     published_ports: Option<TcpPortListeners>,
     poll_handle: Option<JoinHandle<()>>,
@@ -250,6 +265,10 @@ pub struct VirtioNetworkRuntime {
 /// - host->guest Ethernet frames emitted by smoltcp are written back to libkrun
 /// - published host TCP connections can be forwarded toward guest listeners
 /// - the poll loop starts acting as the guest-visible gateway
+///
+/// Only available on Unix: the libkrun frame bridge it builds requires a
+/// Unix-domain stream socket.
+#[cfg(unix)]
 pub fn start_virtio_network(
     host_fd: RawFd,
     guest_network: GuestNetworkConfig,

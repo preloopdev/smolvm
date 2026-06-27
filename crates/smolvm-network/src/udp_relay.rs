@@ -33,11 +33,11 @@
 use crate::egress::EgressPolicy;
 use crate::queues::WakePipe;
 use crate::virtio_net_log;
+use polling::{Event, Events};
 use smoltcp::iface::{SocketHandle, SocketSet};
 use smoltcp::socket::udp::{PacketBuffer, PacketMetadata, Socket as UdpSocket, UdpMetadata};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as HostUdpSocket};
-use std::os::fd::AsRawFd;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::thread;
@@ -186,38 +186,40 @@ fn run_udp_relay(
             }
         }
 
-        // Inbound: poll all flow sockets for replies.
-        let mut poll_fds: Vec<libc::pollfd> = Vec::with_capacity(flows.len() + 1);
-        poll_fds.push(libc::pollfd {
-            fd: wake.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        });
+        // Inbound: poll all flow sockets for replies. The wake's poller blocks
+        // on "wake OR any flow socket readable" in a single call; the wake is a
+        // notify (no key), and each flow socket is registered at key `slot + 1`.
+        let poller = wake.poller();
         let keys: Vec<(SocketAddr, SocketAddr)> = flows.keys().copied().collect();
+        for (slot, key) in keys.iter().enumerate() {
+            // SAFETY: the socket is owned by `flows` and is deleted from the
+            // poller below before the next iteration may drop it.
+            let _ = unsafe { poller.add(&flows[key].socket, Event::readable(slot + 1)) };
+        }
+
+        let mut events = Events::new();
+        let _ = poller.wait(
+            &mut events,
+            Some(Duration::from_millis(RELAY_POLL_MAX_MS as u64)),
+        );
+
+        // A pending notify is consumed by `wait`; nothing else to drain.
+        let mut ready: Vec<bool> = vec![false; keys.len()];
+        for event in events.iter() {
+            if event.key >= 1 && event.key - 1 < ready.len() {
+                ready[event.key - 1] = true;
+            }
+        }
+
+        // Deregister sockets before the next rebuild so a closed flow's socket
+        // is never left registered on the poller.
         for key in &keys {
-            poll_fds.push(libc::pollfd {
-                fd: flows[key].socket.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            });
-        }
-
-        // SAFETY: every pollfd holds a valid descriptor owned by this thread.
-        unsafe {
-            libc::poll(
-                poll_fds.as_mut_ptr(),
-                poll_fds.len() as libc::nfds_t,
-                RELAY_POLL_MAX_MS,
-            );
-        }
-
-        if poll_fds[0].revents & libc::POLLIN != 0 {
-            wake.drain();
+            let _ = poller.delete(&flows[key].socket);
         }
 
         let mut woke_reply = false;
         for (slot, key) in keys.iter().enumerate() {
-            if poll_fds[slot + 1].revents & libc::POLLIN == 0 {
+            if !ready[slot] {
                 continue;
             }
             let Some(flow) = flows.get_mut(key) else {

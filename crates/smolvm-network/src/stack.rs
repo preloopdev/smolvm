@@ -227,21 +227,16 @@ fn run_network_stack(
         )
     };
 
-    // The smoltcp loop is driven by fd-based wakeups rather than busy spinning.
+    // The smoltcp loop is driven by poller wakeups rather than busy spinning.
     // guest_wake  -> new guest frame or shutdown
     // relay_wake  -> host TCP relay thread produced data or shutdown
-    let mut poll_fds = [
-        libc::pollfd {
-            fd: queues.guest_wake.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        },
-        libc::pollfd {
-            fd: queues.relay_wake.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        },
-    ];
+    //
+    // Both wakes share a single underlying poller (see `NetworkFrameQueues`), so
+    // the loop blocks on that one poller and either side unblocks it. The loop
+    // re-runs its whole pipeline on every wakeup, so it does not need to know
+    // which wake fired.
+    let poller = queues.guest_wake.poller().clone();
+    let mut events = polling::Events::new();
 
     loop {
         if queues.is_shutting_down() {
@@ -392,26 +387,19 @@ fn run_network_stack(
         flush_interface_egress(&mut interface, &mut device, &mut sockets, now);
         wake_guest_if_needed(&queues, &device);
 
-        let timeout_ms = interface
+        let timeout = interface
             .poll_delay(now, &sockets)
-            .map(|duration| duration.total_millis().min(i32::MAX as u64) as i32)
-            .unwrap_or(DEFAULT_IDLE_TIMEOUT_MS);
+            .map(|duration| Duration::from_millis(duration.total_millis().min(u32::MAX as u64)));
+        let timeout = match timeout {
+            Some(timeout) => Some(timeout),
+            None => Some(Duration::from_millis(DEFAULT_IDLE_TIMEOUT_MS as u64)),
+        };
 
-        // SAFETY: both pollfds contain valid wake-pipe descriptors.
-        unsafe {
-            libc::poll(
-                poll_fds.as_mut_ptr(),
-                poll_fds.len() as libc::nfds_t,
-                timeout_ms,
-            );
-        }
-
-        if poll_fds[0].revents & libc::POLLIN != 0 {
-            queues.guest_wake.drain();
-        }
-        if poll_fds[1].revents & libc::POLLIN != 0 {
-            queues.relay_wake.drain();
-        }
+        // Block until either wake notifies the shared poller or the timeout
+        // elapses. The wakes are notify-only, so no events are reported; the
+        // loop re-runs unconditionally on the next iteration.
+        events.clear();
+        let _ = poller.wait(&mut events, timeout);
     }
 }
 

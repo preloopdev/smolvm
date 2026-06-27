@@ -53,9 +53,17 @@ pub struct ScopeCaps {
 /// Future: support the per-user systemd bus (`busctl --user`) so an unprivileged
 /// local serve can still get scopes.
 pub fn is_available() -> bool {
-    // SAFETY: geteuid() is always-safe (no args, no global state mutation).
-    let is_root = unsafe { libc::geteuid() } == 0;
-    is_root && Path::new("/run/systemd/system").is_dir() && busctl_path().is_some()
+    // systemd scopes are a Linux-only concept; never available elsewhere.
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: geteuid() is always-safe (no args, no global state mutation).
+        let is_root = unsafe { libc::geteuid() } == 0;
+        is_root && Path::new("/run/systemd/system").is_dir() && busctl_path().is_some()
+    }
 }
 
 /// Locate `busctl` (PATH, then the usual absolute locations — serve may run with

@@ -9,7 +9,6 @@ use crate::process::{self, ChildProcess};
 use crate::storage::{DiskFormat, OverlayDisk, StorageDisk};
 use parking_lot::Mutex;
 use smolvm_protocol::AGENT_READY_MARKER;
-use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -266,6 +265,8 @@ pub fn egress_telemetry_file(name: &str) -> PathBuf {
 /// How often the VM subprocess flushes its egress counter to disk. The control
 /// plane's egress rollup runs on a multi-minute cadence, so a value this small
 /// keeps the file comfortably fresh while writing only a few bytes.
+// Used only by the (Unix-only) virtio-net launch path's egress flusher.
+#[cfg_attr(not(unix), allow(dead_code))]
 const EGRESS_FLUSH_SECS: u64 = 15;
 
 /// Spawn a detached thread (in the VM subprocess) that periodically writes the
@@ -274,6 +275,7 @@ const EGRESS_FLUSH_SECS: u64 = 15;
 /// same way disk size does. The thread exits when the subprocess does; the last
 /// value persists in the file even after exit, so a stopped machine's final
 /// egress is still readable. Best-effort: a write error never affects the VM.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn spawn_egress_flush(
     path: std::path::PathBuf,
     counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -1666,8 +1668,8 @@ impl AgentManager {
         let boot_exe = boot_binary
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| exe.clone());
-        let child = std::process::Command::new(&boot_exe)
-            .args(["_boot-vm", &config_path.to_string_lossy()])
+        let mut cmd = std::process::Command::new(&boot_exe);
+        cmd.args(["_boot-vm", &config_path.to_string_lossy()])
             .env(
                 "SMOLVM_BOOT_WATCH_PARENT",
                 if watch_parent { "1" } else { "0" },
@@ -1696,13 +1698,34 @@ impl AgentManager {
                 std::process::Stdio::inherit()
             } else {
                 std::process::Stdio::null()
-            })
-            // Own process group (pgid = child pid) so the VM is immune to
-            // SIGHUP from the parent's terminal closing, without making it a
-            // session leader. Session-leader status causes proc_pidinfo to
-            // return a zeroed struct on macOS, breaking start-time verification
-            // in _cleanup-ephemeral and leaving orphan VM processes running.
-            .process_group(0)
+            });
+        // Own process group (pgid = child pid) so the VM is immune to SIGHUP from
+        // the parent's terminal closing, without making it a session leader.
+        // POSIX-only; Windows process groups have different semantics and the
+        // SIGHUP concern does not apply.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        // Windows analogue: detach the VM from the launching process's console so
+        // it survives that shell closing (a closing console delivers
+        // CTRL_CLOSE_EVENT to attached processes, which would kill a detached
+        // persistent machine the moment `machine start` returns), and give it its
+        // own process group so a Ctrl-C in the launcher isn't forwarded.
+        //
+        // NB: an OpenSSH session wraps its processes in a job object with
+        // KILL_ON_JOB_CLOSE, so a machine started over `ssh ... cmd /c` still dies
+        // on disconnect — that's an SSH artifact, not present in a normal terminal
+        // or under the `serve` supervisor.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        }
+        let child = cmd
             .spawn()
             .map_err(|e| Error::agent("spawn boot subprocess", e.to_string()))?;
 
@@ -1821,7 +1844,7 @@ impl AgentManager {
     /// If either method confirms identity, sends SIGTERM (then SIGKILL on timeout).
     /// Returns `Ok(())` if the process is confirmed dead, `Err` if still alive
     /// or identity could not be verified.
-    fn stop_vm_process(&self, pid: libc::pid_t, start_time: Option<u64>) -> Result<()> {
+    fn stop_vm_process(&self, pid: crate::process::Pid, start_time: Option<u64>) -> Result<()> {
         // Use short timeout — the agent may already be gone (ephemeral run exited).
         // A 100ms connect timeout avoids blocking the exit path.
         let shutdown_acked = if let Ok(mut client) =

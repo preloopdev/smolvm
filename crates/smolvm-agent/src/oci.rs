@@ -1101,7 +1101,24 @@ fn default_mounts(unprivileged: bool) -> Vec<OciMount> {
             ],
         });
     }
+
+    // Drop mounts whose filesystem the guest kernel doesn't provide. The WHP
+    // guest kernel may lack CONFIG_POSIX_MQUEUE; crun fails the entire container
+    // with "mount mqueue: No such device" if /dev/mqueue can't be mounted, and
+    // almost no workload needs POSIX message queues. /proc/filesystems lists the
+    // kernel's known filesystems (e.g. "nodev\tmqueue").
+    if !proc_filesystems_has("mqueue") {
+        mounts.retain(|m| m.mount_type.as_deref() != Some("mqueue"));
+    }
     mounts
+}
+
+/// Whether the guest kernel registers `fstype` (per /proc/filesystems). Assumes
+/// supported when the file can't be read, to avoid over-filtering.
+fn proc_filesystems_has(fstype: &str) -> bool {
+    std::fs::read_to_string("/proc/filesystems")
+        .map(|s| s.split_whitespace().any(|w| w == fstype))
+        .unwrap_or(true)
 }
 
 #[cfg(test)]

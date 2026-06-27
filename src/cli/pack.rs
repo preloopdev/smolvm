@@ -1105,6 +1105,7 @@ impl PackCreateCmd {
     /// (without loading a new one), then `dladdr` to resolve the symbol back to
     /// a filesystem path. This ensures the packer bundles the exact same library
     /// that smolvm itself linked against — no version mismatches possible.
+    #[cfg(unix)]
     fn find_loaded_libkrun_dir() -> Option<PathBuf> {
         use std::ffi::{CStr, CString};
 
@@ -1135,6 +1136,14 @@ impl PackCreateCmd {
             }
         }
 
+        None
+    }
+
+    /// Windows: the `dlopen(RTLD_NOLOAD)` + `dladdr` self-location trick has no
+    /// direct equivalent here; callers fall back to the configured/standard
+    /// library search paths.
+    #[cfg(not(unix))]
+    fn find_loaded_libkrun_dir() -> Option<PathBuf> {
         None
     }
 

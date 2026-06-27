@@ -18,13 +18,14 @@ cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 want_krun="$(git rev-parse "HEAD:libkrun")"
 want_fw="$(git rev-parse "HEAD:libkrunfw")"
 
-# Lib dirs that bundle a libkrun (macOS dylibs + each Linux arch).
-LIB_DIRS=(lib lib/linux-x86_64 lib/linux-aarch64)
+# Lib dirs that bundle a libkrun (macOS dylib + each Linux arch + Windows DLL).
+LIB_DIRS=(lib lib/linux-x86_64 lib/linux-aarch64 lib/windows-x86_64)
 
 fail=0
 for dir in "${LIB_DIRS[@]}"; do
-  # Skip dirs that don't actually ship a libkrun.
-  compgen -G "$dir/libkrun.*" >/dev/null 2>&1 || continue
+  # Skip dirs that don't actually ship a libkrun. The lib is `libkrun.*` on
+  # macOS/Linux and `krun.dll` on Windows.
+  { compgen -G "$dir/libkrun.*" || compgen -G "$dir/krun.dll"; } >/dev/null 2>&1 || continue
   prov="$dir/libkrun.provenance"
 
   if [[ ! -f "$prov" ]]; then

@@ -3,6 +3,7 @@
 //! This module provides utilities for managing child processes,
 //! including signal handling and graceful shutdown.
 
+#[cfg(unix)]
 use std::os::fd::IntoRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -10,7 +11,134 @@ use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 
-/// Flag indicating whether SIGCHLD handler has been installed.
+/// Portable process-id type. On Unix this is `libc::pid_t`; on Windows there is
+/// no POSIX `pid_t`, so we use `i32` (process IDs there are `u32` but `i32`
+/// matches the existing signatures and the sentinel `-1` values used here).
+#[cfg(unix)]
+pub type Pid = libc::pid_t;
+/// Portable process-id type (Windows): there is no POSIX `pid_t`, so `i32` is
+/// used (matching the existing signatures and `-1` sentinels).
+#[cfg(not(unix))]
+pub type Pid = i32;
+
+/// Windows process-control helpers backing the cross-platform liveness/kill/wait
+/// API. Mirror the semantics of the Unix `kill`/`waitpid` paths using the Win32
+/// process APIs.
+#[cfg(windows)]
+mod win {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, STILL_ACTIVE, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, TerminateProcess, WaitForSingleObject, INFINITE,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    };
+
+    // `GetExitCodeProcess` writes `STILL_ACTIVE` (= STATUS_PENDING, 0x103) while
+    // the process is running.
+    const STILL_RUNNING: u32 = STILL_ACTIVE as u32;
+
+    /// Open a process handle, returning `None` if it cannot be opened.
+    fn open(pid: u32, access: u32) -> Option<HANDLE> {
+        // SAFETY: OpenProcess is a simple FFI call; we validate the handle.
+        let handle = unsafe { OpenProcess(access, 0, pid) };
+        if handle.is_null() {
+            None
+        } else {
+            Some(handle)
+        }
+    }
+
+    fn exit_code(handle: HANDLE) -> Option<u32> {
+        let mut code: u32 = 0;
+        // SAFETY: handle is a live process handle for the duration of the call.
+        let ok = unsafe { GetExitCodeProcess(handle, &mut code) };
+        if ok == 0 {
+            None
+        } else {
+            Some(code)
+        }
+    }
+
+    pub fn process_is_alive(pid: u32) -> bool {
+        match open(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
+            Some(handle) => {
+                let alive = exit_code(handle)
+                    .map(|c| c == STILL_RUNNING)
+                    .unwrap_or(false);
+                unsafe { CloseHandle(handle) };
+                alive
+            }
+            None => false,
+        }
+    }
+
+    pub fn process_try_wait(pid: u32) -> Option<i32> {
+        let handle = open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+        let result = match exit_code(handle) {
+            Some(code) if code == STILL_RUNNING => None,
+            Some(code) => Some(code as i32),
+            None => None,
+        };
+        unsafe { CloseHandle(handle) };
+        result
+    }
+
+    pub fn process_wait(pid: u32) -> i32 {
+        let Some(handle) = open(pid, PROCESS_QUERY_LIMITED_INFORMATION) else {
+            return -1;
+        };
+        // SAFETY: handle is valid; INFINITE blocks until the process exits.
+        let waited = unsafe { WaitForSingleObject(handle, INFINITE) };
+        let code = if waited == WAIT_OBJECT_0 {
+            exit_code(handle).map(|c| c as i32).unwrap_or(-1)
+        } else {
+            -1
+        };
+        unsafe { CloseHandle(handle) };
+        code
+    }
+
+    pub fn process_kill(pid: u32) -> bool {
+        match open(pid, PROCESS_TERMINATE) {
+            Some(handle) => {
+                // SAFETY: handle has PROCESS_TERMINATE rights.
+                let ok = unsafe { TerminateProcess(handle, 1) } != 0;
+                unsafe { CloseHandle(handle) };
+                ok
+            }
+            None => false,
+        }
+    }
+
+    /// Process creation time as a u64 (Windows FILETIME: 100 ns ticks since
+    /// 1601). Stable for the life of the process, so it pins PID identity
+    /// against reuse — the same role the start-time-from-/proc plays on Linux.
+    pub fn process_start_time(pid: u32) -> Option<u64> {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::Threading::GetProcessTimes;
+        let handle = open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+        let mut creation = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut exit = creation;
+        let mut kernel = creation;
+        let mut user = creation;
+        // SAFETY: handle is a live process handle for the duration of the call;
+        // all four FILETIME out-params are valid, writable locals.
+        let ok =
+            unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+        unsafe { CloseHandle(handle) };
+        if ok == 0 {
+            None
+        } else {
+            Some(((creation.dwHighDateTime as u64) << 32) | (creation.dwLowDateTime as u64))
+        }
+    }
+}
+
+/// Flag indicating whether SIGCHLD handler has been installed. Only the Unix
+/// SIGCHLD-reaping path uses this; Windows has no zombie-reaping model.
+#[cfg_attr(not(unix), allow(dead_code))]
 static SIGCHLD_HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 /// Default timeout for graceful shutdown before SIGKILL.
@@ -37,6 +165,7 @@ pub const UNKNOWN_EXIT_CODE: i32 = -1;
 /// `close_range` when available. On other platforms it enumerates `/dev/fd` and
 /// closes only descriptors that are actually open, avoiding an expensive loop to
 /// very large `getdtablesize()` values on macOS.
+#[cfg(unix)]
 pub fn close_inherited_fds_from(min_fd: i32) {
     if min_fd < 0 {
         return;
@@ -57,6 +186,13 @@ pub fn close_inherited_fds_from(min_fd: i32) {
     close_fds_by_range(min_fd);
 }
 
+/// Windows: file descriptors are not inherited across `CreateProcess` the way
+/// POSIX fds are (handle inheritance is opt-in per-handle), so there is nothing
+/// to bulk-close here.
+#[cfg(not(unix))]
+pub fn close_inherited_fds_from(_min_fd: i32) {}
+
+#[cfg(unix)]
 fn close_fds_from_dev_fd(min_fd: i32) -> bool {
     let entries = match std::fs::read_dir("/dev/fd") {
         Ok(entries) => entries,
@@ -83,6 +219,7 @@ fn close_fds_from_dev_fd(min_fd: i32) -> bool {
     true
 }
 
+#[cfg(unix)]
 fn close_fds_by_range(min_fd: i32) {
     let max_fd = unsafe { libc::getdtablesize() };
     for fd in min_fd..max_fd {
@@ -129,6 +266,9 @@ pub fn harden_self() {
             libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
         }
     }
+    // RLIMIT_CORE=0: never write a core dump (which would contain guest RAM).
+    // POSIX-only; Windows has no rlimit and no core-dump-to-file model here.
+    #[cfg(unix)]
     unsafe {
         let lim = libc::rlimit {
             rlim_cur: 0,
@@ -1066,6 +1206,7 @@ pub fn reap_vm_children() {}
 ///
 /// This function installs a signal handler which must be async-signal-safe.
 /// The handler only calls waitpid() which is safe.
+#[cfg(unix)]
 pub fn install_sigchld_handler() {
     // Only install once
     if SIGCHLD_HANDLER_INSTALLED.swap(true, Ordering::SeqCst) {
@@ -1088,9 +1229,15 @@ pub fn install_sigchld_handler() {
     }
 }
 
+/// Windows has no SIGCHLD / zombie-reaping model; child cleanup is handled by
+/// the OS when the last handle closes. This is a no-op.
+#[cfg(not(unix))]
+pub fn install_sigchld_handler() {}
+
 /// SIGCHLD signal handler that reaps zombie children.
 ///
 /// This handler is async-signal-safe as it only calls waitpid().
+#[cfg(unix)]
 extern "C" fn sigchld_handler(_sig: libc::c_int) {
     // Reap all terminated children (non-blocking)
     // Loop until no more children to reap
@@ -1107,15 +1254,27 @@ extern "C" fn sigchld_handler(_sig: libc::c_int) {
 /// Check if a process is alive.
 ///
 /// Returns true if the process exists and is running.
-pub fn is_alive(pid: libc::pid_t) -> bool {
+#[cfg(unix)]
+pub fn is_alive(pid: Pid) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Check if a process is alive (Windows).
+///
+/// Opens the process with minimal rights and checks its exit code; a process
+/// that is still running reports `STILL_ACTIVE`. Falls back to `false` if the
+/// handle cannot be opened (process gone or access denied).
+#[cfg(windows)]
+pub fn is_alive(pid: Pid) -> bool {
+    win::process_is_alive(pid as u32)
 }
 
 /// Wait for a process to exit (non-blocking check).
 ///
 /// Returns `Some(exit_code)` if the process has exited, `None` if still running.
 /// Handles EINTR by retrying the waitpid call.
-pub fn try_wait(pid: libc::pid_t) -> Option<i32> {
+#[cfg(unix)]
+pub fn try_wait(pid: Pid) -> Option<i32> {
     loop {
         let mut status: libc::c_int = 0;
         let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
@@ -1146,10 +1305,17 @@ pub fn try_wait(pid: libc::pid_t) -> Option<i32> {
     }
 }
 
+/// Wait for a process to exit (non-blocking check) — Windows.
+#[cfg(windows)]
+pub fn try_wait(pid: Pid) -> Option<i32> {
+    win::process_try_wait(pid as u32)
+}
+
 /// Wait for a process to exit (blocking).
 ///
 /// Returns the exit code. Handles EINTR by retrying the waitpid call.
-pub fn wait(pid: libc::pid_t) -> i32 {
+#[cfg(unix)]
+pub fn wait(pid: Pid) -> i32 {
     loop {
         let mut status: libc::c_int = 0;
         let result = unsafe { libc::waitpid(pid, &mut status, 0) };
@@ -1173,18 +1339,40 @@ pub fn wait(pid: libc::pid_t) -> i32 {
     }
 }
 
+/// Wait for a process to exit (blocking) — Windows.
+#[cfg(windows)]
+pub fn wait(pid: Pid) -> i32 {
+    win::process_wait(pid as u32)
+}
+
 /// Send SIGTERM to a process.
 ///
 /// Returns true if the signal was sent successfully.
-pub fn terminate(pid: libc::pid_t) -> bool {
+#[cfg(unix)]
+pub fn terminate(pid: Pid) -> bool {
     unsafe { libc::kill(pid, libc::SIGTERM) == 0 }
+}
+
+/// Request termination of a process (Windows).
+///
+/// There is no graceful SIGTERM equivalent; this calls `TerminateProcess`.
+#[cfg(windows)]
+pub fn terminate(pid: Pid) -> bool {
+    win::process_kill(pid as u32)
 }
 
 /// Send SIGKILL to a process.
 ///
 /// Returns true if the signal was sent successfully.
-pub fn kill(pid: libc::pid_t) -> bool {
+#[cfg(unix)]
+pub fn kill(pid: Pid) -> bool {
     unsafe { libc::kill(pid, libc::SIGKILL) == 0 }
+}
+
+/// Forcibly terminate a process (Windows) via `TerminateProcess`.
+#[cfg(windows)]
+pub fn kill(pid: Pid) -> bool {
+    win::process_kill(pid as u32)
 }
 
 /// Get the start time of a process (seconds since epoch).
@@ -1193,7 +1381,7 @@ pub fn kill(pid: libc::pid_t) -> bool {
 /// PID reuse. If the process at a given PID has a different start time
 /// than expected, it's a different process (PID was recycled).
 #[cfg(target_os = "macos")]
-pub fn process_start_time(pid: libc::pid_t) -> Option<u64> {
+pub fn process_start_time(pid: Pid) -> Option<u64> {
     // Use proc_pidinfo(PROC_PIDTBSDINFO) — the modern macOS API for
     // process information, which has stable struct layouts.
     extern "C" {
@@ -1261,7 +1449,7 @@ pub fn process_start_time(pid: libc::pid_t) -> Option<u64> {
 
 /// Get the start time of a process (clock ticks since boot from /proc/pid/stat field 22).
 #[cfg(target_os = "linux")]
-pub fn process_start_time(pid: libc::pid_t) -> Option<u64> {
+pub fn process_start_time(pid: Pid) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
     // Format: pid (comm) state ppid ... starttime ...
     // comm can contain spaces and parentheses, so find the last ')' first.
@@ -1271,9 +1459,15 @@ pub fn process_start_time(pid: libc::pid_t) -> Option<u64> {
     fields.get(19)?.parse::<u64>().ok()
 }
 
+/// Get the start time of a process (Windows process creation FILETIME).
+#[cfg(windows)]
+pub fn process_start_time(pid: Pid) -> Option<u64> {
+    win::process_start_time(pid as u32)
+}
+
 /// Get the start time of a process (stub for unsupported platforms).
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub fn process_start_time(_pid: libc::pid_t) -> Option<u64> {
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+pub fn process_start_time(_pid: Pid) -> Option<u64> {
     None
 }
 
@@ -1290,7 +1484,7 @@ pub struct ProcessStats {
 /// dead or stats cannot be read. Both values are cumulative — caller must
 /// compute deltas across samples to derive a rate (e.g., fractional CPUs).
 #[cfg(target_os = "macos")]
-pub fn process_stats(pid: libc::pid_t) -> Option<ProcessStats> {
+pub fn process_stats(pid: Pid) -> Option<ProcessStats> {
     extern "C" {
         fn proc_pidinfo(
             pid: libc::c_int,
@@ -1350,7 +1544,7 @@ pub fn process_stats(pid: libc::pid_t) -> Option<ProcessStats> {
 
 /// Sample CPU time and RSS for a single process on Linux via /proc/<pid>/{stat,statm}.
 #[cfg(target_os = "linux")]
-pub fn process_stats(pid: libc::pid_t) -> Option<ProcessStats> {
+pub fn process_stats(pid: Pid) -> Option<ProcessStats> {
     let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
     // Field 14 (utime) and 15 (stime) — both in clock ticks since process start.
     let after_comm = stat.rfind(')')? + 2;
@@ -1372,8 +1566,10 @@ pub fn process_stats(pid: libc::pid_t) -> Option<ProcessStats> {
     })
 }
 
+/// Sample CPU time and RSS for a process (stub on platforms without a
+/// supported implementation; e.g. Windows). Always returns `None`.
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub fn process_stats(_pid: libc::pid_t) -> Option<ProcessStats> {
+pub fn process_stats(_pid: Pid) -> Option<ProcessStats> {
     None
 }
 
@@ -1398,7 +1594,7 @@ fn start_time_matches(actual: u64, expected: u64) -> bool {
 ///
 /// If `expected_start_time` is None (legacy records), falls back to PID-only check.
 /// Use [`is_our_process_strict`] for signal/kill paths where false positives are dangerous.
-pub fn is_our_process(pid: libc::pid_t, expected_start_time: Option<u64>) -> bool {
+pub fn is_our_process(pid: Pid, expected_start_time: Option<u64>) -> bool {
     if !is_alive(pid) {
         return false;
     }
@@ -1418,7 +1614,7 @@ pub fn is_our_process(pid: libc::pid_t, expected_start_time: Option<u64>) -> boo
 /// Returns `false` when start time is missing (legacy records) rather than
 /// assuming the PID is ours. Prevents accidentally signaling an unrelated
 /// process that reused the same PID.
-pub fn is_our_process_strict(pid: libc::pid_t, expected_start_time: Option<u64>) -> bool {
+pub fn is_our_process_strict(pid: Pid, expected_start_time: Option<u64>) -> bool {
     if !is_alive(pid) {
         return false;
     }
@@ -1440,7 +1636,7 @@ pub fn is_our_process_strict(pid: libc::pid_t, expected_start_time: Option<u64>)
 /// Send SIGTERM only if the PID still belongs to our process.
 ///
 /// Uses strict verification — refuses to signal without start time.
-pub fn terminate_verified(pid: libc::pid_t, start_time: Option<u64>) -> bool {
+pub fn terminate_verified(pid: Pid, start_time: Option<u64>) -> bool {
     if is_our_process_strict(pid, start_time) {
         terminate(pid)
     } else {
@@ -1451,7 +1647,7 @@ pub fn terminate_verified(pid: libc::pid_t, start_time: Option<u64>) -> bool {
 /// Send SIGKILL only if the PID still belongs to our process.
 ///
 /// Uses strict verification — refuses to signal without start time.
-pub fn kill_verified(pid: libc::pid_t, start_time: Option<u64>) -> bool {
+pub fn kill_verified(pid: Pid, start_time: Option<u64>) -> bool {
     if is_our_process_strict(pid, start_time) {
         kill(pid)
     } else {
@@ -1466,7 +1662,7 @@ pub fn kill_verified(pid: libc::pid_t, start_time: Option<u64>) -> bool {
 /// 3. If still running and `force` is true, sends SIGKILL
 ///
 /// Returns `Ok(exit_code)` on success, `Err` if timeout without force.
-pub fn stop_process(pid: libc::pid_t, timeout: Duration, force: bool) -> Result<i32> {
+pub fn stop_process(pid: Pid, timeout: Duration, force: bool) -> Result<i32> {
     // Check if already dead
     if !is_alive(pid) {
         // Try to reap zombie
@@ -1526,7 +1722,7 @@ pub fn stop_process(pid: libc::pid_t, timeout: Duration, force: bool) -> Result<
 ///
 /// This minimizes latency for processes that exit quickly while
 /// still being efficient for slower shutdowns.
-pub fn stop_process_fast(pid: libc::pid_t, timeout: Duration, force: bool) -> Result<i32> {
+pub fn stop_process_fast(pid: Pid, timeout: Duration, force: bool) -> Result<i32> {
     // Check if already dead
     if !is_alive(pid) {
         if let Some(code) = try_wait(pid) {
@@ -1603,7 +1799,7 @@ pub const VM_SIGKILL_TIMEOUT: Duration = Duration::from_secs(3);
 ///
 /// Returns `Ok(exit_code)` if the process exited, `Err` if still alive.
 pub fn stop_vm_process(
-    pid: libc::pid_t,
+    pid: Pid,
     sigterm_timeout: Duration,
     sigkill_timeout: Duration,
 ) -> Result<i32> {
@@ -1637,7 +1833,7 @@ pub fn stop_vm_process(
 /// Poll for process exit with aggressive-then-backoff strategy.
 ///
 /// Returns `Some(exit_code)` if the process exits within the timeout.
-fn poll_for_exit(pid: libc::pid_t, timeout: Duration) -> Option<i32> {
+fn poll_for_exit(pid: Pid, timeout: Duration) -> Option<i32> {
     let start = Instant::now();
     let mut poll_count: u32 = 0;
 
@@ -1664,7 +1860,7 @@ fn poll_for_exit(pid: libc::pid_t, timeout: Duration) -> Option<i32> {
 #[derive(Debug)]
 pub enum ForkResult {
     /// This is the parent process. Contains the child's PID.
-    Parent(libc::pid_t),
+    Parent(Pid),
     /// This is the child process.
     Child,
 }
@@ -1696,7 +1892,8 @@ pub enum ForkResult {
 ///     std::process::exit(0);
 /// })?;
 /// ```
-pub fn fork_session_leader<F>(child_fn: F) -> Result<libc::pid_t>
+#[cfg(unix)]
+pub fn fork_session_leader<F>(child_fn: F) -> Result<Pid>
 where
     F: FnOnce(),
 {
@@ -1750,6 +1947,19 @@ where
     }
 }
 
+/// `fork()`-based session-leader launch is a Unix-only mechanism. The Windows
+/// host never uses the in-process fork launch path; it always launches the VM
+/// boot as a `smolvm _boot-vm` subprocess via `Command::new`.
+#[cfg(not(unix))]
+pub fn fork_session_leader<F>(_child_fn: F) -> Result<Pid>
+where
+    F: FnOnce(),
+{
+    Err(Error::vm_creation(
+        "fork-based launch is not supported on Windows; use the subprocess launch path",
+    ))
+}
+
 /// Redirect stdin, stdout, and stderr to `/dev/null`.
 ///
 /// Call this in a forked child process before launching a long-running
@@ -1760,6 +1970,7 @@ where
 ///
 /// Must be called **after** any `eprintln!()` diagnostics that need the
 /// real stderr, but **before** the point of no return (`krun_start_enter`).
+#[cfg(unix)]
 pub fn detach_stdio() {
     unsafe {
         let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
@@ -1774,10 +1985,16 @@ pub fn detach_stdio() {
     }
 }
 
+/// No-op on Windows: there is no `/dev/null` fd-redirection model; the
+/// subprocess launch path configures the child's stdio via `Command` instead.
+#[cfg(not(unix))]
+pub fn detach_stdio() {}
+
 /// Redirect stdin/stdout to `/dev/null` and stderr to a log file.
 ///
 /// This keeps background children detached from the user's terminal while
 /// preserving boot-time diagnostics for later inspection.
+#[cfg(unix)]
 pub fn detach_stdio_to_stderr_file(path: &std::path::Path) -> std::io::Result<()> {
     let stderr_file = std::fs::OpenOptions::new()
         .create(true)
@@ -1807,16 +2024,45 @@ pub fn detach_stdio_to_stderr_file(path: &std::path::Path) -> std::io::Result<()
     Ok(())
 }
 
+/// Windows: redirect this process's stderr to a log file via `SetStdHandle`.
+///
+/// The fd-level `dup2` of stdin/stdout to `/dev/null` has no portable analog
+/// and is unnecessary here (the boot subprocess is launched with inherited or
+/// null handles by the parent `Command`); only the stderr log redirection is
+/// reproduced so boot diagnostics are captured.
+#[cfg(not(unix))]
+pub fn detach_stdio_to_stderr_file(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Console::{SetStdHandle, STD_ERROR_HANDLE};
+
+    let stderr_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    // Keep the file handle alive for the process lifetime by leaking it; the
+    // OS handle now backs stderr.
+    let handle = stderr_file.as_raw_handle();
+    std::mem::forget(stderr_file);
+    // SAFETY: `handle` is a valid file handle that we have intentionally leaked
+    // so it outlives this call and remains valid as the process's stderr.
+    let ok = unsafe { SetStdHandle(STD_ERROR_HANDLE, handle as _) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Exit the current process immediately without cleanup.
 ///
-/// This is a safe wrapper around `libc::_exit()` for use in forked child
-/// processes. It avoids running atexit handlers and flushing stdio buffers
-/// that were inherited from the parent.
+/// On Unix this is a safe wrapper around `libc::_exit()` for use in forked
+/// child processes — it avoids running atexit handlers and flushing stdio
+/// buffers inherited from the parent. On Windows (no fork) it is a plain
+/// process exit.
 ///
 /// # Safety
 ///
-/// This function never returns. It should only be called in a forked child
-/// process after fork() to avoid double-flushing stdio buffers.
+/// This function never returns.
+#[cfg(unix)]
 pub fn exit_child(code: i32) -> ! {
     // SAFETY: _exit() is safe in a forked child process. Using _exit() instead
     // of exit() ensures we don't run atexit handlers or flush stdio buffers
@@ -1826,12 +2072,19 @@ pub fn exit_child(code: i32) -> ! {
     }
 }
 
+/// Exit the current process immediately (Windows). No fork is involved, so a
+/// normal `process::exit` is correct.
+#[cfg(not(unix))]
+pub fn exit_child(code: i32) -> ! {
+    std::process::exit(code)
+}
+
 /// A handle to a running child process.
 ///
 /// Provides methods to check status, stop, and kill the process.
 #[derive(Debug)]
 pub struct ChildProcess {
-    pid: libc::pid_t,
+    pid: Pid,
     /// Start time captured at creation for PID reuse detection.
     start_time: Option<u64>,
     exit_code: Option<i32>,
@@ -1839,7 +2092,7 @@ pub struct ChildProcess {
 
 impl ChildProcess {
     /// Create a new child process handle, capturing start time immediately.
-    pub fn new(pid: libc::pid_t) -> Self {
+    pub fn new(pid: Pid) -> Self {
         Self {
             pid,
             start_time: process_start_time(pid),
@@ -1848,7 +2101,7 @@ impl ChildProcess {
     }
 
     /// Get the process ID.
-    pub fn pid(&self) -> libc::pid_t {
+    pub fn pid(&self) -> Pid {
         self.pid
     }
 
@@ -1933,7 +2186,8 @@ pub struct SigintGuard(());
 
 impl SigintGuard {
     /// Install a SIGINT handler that will SIGTERM+SIGKILL the given PID.
-    pub fn new(pid: libc::pid_t) -> Self {
+    #[cfg(unix)]
+    pub fn new(pid: Pid) -> Self {
         SIGINT_CHILD_PID.store(pid, Ordering::SeqCst);
         unsafe {
             libc::signal(
@@ -1944,12 +2198,20 @@ impl SigintGuard {
         Self(())
     }
 
+    /// Windows: POSIX signal-handler installation has no direct equivalent and
+    /// the orphaned-process-group concern does not apply. The guard is inert.
+    #[cfg(not(unix))]
+    pub fn new(_pid: Pid) -> Self {
+        Self(())
+    }
+
     /// Disarm the guard: clear the PID, restore default handler, skip Drop.
     ///
     /// Use when transitioning to a phase with its own SIGINT handling
     /// (e.g., interactive exec).
     pub fn disarm(self) {
         SIGINT_CHILD_PID.store(0, Ordering::SeqCst);
+        #[cfg(unix)]
         unsafe {
             libc::signal(libc::SIGINT, libc::SIG_DFL);
         }
@@ -1960,6 +2222,7 @@ impl SigintGuard {
 impl Drop for SigintGuard {
     fn drop(&mut self) {
         SIGINT_CHILD_PID.store(0, Ordering::SeqCst);
+        #[cfg(unix)]
         unsafe {
             libc::signal(libc::SIGINT, libc::SIG_DFL);
         }
@@ -1969,6 +2232,7 @@ impl Drop for SigintGuard {
 /// SIGINT handler: SIGTERM the child, brief busy-wait, escalate to SIGKILL, then _exit.
 ///
 /// SAFETY: Only calls `kill()` and `_exit()`, both async-signal-safe.
+#[cfg(unix)]
 extern "C" fn sigint_kill_handler(_sig: libc::c_int) {
     let pid = SIGINT_CHILD_PID.load(Ordering::SeqCst);
     if pid > 0 {

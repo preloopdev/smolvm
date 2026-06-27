@@ -53,6 +53,10 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     // the manager signals this via SMOLVM_BOOT_WATCH_PARENT=1. The CLI detaches
     // its VM on purpose and `serve` reconnects to surviving VMs, so for those the
     // parent exiting is normal and the watchdog stays off.
+    // The getppid()-based reparenting check is POSIX-specific; on Windows the
+    // parent-death watchdog is not wired up (the SDK in-process embedder path is
+    // a Unix concern here).
+    #[cfg(unix)]
     if std::env::var_os("SMOLVM_BOOT_WATCH_PARENT").as_deref() == Some(std::ffi::OsStr::new("1")) {
         let original_ppid = unsafe { libc::getppid() };
         let _ = std::thread::Builder::new()
@@ -76,30 +80,40 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
 
     // Redirect stdio. When SMOLVM_GPU_DEBUG=1, keep stderr pointed at a
     // debug log file so virglrenderer/MoltenVK errors are captured.
-    if std::env::var_os("SMOLVM_GPU_DEBUG").is_some() {
-        if let Some(ref log) = config.console_log {
-            let debug_path = log.with_file_name("gpu-debug.log");
-            if let Ok(cpath) = std::ffi::CString::new(debug_path.to_string_lossy().as_bytes()) {
-                unsafe {
-                    let fd = libc::open(
-                        cpath.as_ptr(),
-                        libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
-                        0o644,
-                    );
-                    if fd >= 0 {
-                        libc::dup2(fd, 2);
-                        libc::close(fd);
+    // The GPU-debug stdio redirection uses POSIX fd dup2 and is part of the
+    // (Unix-only) GPU path; on Windows it falls through to the portable stderr
+    // log redirection below.
+    #[cfg(unix)]
+    let gpu_debug = std::env::var_os("SMOLVM_GPU_DEBUG").is_some();
+    #[cfg(not(unix))]
+    let gpu_debug = false;
+    if gpu_debug {
+        #[cfg(unix)]
+        {
+            if let Some(ref log) = config.console_log {
+                let debug_path = log.with_file_name("gpu-debug.log");
+                if let Ok(cpath) = std::ffi::CString::new(debug_path.to_string_lossy().as_bytes()) {
+                    unsafe {
+                        let fd = libc::open(
+                            cpath.as_ptr(),
+                            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+                            0o644,
+                        );
+                        if fd >= 0 {
+                            libc::dup2(fd, 2);
+                            libc::close(fd);
+                        }
                     }
                 }
             }
-        }
-        // Detach stdin/stdout only — keep stderr for GPU debug output
-        unsafe {
-            let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
-            if devnull >= 0 {
-                libc::dup2(devnull, 0);
-                libc::dup2(devnull, 1);
-                libc::close(devnull);
+            // Detach stdin/stdout only — keep stderr for GPU debug output
+            unsafe {
+                let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+                if devnull >= 0 {
+                    libc::dup2(devnull, 0);
+                    libc::dup2(devnull, 1);
+                    libc::close(devnull);
+                }
             }
         }
     } else if let Err(e) = smolvm::process::detach_stdio_to_stderr_file(&config.startup_error_log) {

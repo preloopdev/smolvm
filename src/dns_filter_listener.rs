@@ -4,7 +4,7 @@
 //! DNS proxy and filters DNS queries against a hostname allowlist.
 
 use crate::dns_filter::{handle_connection, DnsFilter};
-use std::os::unix::net::UnixListener;
+use crate::platform::uds::UdsListener;
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
@@ -20,7 +20,7 @@ pub fn start(socket_path: &Path, allowed_hosts: Vec<String>) -> std::io::Result<
     // Clean up stale socket
     let _ = std::fs::remove_file(socket_path);
 
-    let listener = UnixListener::bind(socket_path)?;
+    let listener = UdsListener::bind(socket_path)?;
 
     let filter = Arc::new(DnsFilter::new(
         allowed_hosts,

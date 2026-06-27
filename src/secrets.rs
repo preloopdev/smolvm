@@ -53,7 +53,9 @@ pub use smolvm_protocol::{SecretRef, SecretSourceKind};
 /// callers can classify without string-matching the inner `io::Error`.
 #[derive(Debug)]
 enum FileSourceError {
-    /// The stored path points at a symlink; we refuse to follow.
+    /// The stored path points at a symlink; we refuse to follow. Only
+    /// constructed on Unix (via `O_NOFOLLOW`/`ELOOP`); Windows omits the check.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Symlink,
     /// File size exceeded the per-call cap.
     TooLarge,
@@ -111,20 +113,26 @@ fn read_file_bounded(
 /// the bytes come from exactly what we opened. (Parent-directory symlinks are
 /// not covered — that would need a component-by-component `openat` walk.)
 fn read_from_file_source(path: &std::path::Path) -> std::result::Result<String, FileSourceError> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|e| {
-            // O_NOFOLLOW on a symlink leaf fails with ELOOP — surface it as the
-            // dedicated Symlink class rather than a generic I/O error.
-            if e.raw_os_error() == Some(libc::ELOOP) {
-                FileSourceError::Symlink
-            } else {
-                FileSourceError::Io(e)
-            }
-        })?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    // O_NOFOLLOW refuses a symlink leaf atomically at open time. There is no
+    // portable Windows equivalent here; Windows symlink creation is privileged
+    // and the threat model (swapping the leaf for a symlink to /etc/shadow) is
+    // POSIX-specific, so the flag is simply omitted there.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let f = opts.open(path).map_err(|e| {
+        // O_NOFOLLOW on a symlink leaf fails with ELOOP — surface it as the
+        // dedicated Symlink class rather than a generic I/O error.
+        #[cfg(unix)]
+        if e.raw_os_error() == Some(libc::ELOOP) {
+            return FileSourceError::Symlink;
+        }
+        FileSourceError::Io(e)
+    })?;
     read_file_bounded(f, MAX_FROM_FILE_BYTES)
 }
 

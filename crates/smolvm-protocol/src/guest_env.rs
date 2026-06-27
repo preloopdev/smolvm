@@ -29,6 +29,14 @@ pub const GPU: &str = "SMOLVM_GPU";
 /// falls back to the shared [`crate::AGENT_READY_MARKER`] constant.
 pub const READY_MARKER: &str = "SMOLVM_READY_MARKER";
 
+/// Host wall-clock at VM launch, nanoseconds since the Unix epoch. The agent
+/// uses this to set the guest clock when the hypervisor gives the guest no
+/// readable paravirt clock (e.g. WHP on Windows, where the guest otherwise
+/// boots at ~1999 and every TLS cert validation fails). The agent only applies
+/// it when the guest clock already looks obviously wrong, so it never fights an
+/// accurate kvmclock (Linux/KVM) or HVF-seeded RTC (macOS).
+pub const HOST_TIME_NS: &str = "SMOLVM_HOST_TIME_NS";
+
 /// Selects whether the guest should configure a real virtio NIC.
 pub const BACKEND: &str = "SMOLVM_NETWORK_BACKEND";
 /// Canonical backend value meaning "configure guest virtio-net".

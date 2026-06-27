@@ -66,6 +66,16 @@ impl HostMount {
         ("/run", true),
     ];
 
+    /// Protected host paths that must never be mounted into the guest (Windows).
+    #[cfg(target_os = "windows")]
+    const ILLEGAL_SOURCE_MOUNT_PATH: &[(&str, bool)] = &[
+        ("C:\\", false),
+        ("C:\\Windows", true),
+        ("C:\\Program Files", true),
+        ("C:\\Program Files (x86)", true),
+        ("C:\\ProgramData", true),
+    ];
+
     /// Create a host mount with an explicit read-only flag.
     pub fn new(
         source: impl Into<PathBuf>,
@@ -109,12 +119,19 @@ impl HostMount {
     /// If no mode is provided, the mount defaults to writable.
     /// The source path is validated, required to be a directory, and canonicalized.
     fn _parse(spec: &str) -> Result<Self> {
-        let parts: Vec<&str> = spec.split(':').collect();
-
-        match parts.as_slice() {
-            [source, target] => Self::new(source, target, false),
-            [source, target, "ro"] => Self::new(source, target, true),
-            [source, target, "rw"] => Self::new(source, target, false),
+        // Parse from the right so a Windows host path keeps its drive-letter
+        // colon (e.g. `C:\data:/data:ro`). The guest path is a Unix path with no
+        // colon, and the optional trailing mode is `ro`/`rw`; everything before
+        // the guest path is the host source.
+        let (rest, read_only) = match spec.rsplit_once(':') {
+            Some((head, "ro")) => (head, true),
+            Some((head, "rw")) => (head, false),
+            _ => (spec, false),
+        };
+        match rest.rsplit_once(':') {
+            Some((source, target)) if !source.is_empty() && !target.is_empty() => {
+                Self::new(source, target, read_only)
+            }
             _ => Err(Error::invalid_mount_path(format!(
                 "invalid format '{}' (expected host:guest[:ro|:rw])",
                 spec
@@ -164,7 +181,11 @@ impl HostMount {
             }
         }
 
-        if !mount.target.is_absolute() {
+        // Guest paths are always Linux paths; check Linux-absolute (leading '/')
+        // rather than `Path::is_absolute()`, which is host-platform-specific and
+        // wrongly rejects "/data" on Windows (where absolute means `C:\...`).
+        let target_is_absolute = mount.target.to_str().is_some_and(|t| t.starts_with('/'));
+        if !target_is_absolute {
             return Err(Error::mount(
                 "validate guest path",
                 format!(

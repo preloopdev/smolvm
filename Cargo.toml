@@ -42,6 +42,13 @@ serde_yaml = "0.9"
 toml = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
 libc = "0.2"
+# Cross-platform dynamic library loading for libkrun (dlopen on Unix,
+# LoadLibraryW on Windows). Replaces the previous direct libc::dlopen path.
+libloading = "0.8"
+# Cross-platform AF_UNIX sockets for the agent control channel and vsock-port
+# bridges. std has no UnixStream on Windows, but socket2 (Domain::UNIX) works
+# on Windows 10 1809+. See src/platform/uds.rs.
+socket2 = "0.6"
 dirs = "5"
 sha2 = "0.10"
 hex = "0.4"
@@ -86,6 +93,19 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false }
 [target.'cfg(target_os = "linux")'.dependencies]
 seccompiler = "0.4"
 landlock = "0.4"
+
+# Windows process management (OpenProcess / TerminateProcess / Wait) and
+# DLL-search-path control (SetDllDirectoryW). Used to replace the Unix
+# kill/waitpid/dlopen primitives on the Windows host build.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_Networking_WinSock",
+] }
 
 [dev-dependencies]
 tempfile = "3"

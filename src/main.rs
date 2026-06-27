@@ -70,8 +70,19 @@ fn main() {
     // Auto-detect packed binary mode BEFORE parsing the normal CLI.
     // If this executable has a `.smolmachine` sidecar, appended assets,
     // or a Mach-O section with packed data, run as a packed binary instead.
-    if let Some(mode) = smolvm_pack::detect_packed_mode() {
-        cli::pack_run::run_as_packed_binary(mode);
+    //
+    // EXCEPTION: skip auto-detection when re-invoked as `_boot-vm`. On Windows
+    // (and any non-fork path) pack rehydrate boots the VM by re-spawning this
+    // same packed executable as `current_exe _boot-vm <config.json>`. That child
+    // still carries the packed footer/sidecar, so without this guard it would
+    // re-trigger packed-mode detection and rehydrate again instead of booting
+    // the VM from the config it was handed.
+    let is_boot_vm =
+        std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("_boot-vm"));
+    if !is_boot_vm {
+        if let Some(mode) = smolvm_pack::detect_packed_mode() {
+            cli::pack_run::run_as_packed_binary(mode);
+        }
     }
 
     let cli = Cli::parse();

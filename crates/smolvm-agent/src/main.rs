@@ -161,6 +161,35 @@ fn tsi_resolv_conf(dns_override: Option<&str>, current: &str) -> Option<String> 
     }
 }
 
+/// Seed the guest wall clock from `SMOLVM_HOST_TIME_NS` (the host's launch time),
+/// but only when the guest clock is obviously wrong (before 2020). Hypervisors
+/// without a guest-readable paravirt clock (WHP on Windows) boot the guest at
+/// ~1999, breaking all TLS cert validation; this fixes that without fighting an
+/// already-correct kvmclock (KVM) or HVF-seeded clock (macOS).
+#[cfg(target_os = "linux")]
+fn maybe_set_clock_from_host() {
+    const Y2020_SECS: i64 = 1_577_836_800;
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if now_secs >= Y2020_SECS {
+        return;
+    }
+    let Ok(ns_str) = std::env::var(smolvm_protocol::guest_env::HOST_TIME_NS) else {
+        return;
+    };
+    let Ok(ns) = ns_str.parse::<u128>() else {
+        return;
+    };
+    let ts = libc::timespec {
+        tv_sec: (ns / 1_000_000_000) as libc::time_t,
+        tv_nsec: (ns % 1_000_000_000) as libc::c_long,
+    };
+    // SAFETY: ts is a valid timespec; the agent runs as PID-1 with CAP_SYS_TIME.
+    let _ = unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) };
+}
+
 fn main() {
     // Quick --version check (used by init script to detect rootfs updates)
     if std::env::args().any(|a| a == "--version") {
@@ -174,6 +203,13 @@ fn main() {
         "INFO",
         &format!("boot agent_entry uptime_ms={}", boottime_ms()),
     );
+
+    // Seed the guest wall clock from the host's launch time when the hypervisor
+    // gives the guest no readable paravirt clock and it boots at ~1999 (WHP on
+    // Windows); without this every TLS handshake fails ("cert not yet valid").
+    // No-op when the clock already looks sane (kvmclock on KVM, HVF on macOS).
+    #[cfg(target_os = "linux")]
+    maybe_set_clock_from_host();
 
     // CRITICAL: Mount essential filesystems FIRST, before anything else.
     // When running as init (PID 1), we need these for the system to function.
