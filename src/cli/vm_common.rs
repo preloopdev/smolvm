@@ -1962,39 +1962,72 @@ pub fn deregister_ephemeral_vm(name: &str) {
     }
 }
 
-/// Clean up orphaned ephemeral VM records.
+/// Names of ephemeral VMs that are orphans (dead or PID-less), capped at `limit`.
 ///
-/// Called once at CLI startup. Scans for ephemeral records whose PID is no
-/// longer alive and removes them. Fast path: if no ephemeral records exist,
-/// this is a single DB read (~0.2ms).
+/// Pure (no I/O) so the reaping policy is unit-testable: given the VM list and a
+/// liveness probe, it returns at most `limit` orphan names in list order. A
+/// non-ephemeral or still-alive record is never returned.
+fn orphaned_ephemeral_names(
+    vms: &[(String, VmRecord)],
+    is_alive: impl Fn(i32) -> bool,
+    limit: usize,
+) -> Vec<&str> {
+    let mut out = Vec::new();
+    for (name, record) in vms {
+        if out.len() >= limit {
+            break;
+        }
+        if !record.ephemeral {
+            continue;
+        }
+        let is_orphan = match record.pid {
+            Some(pid) => !is_alive(pid),
+            None => true, // No PID recorded — stale
+        };
+        if is_orphan {
+            out.push(name.as_str());
+        }
+    }
+    out
+}
+
+/// Clean up ALL orphaned ephemeral VM records.
+///
+/// Called at the start of every machine command EXCEPT `machine run` (which uses
+/// the bounded variant on its hot path). Fast path: if no ephemeral records
+/// exist, this is a single DB read (~0.2ms).
 pub fn cleanup_orphaned_ephemeral_vms() {
+    cleanup_orphaned_ephemeral_vms_bounded(usize::MAX);
+}
+
+/// Clean up orphaned ephemeral VM records, removing at most `limit` of them.
+///
+/// `machine run` is the one hot-path caller and passes a small cap: a workflow
+/// that ONLY ever calls `machine run` (e.g. a wrapper that spawns a fresh
+/// ephemeral VM per task) never reaches the unbounded sweep above, so any run
+/// whose detached `_cleanup-ephemeral` helper didn't finish (Ctrl-C / SIGKILL /
+/// host sleep mid-run) would leak its data dir forever. The cap lets such a
+/// backlog self-heal over a few runs instead of stalling one boot on a large
+/// `remove_dir_all` storm. Removal order follows the DB list order. Fast path:
+/// no ephemeral records → a single DB read.
+pub fn cleanup_orphaned_ephemeral_vms_bounded(limit: usize) {
+    if limit == 0 {
+        return;
+    }
     let db = match SmolvmDb::open() {
         Ok(db) => db,
         Err(_) => return,
     };
-
     let vms = match db.list_vms() {
         Ok(vms) => vms,
         Err(_) => return,
     };
-
-    for (name, record) in &vms {
-        if !record.ephemeral {
-            continue;
-        }
-
-        let is_orphan = match record.pid {
-            Some(pid) => !smolvm::process::is_alive(pid),
-            None => true, // No PID recorded — stale
-        };
-
-        if is_orphan {
-            tracing::debug!(name = %name, pid = ?record.pid, "cleaning up orphaned ephemeral VM");
-            let _ = db.remove_vm(name);
-            let dir = smolvm::agent::vm_data_dir(name);
-            if dir.exists() {
-                let _ = std::fs::remove_dir_all(&dir);
-            }
+    for name in orphaned_ephemeral_names(&vms, smolvm::process::is_alive, limit) {
+        tracing::debug!(name = %name, "cleaning up orphaned ephemeral VM");
+        let _ = db.remove_vm(name);
+        let dir = smolvm::agent::vm_data_dir(name);
+        if dir.exists() {
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }
@@ -2002,6 +2035,40 @@ pub fn cleanup_orphaned_ephemeral_vms() {
 #[cfg(test)]
 mod init_runner_tests {
     use super::*;
+
+    // The ephemeral-reap policy: only ephemeral + (dead or PID-less) records, in
+    // list order, capped at `limit`. Persistent and still-alive VMs are never
+    // returned — this is what keeps the bounded `machine run` sweep from touching
+    // a concurrent run's live VM.
+    #[test]
+    fn orphaned_ephemeral_names_filters_and_caps() {
+        use smolvm::config::VmRecord;
+        let mk = |name: &str, ephemeral: bool, pid: Option<i32>| {
+            let mut r = VmRecord::new(name.to_string(), 1, 256, vec![], vec![], false);
+            r.ephemeral = ephemeral;
+            r.pid = pid;
+            (name.to_string(), r)
+        };
+        let vms = vec![
+            mk("persistent", false, Some(10)), // not ephemeral -> skip
+            mk("alive", true, Some(20)),       // ephemeral but alive -> skip
+            mk("dead1", true, Some(30)),       // ephemeral + dead -> orphan
+            mk("nopid", true, None),           // ephemeral + no PID -> orphan
+            mk("dead2", true, Some(40)),       // ephemeral + dead -> orphan
+        ];
+        let alive = |pid: i32| pid == 20; // only the live VM's PID is alive
+
+        assert_eq!(
+            orphaned_ephemeral_names(&vms, alive, usize::MAX),
+            vec!["dead1", "nopid", "dead2"]
+        );
+        assert_eq!(
+            orphaned_ephemeral_names(&vms, alive, 2),
+            vec!["dead1", "nopid"],
+            "cap limits how many are reaped per call"
+        );
+        assert!(orphaned_ephemeral_names(&vms, alive, 0).is_empty());
+    }
 
     fn sample_image_info(env: Vec<&str>, workdir: Option<&str>, user: Option<&str>) -> ImageInfo {
         ImageInfo {
