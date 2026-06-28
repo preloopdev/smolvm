@@ -127,7 +127,10 @@ fn shared_extraction_is_content_addressed_idempotent_and_locked_down() {
     //    extracted tree — no second decode, no second store dir. This is the
     //    cold-start tax the shared store removes.
     let shared_dir2 = extract_sidecar_shared(&sidecar, &shared_root, &footer, false).unwrap();
-    assert_eq!(shared_dir2, shared_dir, "second machine must reuse the copy");
+    assert_eq!(
+        shared_dir2, shared_dir,
+        "second machine must reuse the copy"
+    );
     let store_dirs: Vec<_> = fs::read_dir(&shared_root)
         .unwrap()
         .filter_map(|e| e.ok())
@@ -144,7 +147,13 @@ fn shared_extraction_is_content_addressed_idempotent_and_locked_down() {
     //    directly — it must go through its own idmapped mount (#456 isolation).
     for dir in [&shared_root, &shared_dir] {
         let mode = fs::metadata(dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700, "{} must be 0700, got {:o}", dir.display(), mode);
+        assert_eq!(
+            mode,
+            0o700,
+            "{} must be 0700, got {:o}",
+            dir.display(),
+            mode
+        );
     }
 }
 

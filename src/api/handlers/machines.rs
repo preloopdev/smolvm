@@ -480,9 +480,7 @@ pub async fn create_machine(
                         &footer,
                         false,
                     )
-                    .map_err(|e| {
-                        ApiError::internal(format!("extract sidecar (shared): {}", e))
-                    })?;
+                    .map_err(|e| ApiError::internal(format!("extract sidecar (shared): {}", e)))?;
                     std::fs::create_dir_all(&cache_dir).map_err(|e| {
                         ApiError::internal(format!("create pack mountpoint: {}", e))
                     })?;

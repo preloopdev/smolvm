@@ -1282,8 +1282,9 @@ pub fn setup_pack_idmap_mount(
     // Clone the shared subtree into a detached mount object. mount_setattr's idmap
     // requires a freshly-cloned mount with no other users, which OPEN_TREE_CLONE
     // provides; AT_RECURSIVE covers any submounts.
-    let open_flags: libc::c_uint =
-        libc::OPEN_TREE_CLONE | libc::AT_RECURSIVE as libc::c_uint | libc::O_CLOEXEC as libc::c_uint;
+    let open_flags: libc::c_uint = libc::OPEN_TREE_CLONE
+        | libc::AT_RECURSIVE as libc::c_uint
+        | libc::O_CLOEXEC as libc::c_uint;
     let tree = unsafe {
         libc::syscall(
             libc::SYS_open_tree,
