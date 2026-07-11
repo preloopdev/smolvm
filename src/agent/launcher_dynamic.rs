@@ -565,6 +565,15 @@ pub fn launch_agent_vm_dynamic(
         free_ctx_on_err!("krun_set_exec failed");
     }
 
+    // Every virtiofs mount gets a DAX window (like the root fs above): without
+    // DAX, virtiofs falls back to writeback caching where each file access is a
+    // FUSE round-trip over the virtio queue — pathological for read-heavy mounts
+    // with many files (a multi-GB Python venv took minutes just to import, and a
+    // single file larger than the window stalled entirely). 2 GiB exceeds any
+    // realistic single mapped file; the window is virtual host address space
+    // backed on demand, so oversizing costs nothing until touched.
+    const VIRTIOFS_DAX_WINDOW: u64 = 1 << 31;
+
     // Add virtiofs mount for packed layers (AFTER set_exec)
     if config.layers_dir.exists() {
         let layers_tag = cstr("smolvm_layers");
@@ -573,7 +582,16 @@ pub fn launch_agent_vm_dynamic(
             "layers dir path contains null byte"
         );
         // SAFETY: ctx is valid, tag and path are valid C strings
-        if unsafe { (krun.add_virtiofs)(ctx, layers_tag.as_ptr(), layers_path.as_ptr()) } < 0 {
+        if unsafe {
+            add_virtiofs3(
+                ctx,
+                layers_tag.as_ptr(),
+                layers_path.as_ptr(),
+                VIRTIOFS_DAX_WINDOW,
+                false,
+            )
+        } < 0
+        {
             free_ctx_on_err!("krun_add_virtiofs failed for packed layers");
         }
     }
@@ -590,7 +608,16 @@ pub fn launch_agent_vm_dynamic(
         );
 
         // SAFETY: ctx is valid, tag and host_path are valid C strings
-        if unsafe { (krun.add_virtiofs)(ctx, tag.as_ptr(), host_path.as_ptr()) } < 0 {
+        if unsafe {
+            add_virtiofs3(
+                ctx,
+                tag.as_ptr(),
+                host_path.as_ptr(),
+                VIRTIOFS_DAX_WINDOW,
+                mount.read_only,
+            )
+        } < 0
+        {
             free_ctx_on_err!(format!(
                 "krun_add_virtiofs failed for '{}' - requested mount cannot be attached",
                 mount.tag

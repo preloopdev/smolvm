@@ -1079,6 +1079,7 @@ impl RunCmd {
 
         let mut features = smolvm::agent::LaunchFeatures {
             ssh_agent_socket,
+            cuda: self.cuda || params.cuda,
             dns_filter_hosts: params.dns_filter_hosts.clone(),
             packed_layers_dir,
             extra_disks: Vec::new(),

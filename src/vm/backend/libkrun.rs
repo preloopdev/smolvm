@@ -238,13 +238,34 @@ impl LibkrunVm {
                 return Err(Error::vm_creation("failed to set exec command"));
             }
 
-            // Add virtiofs mounts for host directories
+            // Add virtiofs mounts for host directories. Prefer krun_add_virtiofs3
+            // with a DAX window (like the root fs): without DAX, virtiofs falls
+            // back to writeback caching where every file access is a FUSE
+            // round-trip over the virtio queue — pathological for read-heavy
+            // mounts with many files (e.g. a multi-GB Python venv taking minutes
+            // just to import). DAX maps file contents through a coherent host
+            // window, giving near-native read throughput. Fall back to the plain
+            // API only on an older libkrun that lacks virtiofs3.
+            // 2 GiB: the window must exceed the largest single file mapped from
+            // the volume, or mapping that file stalls (a 902 MB libtorch_cuda.so
+            // hung against a 512 MB window). The window is virtual host address
+            // space backed on demand, so oversizing costs nothing until touched.
+            const VIRTIOFS_DAX_WINDOW: u64 = 1 << 31;
             for (i, mount) in config.mounts.iter().enumerate() {
                 let tag = CString::new(HostMount::mount_tag(i))
                     .map_err(|_| Error::mount("create mount tag", "tag contains null byte"))?;
                 let path = path_to_cstring(&mount.source)?;
 
-                if krun_add_virtiofs(ctx, tag.as_ptr(), path.as_ptr()) < 0 {
+                // `krun_add_virtiofs3` is already unwrapped above (the root fs
+                // requires it), so use it directly with a DAX window.
+                let ret = krun_add_virtiofs3(
+                    ctx,
+                    tag.as_ptr(),
+                    path.as_ptr(),
+                    VIRTIOFS_DAX_WINDOW,
+                    mount.read_only,
+                );
+                if ret < 0 {
                     tracing::warn!(
                         "failed to add virtiofs mount: {} -> {}",
                         mount.source.display(),

@@ -79,6 +79,7 @@ fn boot_log(level: &str, msg: &str) {
         }
     }
 }
+mod cuda;
 mod dns_proxy;
 mod network;
 mod oci;
@@ -3150,6 +3151,7 @@ fn write_oci_bundle(
 
     ssh_agent::inject_into_container(&mut spec);
     rosetta::inject_into_container(&mut spec);
+    cuda::inject_into_container(&mut spec, rootfs_path);
     spec.write_to(bundle_path)
         .map_err(|e| format!("failed to write OCI spec: {}", e))?;
 
@@ -3906,6 +3908,7 @@ fn spawn_interactive_command(
     // Forward SSH agent into the container if enabled at boot.
     ssh_agent::inject_into_container(&mut spec);
     rosetta::inject_into_container(&mut spec);
+    cuda::inject_into_container(&mut spec, rootfs_path);
 
     spec.write_to(&bundle_path)
         .map_err(|e| format!("failed to write OCI spec: {}", e))?;
