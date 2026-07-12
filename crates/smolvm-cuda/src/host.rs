@@ -20,6 +20,8 @@ pub type CuResult<T> = Result<T, i32>;
 
 /// `CUDA_ERROR_INVALID_HANDLE`.
 pub const CUDA_ERROR_INVALID_HANDLE: i32 = 400;
+/// Bit-63 marks a guest-minted virtual handle (see `raw_graph`, cublas vh).
+const VHANDLE_TAG: u64 = 1 << 63;
 /// `CUDA_ERROR_NOT_FOUND`.
 pub const CUDA_ERROR_NOT_FOUND: i32 = 500;
 pub const CUDA_ERROR_NOT_SUPPORTED: i32 = 801;
@@ -263,6 +265,10 @@ struct Session {
     streams: HashMap<u64, u64>,
     events: HashMap<u64, u64>,
     cublas_handles: HashMap<u64, u64>,
+    /// Guest-minted virtual graph/exec handles → real (bit-63 tagged). Lets
+    /// EndCapture / GraphInstantiate be fire-and-forget: the guest invents the
+    /// handle, the host maps it when it materializes the real one.
+    graph_vhandles: HashMap<u64, u64>,
     /// Live resources this connection created, reclaimed when it ends —
     /// a guest that dies mid-run must not leak GPU memory (device
     /// allocations are the multi-GB hazard; modules/streams/events are
@@ -303,6 +309,16 @@ fn reclaim_session(sess: &mut Session, b: &mut dyn Backend) {
     }
     for e in std::mem::take(&mut sess.owned_events) {
         let _ = b.event_destroy(e);
+    }
+    for (vh, real) in std::mem::take(&mut sess.graph_vhandles) {
+        // Exec handles (used by GraphLaunch) vs graphs — try exec destroy
+        // first, then graph destroy; the wrong one errors harmlessly.
+        let _ = if vh != 0 {
+            b.graph_exec_destroy(real)
+                .or_else(|_| b.graph_destroy(real))
+        } else {
+            Ok(())
+        };
     }
     for _ in 0..std::mem::take(&mut sess.primary_retains) {
         let _ = b.primary_ctx_release(0);
@@ -676,6 +692,14 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             Ok(sess.streams.get(&stream).copied().unwrap_or(stream))
         }
     }
+    fn raw_graph(sess: &Session, h: u64) -> u64 {
+        // Virtual graph/exec handle → real; untagged values pass through.
+        if h & VHANDLE_TAG != 0 {
+            sess.graph_vhandles.get(&h).copied().unwrap_or(0)
+        } else {
+            h
+        }
+    }
     fn raw_event(sess: &Session, event: u64) -> CuResult<u64> {
         // Same raw-on-the-wire convention as streams.
         Ok(sess.events.get(&event).copied().unwrap_or(event))
@@ -841,24 +865,42 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         Request::ThreadExchangeCaptureMode { mode } => {
             b.thread_exchange_capture_mode(mode).map(Response::Count)
         }
-        Request::StreamEndCapture { stream } => {
+        Request::StreamEndCapture { stream, graph_vh } => {
             let raw = raw_stream(sess, stream)?;
-            b.stream_end_capture(raw).map(Response::Handle)
+            let g = b.stream_end_capture(raw)?;
+            if graph_vh & VHANDLE_TAG != 0 {
+                sess.graph_vhandles.insert(graph_vh, g);
+            }
+            Ok(Response::Handle(g))
         }
         Request::StreamCaptureInfo { stream } => {
             let raw = raw_stream(sess, stream)?;
             b.stream_capture_info(raw)
                 .map(|(st, id)| Response::Pair(st, id))
         }
-        Request::GraphInstantiate { graph } => b.graph_instantiate(graph).map(Response::Handle),
+        Request::GraphInstantiate { graph, exec_vh } => {
+            let real_graph = raw_graph(sess, graph);
+            let e = b.graph_instantiate(real_graph)?;
+            if exec_vh & VHANDLE_TAG != 0 {
+                sess.graph_vhandles.insert(exec_vh, e);
+            }
+            Ok(Response::Handle(e))
+        }
         Request::GraphLaunch { graph_exec, stream } => {
             let raw = raw_stream(sess, stream)?;
-            b.graph_launch(graph_exec, raw).map(|_| Response::Ok)
+            b.graph_launch(raw_graph(sess, graph_exec), raw)
+                .map(|_| Response::Ok)
         }
         Request::GraphExecDestroy { graph_exec } => {
-            b.graph_exec_destroy(graph_exec).map(|_| Response::Ok)
+            let real = raw_graph(sess, graph_exec);
+            sess.graph_vhandles.remove(&graph_exec);
+            b.graph_exec_destroy(real).map(|_| Response::Ok)
         }
-        Request::GraphDestroy { graph } => b.graph_destroy(graph).map(|_| Response::Ok),
+        Request::GraphDestroy { graph } => {
+            let real = raw_graph(sess, graph);
+            sess.graph_vhandles.remove(&graph);
+            b.graph_destroy(real).map(|_| Response::Ok)
+        }
         Request::GraphGetNodes { graph } => b.graph_get_node_count(graph).map(Response::Bytes),
         Request::MemsetD8Async {
             dptr,

@@ -318,9 +318,15 @@ pub enum Request {
     },
     StreamEndCapture {
         stream: u64,
+        /// Guest-minted virtual graph handle (bit-63 tagged). The host maps it
+        /// to the real captured graph so EndCapture can be fire-and-forget.
+        graph_vh: u64,
     },
     GraphInstantiate {
         graph: u64,
+        /// Guest-minted virtual exec handle; host maps it to the real
+        /// instantiated exec so GraphInstantiate can be fire-and-forget.
+        exec_vh: u64,
     },
     GraphLaunch {
         graph_exec: u64,
@@ -819,13 +825,15 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             w_u64(&mut b, *stream);
             w_i32(&mut b, *mode);
         }
-        Request::StreamEndCapture { stream } => {
+        Request::StreamEndCapture { stream, graph_vh } => {
             w_u8(&mut b, Op::StreamEndCapture as u8);
             w_u64(&mut b, *stream);
+            w_u64(&mut b, *graph_vh);
         }
-        Request::GraphInstantiate { graph } => {
+        Request::GraphInstantiate { graph, exec_vh } => {
             w_u8(&mut b, Op::GraphInstantiate as u8);
             w_u64(&mut b, *graph);
+            w_u64(&mut b, *exec_vh);
         }
         Request::GraphLaunch { graph_exec, stream } => {
             w_u8(&mut b, Op::GraphLaunch as u8);
@@ -1216,8 +1224,14 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
             stream: c.u64()?,
             mode: c.i32()?,
         },
-        Op::StreamEndCapture => Request::StreamEndCapture { stream: c.u64()? },
-        Op::GraphInstantiate => Request::GraphInstantiate { graph: c.u64()? },
+        Op::StreamEndCapture => Request::StreamEndCapture {
+            stream: c.u64()?,
+            graph_vh: c.u64()?,
+        },
+        Op::GraphInstantiate => Request::GraphInstantiate {
+            graph: c.u64()?,
+            exec_vh: c.u64()?,
+        },
         Op::GraphLaunch => Request::GraphLaunch {
             graph_exec: c.u64()?,
             stream: c.u64()?,

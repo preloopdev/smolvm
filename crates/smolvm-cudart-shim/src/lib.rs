@@ -1628,15 +1628,15 @@ const CAPTURE_ACTIVE: c_int = 1;
 pub extern "C" fn cudaStreamBeginCapture(stream: *mut c_void, mode: c_int) -> c_int {
     set_last(
         match with_state(|s| {
+            // Fire-and-forget: the host starts capture when this drains, and
+            // the (also-deferred) launches record in order. The capture id is
+            // torch-visible only (its allocator correlates via the local
+            // GetCaptureInfo queries; the host tracks capture by stream), so
+            // mint it locally. Both save a host round-trip per captured graph,
+            // which dominates coldstart over a network (~1400 graphs).
             s.client
-                .stream_begin_capture(stream as u64, mode)
+                .stream_begin_capture_deferred(stream as u64, mode)
                 .map_err(map_err)?;
-            // The capture id is torch-visible only (its allocator correlates
-            // capture state through the local GetCaptureInfo queries); the
-            // host tracks capture by stream, not id. So mint it locally
-            // instead of round-tripping cuStreamGetCaptureInfo — that saved
-            // one host RTT per captured graph (vLLM captures ~1400, dominating
-            // coldstart over a network).
             static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
             let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             s.capture = Some((stream as u64, id));
@@ -1655,12 +1655,14 @@ pub extern "C" fn cudaStreamEndCapture(stream: *mut c_void, graph: *mut *mut c_v
     }
     set_last(
         match with_state(|s| {
-            let g = s
-                .client
-                .stream_end_capture(stream as u64)
+            // Mint a virtual graph handle; the host maps it to the real
+            // captured graph when this deferred end drains.
+            let vh = alloc_vhandle();
+            s.client
+                .stream_end_capture_deferred(stream as u64, vh)
                 .map_err(map_err)?;
             s.capture = None;
-            Ok(g)
+            Ok(vh)
         }) {
             Ok(g) => unsafe { out(graph, g as *mut c_void) },
             Err(e) => {
@@ -1733,10 +1735,18 @@ pub extern "C" fn cudaGraphInstantiateWithFlags(
     if graph_exec.is_null() {
         return set_last(CUDA_ERROR_INVALID_VALUE);
     }
-    set_last(match with_client(|c| c.graph_instantiate(graph as u64)) {
-        Ok(e) => unsafe { out(graph_exec, e as *mut c_void) },
-        Err(e) => e,
-    })
+    set_last(
+        match with_client(|c| {
+            // Mint a virtual exec handle; host maps it when this deferred
+            // instantiate drains (graph is itself a virtual graph handle).
+            let exec_vh = alloc_vhandle();
+            c.graph_instantiate_deferred(graph as u64, exec_vh)?;
+            Ok(exec_vh)
+        }) {
+            Ok(e) => unsafe { out(graph_exec, e as *mut c_void) },
+            Err(e) => e,
+        },
+    )
 }
 
 #[no_mangle]

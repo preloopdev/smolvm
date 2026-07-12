@@ -816,12 +816,23 @@ impl<S: Read + Write> Client<S> {
         .map(|_| ())
     }
 
-    /// Returns the raw `cudaGraph_t` (an opaque host pointer to the guest).
-    pub fn stream_end_capture(&mut self, stream: u64) -> Result<u64> {
-        match self.call(&Request::StreamEndCapture { stream }, Op::StreamEndCapture)? {
-            Response::Handle(h) => Ok(h),
-            _ => Err(CudaRpcError::Protocol("expected Handle")),
-        }
+    /// Fire-and-forget begin-capture: the host starts capture when this drains,
+    /// and subsequent (also-deferred) launches record in order. Saves a host
+    /// round-trip per captured graph (coldstart over a network).
+    pub fn stream_begin_capture_deferred(&mut self, stream: u64, mode: i32) -> Result<()> {
+        self.call_deferred(
+            &Request::StreamBeginCapture { stream, mode },
+            Op::StreamBeginCapture,
+        )
+    }
+
+    /// Fire-and-forget end-capture: the guest supplies a virtual graph handle
+    /// it minted; the host maps it to the real captured graph when it drains.
+    pub fn stream_end_capture_deferred(&mut self, stream: u64, graph_vh: u64) -> Result<()> {
+        self.call_deferred(
+            &Request::StreamEndCapture { stream, graph_vh },
+            Op::StreamEndCapture,
+        )
     }
 
     /// `(capture_status, capture_id)` straight from the host driver.
@@ -835,11 +846,13 @@ impl<S: Read + Write> Client<S> {
         }
     }
 
-    pub fn graph_instantiate(&mut self, graph: u64) -> Result<u64> {
-        match self.call(&Request::GraphInstantiate { graph }, Op::GraphInstantiate)? {
-            Response::Handle(h) => Ok(h),
-            _ => Err(CudaRpcError::Protocol("expected Handle")),
-        }
+    /// Fire-and-forget instantiate: `graph` is a virtual graph handle; the
+    /// guest supplies a virtual exec handle the host maps to the real exec.
+    pub fn graph_instantiate_deferred(&mut self, graph: u64, exec_vh: u64) -> Result<()> {
+        self.call_deferred(
+            &Request::GraphInstantiate { graph, exec_vh },
+            Op::GraphInstantiate,
+        )
     }
 
     /// Replay an instantiated graph — the hot path (one message replays every
