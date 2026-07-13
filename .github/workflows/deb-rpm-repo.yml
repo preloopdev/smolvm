@@ -61,7 +61,6 @@ jobs:
             curl -fsSL "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/smolvm-${VER}-linux-${rel}.tar.gz" -o tarball.tgz
             rm -rf pkgroot && mkdir pkgroot
             tar -xzf tarball.tgz --strip-components=1 -C pkgroot
-            cp LICENSE.txt pkgroot/LICENSE
             cp packaging/deb/copyright pkgroot/copyright
             # Retarget the wrapper at the packaged locations (same as the PKGBUILD).
             sed -i \
