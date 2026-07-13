@@ -22,20 +22,40 @@ release: "1"
 section: utils
 priority: optional
 maintainer: smol-machines <hebinsquared@gmail.com>
+# First line is the deb synopsis / rpm Summary (no trailing period); the rest is
+# the extended description.
 description: |
-  Build & run portable, lightweight, self-contained virtual machines.
-  Official smol-machines build — bundles the smol-machines libkrun fork.
+  Build and run portable, lightweight, self-contained virtual machines
+  smolvm runs each workload in its own microVM on libkrun, with sub-second boot
+  and OCI-native images. This is the official smol-machines build and bundles
+  the smol-machines libkrun fork.
 vendor: smol-machines
 homepage: https://github.com/smol-machines/smolvm
 license: Apache-2.0
 
 # crun (OCI runtime), jq and e2fsprogs (mkfs.ext4, used to format storage on the
 # first pack since we don't ship the prebuilt template) are the runtime deps most
-# likely to be missing; the rest (util-linux, gzip, tar, libcap) are base.
+# likely to be missing; the rest (util-linux, gzip, tar, libcap) are base. The
+# per-format overrides add the C library (deb: libc6, rpm: glibc) — nfpm does not
+# run the distro's automatic ELF dependency generator, so we declare it.
 depends:
   - crun
   - jq
   - e2fsprogs
+
+overrides:
+  deb:
+    depends:
+      - crun
+      - jq
+      - e2fsprogs
+      - libc6
+  rpm:
+    depends:
+      - crun
+      - jq
+      - e2fsprogs
+      - glibc
 
 contents:
   - src: ./pkgroot/smolvm
@@ -50,8 +70,11 @@ contents:
   - src: ./pkgroot/agent-rootfs
     dst: /usr/lib/smolvm/agent-rootfs
     type: tree
-  - src: ./pkgroot/LICENSE
-    dst: /usr/share/doc/smolvm/LICENSE
+  # DEP-5 machine-readable copyright at the Debian path (satisfies lintian's
+  # no-copyright-file; references common-licenses for Apache-2.0 rather than
+  # embedding the text). Generated into pkgroot by the CI workflow.
+  - src: ./pkgroot/copyright
+    dst: /usr/share/doc/smolvm/copyright
     file_info: { mode: 0644 }
   - src: ./pkgroot/README.txt
     dst: /usr/share/doc/smolvm/README.txt

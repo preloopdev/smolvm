@@ -56,19 +56,23 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p out
-          curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/refs/tags/${TAG}/LICENSE" -o LICENSE.txt
           build() {  # $1 = release-tarball arch label, $2 = nfpm arch
             local rel="$1" nar="$2"
             curl -fsSL "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/smolvm-${VER}-linux-${rel}.tar.gz" -o tarball.tgz
             rm -rf pkgroot && mkdir pkgroot
             tar -xzf tarball.tgz --strip-components=1 -C pkgroot
             cp LICENSE.txt pkgroot/LICENSE
+            cp packaging/deb/copyright pkgroot/copyright
             # Retarget the wrapper at the packaged locations (same as the PKGBUILD).
             sed -i \
               -e 's|^SMOLVM_BIN=.*|SMOLVM_BIN=/usr/lib/smolvm/smolvm-bin|' \
               -e 's|^SMOLVM_LIB=.*|SMOLVM_LIB=/usr/lib/smolvm/lib|' \
               -e 's|^SMOLVM_BUNDLED_ROOTFS=.*|SMOLVM_BUNDLED_ROOTFS=/usr/lib/smolvm/agent-rootfs|' \
               pkgroot/smolvm
+            # Shared libraries don't need the execute bit; 0644 keeps lintian/rpmlint
+            # happy (shared-library-is-executable). Only touch the bundled libs, not
+            # the guest rootfs payload.
+            find pkgroot/lib -type f -name '*.so*' -exec chmod 0644 {} +
             export NFPM_ARCH="$nar" NFPM_VERSION="$VER"
             nfpm package -f packaging/nfpm.yaml -p deb -t out/
             nfpm package -f packaging/nfpm.yaml -p rpm -t out/
