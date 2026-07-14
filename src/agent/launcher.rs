@@ -1121,6 +1121,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // Redirect console output to a file if specified, via the upstream
         // virtio-console API (krun_set_console_output was removed).
         if let Some(log_path) = console_log {
+            // Truncate first so the log reflects only this boot — libkrun appends,
+            // and reused per-machine dirs otherwise show a prior boot's console for
+            // a failed boot. See launcher_dynamic::truncate_console_log.
+            super::launcher_dynamic::truncate_console_log(log_path);
             if krun.console_output_to_file(ctx, log_path) < 0 {
                 // Expected on Windows (fd-based console redirection is a no-op
                 // there); don't let a benign WARN mask the real boot failure the
@@ -1532,7 +1536,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         drop(netns_bridge);
         Err(Error::agent(
             "start vm",
-            format!("krun_start_enter returned: {}", ret),
+            super::launcher_dynamic::describe_krun_start_error(ret),
         ))
     }
 }

@@ -496,6 +496,15 @@ pub fn launch_agent_vm_dynamic(
         }
     }
 
+    // Truncate the console log so it reflects only THIS boot. libkrun's
+    // virtio-console opens the file in append mode, so a per-machine dir that is
+    // reused across boots (e.g. the deterministic ephemeral `run` dir) otherwise
+    // accumulates every past boot's console. A boot that fails then shows a prior
+    // run's *successful* console, making a real boot failure look like a healthy
+    // boot that mysteriously shut down — actively misleading whoever debugs it.
+    // Best-effort: if truncation fails we still boot (worst case, stale history).
+    truncate_console_log(&config.console_log);
+
     // Redirect console output to a log file so libkrun doesn't put the
     // inherited terminal into raw mode (which would break terminal echo
     // if the child is killed before exit observers can restore it). Uses the
@@ -680,12 +689,51 @@ pub fn launch_agent_vm_dynamic(
     // SAFETY: ctx is a valid context from krun_create_ctx
     unsafe { (krun.free_ctx)(ctx) };
     drop(virtio_network_runtime);
-    Err(format!("krun_start_enter returned: {}", ret))
+    Err(describe_krun_start_error(ret))
 }
 
 /// Create a CString from a static string that is known not to contain NUL bytes.
 fn cstr(s: &str) -> CString {
     CString::new(s).expect("string literal must not contain NUL bytes")
+}
+
+/// Turn a `krun_start_enter` failure code into an actionable message.
+///
+/// libkrun returns a negative errno; the bare number ("krun_start_enter
+/// returned: -22") is opaque and, when it bubbles up through the readiness
+/// monitor as "boot process exited before the agent was ready", tells the user
+/// nothing about what to fix. Decode the common codes and name the usual cause.
+pub(crate) fn describe_krun_start_error(ret: i32) -> String {
+    let errno = -ret;
+    let hint = match errno {
+        22 => "EINVAL — libkrun rejected the VM configuration; usually a disk/overlay \
+               that could not be opened (still held by another VM that has not fully \
+               exited, or a corrupt/foreign-owned image) or an unsupported device option",
+        5 => "EIO — a backing disk or overlay could not be read/created",
+        13 => "EACCES — permission denied opening a VM resource (disk, socket, or rootfs)",
+        16 => "EBUSY — a VM resource is already in use by another process",
+        12 => "ENOMEM — out of memory starting the VM",
+        1 => "EPERM — the hypervisor rejected the operation (KVM/HVF/WHP access)",
+        19 => "ENODEV — the hypervisor device is unavailable (is KVM/HVF/WHP enabled?)",
+        _ => "the VM failed to start at the hypervisor layer",
+    };
+    format!("krun_start_enter returned: {ret} ({hint})")
+}
+
+/// Truncate the guest console log to empty so it holds only the current boot.
+///
+/// libkrun's virtio-console appends, and per-machine dirs are reused across
+/// boots, so without this the console grows unbounded and — worse — a failed
+/// boot inherits the previous boot's output, so the log shows a successful boot
+/// that does not correspond to the crashed run. Only truncates a file that
+/// already exists (never creates a spurious log where console capture is a no-op,
+/// e.g. Windows); a failure here is non-fatal.
+pub(crate) fn truncate_console_log(path: &Path) {
+    if path.exists() {
+        if let Err(e) = std::fs::OpenOptions::new().write(true).truncate(true).open(path) {
+            tracing::debug!(path = %path.display(), error = %e, "could not truncate console log");
+        }
+    }
 }
 
 /// Convert a Path to a CString.
@@ -721,5 +769,45 @@ fn raise_fd_limits() {
             limit.rlim_cur = limit.rlim_max;
             libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn describe_krun_start_error_decodes_common_codes() {
+        // The exact string the readiness monitor greps for must survive so
+        // boot_failure_reason still surfaces it as "the error".
+        let einval = describe_krun_start_error(-22);
+        assert!(einval.contains("krun_start_enter returned: -22"));
+        assert!(einval.contains("EINVAL"));
+        assert!(describe_krun_start_error(-13).contains("EACCES"));
+        // Unknown codes still render the raw number with a generic explanation.
+        let unknown = describe_krun_start_error(-999);
+        assert!(unknown.contains("-999"));
+        assert!(unknown.contains("hypervisor"));
+    }
+
+    #[test]
+    fn truncate_console_log_clears_prior_boot_output() {
+        let dir = std::env::temp_dir().join(format!("smolvm-console-trunc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("agent-console.log");
+        // A prior boot's console is present.
+        std::fs::write(&log, b"PRIOR BOOT: agent init complete\n").unwrap();
+        assert!(std::fs::metadata(&log).unwrap().len() > 0);
+
+        truncate_console_log(&log);
+
+        // The next boot starts from an empty file — no stale success lines.
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), 0);
+        // A missing log is left untouched (no spurious file where capture is a no-op).
+        let missing = dir.join("nope.log");
+        truncate_console_log(&missing);
+        assert!(!missing.exists());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
