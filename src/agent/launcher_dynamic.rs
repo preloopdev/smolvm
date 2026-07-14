@@ -706,9 +706,11 @@ fn cstr(s: &str) -> CString {
 pub(crate) fn describe_krun_start_error(ret: i32) -> String {
     let errno = -ret;
     let hint = match errno {
-        22 => "EINVAL — libkrun rejected the VM configuration; usually a disk/overlay \
+        22 => {
+            "EINVAL — libkrun rejected the VM configuration; usually a disk/overlay \
                that could not be opened (still held by another VM that has not fully \
-               exited, or a corrupt/foreign-owned image) or an unsupported device option",
+               exited, or a corrupt/foreign-owned image) or an unsupported device option"
+        }
         5 => "EIO — a backing disk or overlay could not be read/created",
         13 => "EACCES — permission denied opening a VM resource (disk, socket, or rootfs)",
         16 => "EBUSY — a VM resource is already in use by another process",
@@ -730,7 +732,11 @@ pub(crate) fn describe_krun_start_error(ret: i32) -> String {
 /// e.g. Windows); a failure here is non-fatal.
 pub(crate) fn truncate_console_log(path: &Path) {
     if path.exists() {
-        if let Err(e) = std::fs::OpenOptions::new().write(true).truncate(true).open(path) {
+        if let Err(e) = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path)
+        {
             tracing::debug!(path = %path.display(), error = %e, "could not truncate console log");
         }
     }
