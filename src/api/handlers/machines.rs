@@ -1187,6 +1187,27 @@ pub async fn fork_machine(
     let req_share_weights = req.share_weights;
     let fork_env = crate::util::parse_env_list(&req.env);
 
+    // Validate pinned ports as the create path does: fork uses these host ports
+    // as-is (no remapping), so port 0 or a duplicated host port would otherwise
+    // surface only as a confusing clone-boot bind failure instead of a clean 400.
+    for (h, g) in &pinned_ports {
+        if *h == 0 || *g == 0 {
+            return Err(ApiError::BadRequest(
+                "port 0 is not valid for VM port forwarding".to_string(),
+            ));
+        }
+    }
+    {
+        let mut seen = std::collections::HashSet::new();
+        for (h, _) in &pinned_ports {
+            if !seen.insert(*h) {
+                return Err(ApiError::BadRequest(format!(
+                    "duplicate host port {h}: each host port can only be mapped once"
+                )));
+            }
+        }
+    }
+
     // Serialize lifecycle on the CLONE name so a concurrent start/stop/delete of
     // the same clone can't race the fork's register + boot. The golden is only
     // read + frozen via its control socket, which tolerates concurrent forks.
