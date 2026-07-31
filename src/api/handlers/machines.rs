@@ -990,13 +990,20 @@ pub async fn start_machine(
         // Zombie: verified-kill the VMM and clear the DB record
         // before falling through to a clean fresh start. Any stale
         // in-memory registry entry gets overwritten by the
-        // `insert_machine` call later in this handler.
+        // `insert_machine` call later in this handler. If the zombie
+        // cannot be confirmed dead, refuse the start instead of
+        // booting on top of it.
         let name_recover = name.clone();
         tokio::task::spawn_blocking(move || {
-            crate::agent::state_probe::recover_if_unreachable(&name_recover);
+            crate::agent::state_probe::recover_if_unreachable(&name_recover)
         })
         .await
-        .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
+        .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+        .map_err(|e| {
+            ApiError::internal(format!(
+                "machine '{name}' is unreachable and zombie cleanup failed: {e}"
+            ))
+        })?;
     }
 
     if let Some(pool_size) = query.fork_pool_size {

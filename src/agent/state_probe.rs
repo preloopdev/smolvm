@@ -121,7 +121,10 @@ fn recover_unreachable_machine_in_db(record: &VmRecord, db: &SmolvmDb) -> crate:
             if !crate::process::is_our_process_strict(pid, record.pid_start_time) {
                 return Err(crate::Error::agent(
                     "recover unreachable machine",
-                    format!("refusing to stop unverified process {pid}"),
+                    format!(
+                        "refusing to stop unverified process {pid}; if {pid} is \
+                         this VM's process, run: kill -9 {pid}, then retry"
+                    ),
                 ));
             }
             crate::process::stop_vm_process(
@@ -149,16 +152,18 @@ fn recover_unreachable_machine_in_db(record: &VmRecord, db: &SmolvmDb) -> crate:
 /// CLI/API boundary can share the helper without coupling to
 /// `SmolvmConfig`.
 ///
-/// Returns `true` when recovery actually ran, so callers can print
+/// Returns `Ok(true)` when recovery actually ran, so callers can print
 /// a user-facing notice (start/stop/delete all want to mention the
 /// teardown happened — the alternative is a silent kill, which is
 /// surprising when the operator didn't know a zombie existed).
-pub fn recover_if_unreachable(name: &str) -> bool {
-    let Ok(db) = SmolvmDb::open() else {
-        return false;
-    };
+/// Returns `Ok(false)` when the machine is not Unreachable and nothing
+/// happened. Returns `Err` when the zombie could not be confirmed dead
+/// (unverified PID, or still alive after SIGTERM+SIGKILL); callers must
+/// not proceed as if the machine were stopped in that case.
+pub fn recover_if_unreachable(name: &str) -> crate::Result<bool> {
+    let db = SmolvmDb::open()?;
     let Ok(Some(record)) = db.get_vm(name) else {
-        return false;
+        return Ok(false);
     };
     // Only a genuine zombie resolves to `Unreachable`. A frozen fork base
     // resolves to `Frozen` (see `resolve_state`) and is left alone here —
@@ -166,9 +171,10 @@ pub fn recover_if_unreachable(name: &str) -> bool {
     // A force-delete that genuinely wants to break the chain calls
     // `recover_unreachable_machine` directly, bypassing this path.
     if resolve_state(name, &record) != RecordState::Unreachable {
-        return false;
+        return Ok(false);
     }
-    recover_unreachable_machine(&record).is_ok()
+    recover_unreachable_machine_in_db(&record, &db)?;
+    Ok(true)
 }
 
 /// Return true if a short-timeout vsock ping to the agent for this
@@ -303,6 +309,7 @@ mod tests {
         let error = recover_unreachable_machine_in_db(&r, &db).unwrap_err();
 
         assert!(error.to_string().contains("unverified process"));
+        assert!(error.to_string().contains("kill -9"));
         let persisted = db.get_vm(&r.name).unwrap().unwrap();
         assert_eq!(persisted.state, RecordState::Unreachable);
         assert_eq!(persisted.pid, r.pid);
