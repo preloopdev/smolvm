@@ -222,7 +222,12 @@ print_summary() {
 
     echo ""
 
-    if [[ $TESTS_FAILED -eq 0 ]]; then
+    if [[ $TESTS_FAILED -eq 0 ]] && [[ $TESTS_RUN -eq 0 ]]; then
+        # Nothing ran — usually a suite that skipped its setup (unsupported
+        # platform, missing dependency, a VM that would not boot).
+        echo -e "${YELLOW}No tests ran — suite skipped.${NC}"
+        return 0
+    elif [[ $TESTS_FAILED -eq 0 ]]; then
         echo -e "${GREEN}All tests passed!${NC}"
         return 0
     else
