@@ -108,7 +108,17 @@ test_original_clone_alive() {
 
 # delete --force breaks the chain and reaps the golden's VMM (no orphan).
 test_force_delete_reaps_golden() {
+    local pid
+    pid=$("$SMOLVM" machine status --name "$GOLD" --json 2>/dev/null |
+        sed -nE 's/.*"pid":[[:space:]]*([0-9]+).*/\1/p' | head -1)
+    [[ -n "$pid" ]] || {
+        echo "FAIL: golden PID missing before force delete"; return 1; }
+
     "$SMOLVM" machine delete --name "$GOLD" -f >/dev/null 2>&1 || return 1
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "FAIL: golden process $pid still alive after force delete"
+        return 1
+    fi
     # Golden record is gone.
     "$SMOLVM" machine ls --json 2>/dev/null | grep -q "\"name\":\"$GOLD\"" && {
         echo "FAIL: golden record still present after force delete"; return 1; }
