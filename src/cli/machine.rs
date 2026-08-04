@@ -163,6 +163,15 @@ fn parse_published_sockets(
                 ),
             ));
         }
+        // The guest resolves this path in its own namespace (and bind-mounts a
+        // mounted socket there), so a relative path would silently land next to
+        // whatever the resolving process happens to be rooted at.
+        if !s.guest_path.starts_with('/') {
+            return Err(smolvm::Error::config(
+                "publish-socket",
+                format!("guest path '{}' must be absolute", s.guest_path),
+            ));
+        }
     }
     Ok(out)
 }
@@ -1975,6 +1984,10 @@ mod tests {
         assert!(parse_published_sockets(&[], &["/only-host".to_string()]).is_err());
         assert!(parse_published_sockets(&[":/tmp/h.sock".to_string()], &[]).is_err());
         assert!(parse_published_sockets(&["/run/a;b.sock".to_string()], &[]).is_err());
+        // Relative guest paths resolve against whatever the guest process is
+        // rooted at, so they can never name the socket the user meant.
+        assert!(parse_published_sockets(&["app.sock".to_string()], &[]).is_err());
+        assert!(parse_published_sockets(&[], &["/run/h.sock:app.sock".to_string()]).is_err());
     }
 
     #[test]
