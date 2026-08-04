@@ -173,6 +173,22 @@ fn parse_published_sockets(
             ));
         }
     }
+    // Two mount bridges at the same guest path silently shadow each other in
+    // the guest, the later bind mount wins, leaving the first bridge's host
+    // socket unreachable. Reject the config instead of paying out a dead
+    // bridge. (Expose entries only *dial* their guest path, so duplicates
+    // there are harmless.)
+    let mut mounted_paths = std::collections::HashSet::new();
+    for s in &out {
+        if s.direction == smolvm::config::SocketDirection::Mount
+            && !mounted_paths.insert(&s.guest_path)
+        {
+            return Err(smolvm::Error::config(
+                "mount-socket",
+                format!("guest path '{}' is mounted more than once", s.guest_path),
+            ));
+        }
+    }
     Ok(out)
 }
 
@@ -1988,6 +2004,16 @@ mod tests {
         // rooted at, so they can never name the socket the user meant.
         assert!(parse_published_sockets(&["app.sock".to_string()], &[]).is_err());
         assert!(parse_published_sockets(&[], &["/run/h.sock:app.sock".to_string()]).is_err());
+        // Two mount bridges at one guest path shadow each other in the guest,
+        // leaving the first host socket unreachable.
+        assert!(parse_published_sockets(
+            &[],
+            &[
+                "/run/h1.sock:/run/control/engine.sock".to_string(),
+                "/run/h2.sock:/run/control/engine.sock".to_string(),
+            ]
+        )
+        .is_err());
     }
 
     #[test]

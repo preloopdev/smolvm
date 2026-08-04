@@ -24,7 +24,7 @@ use smolvm_protocol::guest_env;
 use smolvm_protocol::publish_socket::{decode, PublishedSocket, SocketDirection};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::RwLock;
 use std::thread;
 
 /// VM-private directory the mount-direction listeners are bound in.
@@ -36,13 +36,18 @@ use std::thread;
 const MOUNT_SOCKET_DIR: &str = "/run/smolvm/published-sockets";
 
 /// Mount-direction sockets whose listener is bound *and* published at its guest
-/// path, recorded by [`start_all`] before the agent accepts host requests.
+/// path, written by [`start_all`] before the agent accepts host requests.
 ///
 /// [`inject_into_container`] reads this rather than the env var so a bridge that
 /// failed to come up is never bind-mounted into a container: crun rejects a
 /// missing mount source, which would turn one broken socket into a VM that can't
 /// start any container.
-static PUBLISHED_MOUNTS: OnceLock<Vec<PublishedSocket>> = OnceLock::new();
+///
+/// A [`RwLock`] rather than a `OnceLock`: production writes this exactly once
+/// per boot, but the lock lets tests reset it — with `OnceLock`, a single
+/// [`start_all`] call in one test would permanently poison the "nothing
+/// published yet" invariant for every other test in the process.
+static PUBLISHED_MOUNTS: RwLock<Vec<PublishedSocket>> = RwLock::new(Vec::new());
 
 /// Start every user-published socket bridge. No-op when none are configured.
 ///
@@ -67,7 +72,9 @@ pub fn start_all() {
             },
         }
     }
-    let _ = PUBLISHED_MOUNTS.set(published);
+    *PUBLISHED_MOUNTS
+        .write()
+        .expect("published-sockets registry lock poisoned") = published;
 }
 
 #[cfg(target_os = "linux")]
@@ -112,12 +119,10 @@ fn mount_socket_path(vsock_port: u32) -> PathBuf {
 /// after the user-volume mounts makes the socket visible even when its public path
 /// is nested under a volume target.
 pub fn inject_into_container(spec: &mut crate::oci::OciSpec) {
-    inject_sockets_into_container(spec, published_mounts());
-}
-
-/// The mount-direction sockets [`start_all`] published; empty before it runs.
-fn published_mounts() -> &'static [PublishedSocket] {
-    PUBLISHED_MOUNTS.get().map_or(&[], Vec::as_slice)
+    let published = PUBLISHED_MOUNTS
+        .read()
+        .expect("published-sockets registry lock poisoned");
+    inject_sockets_into_container(spec, &published);
 }
 
 fn inject_sockets_into_container(spec: &mut crate::oci::OciSpec, sockets: &[PublishedSocket]) {
@@ -442,9 +447,15 @@ mod mount_tests {
     fn nothing_is_injected_before_the_bridges_are_published() {
         // An injected mount whose source doesn't exist fails `crun create`, so a
         // bridge that never came up must not reach the spec at all.
+        // Reset the registry explicitly: the invariant being guarded is about
+        // what the registry *contains*, not about test execution order.
+        PUBLISHED_MOUNTS
+            .write()
+            .expect("published-sockets registry lock poisoned")
+            .clear();
         let mut spec = spec();
         let baseline = spec.mounts.len();
-        inject_sockets_into_container(&mut spec, published_mounts());
+        inject_into_container(&mut spec);
         assert_eq!(spec.mounts.len(), baseline);
     }
 
