@@ -38,6 +38,15 @@ pub fn is_enabled() -> bool {
     std::env::var(guest_env::ROSETTA).as_deref() == Ok(guest_env::VALUE_ON)
 }
 
+/// Serializes unit tests that mutate the process-wide `SMOLVM_ROSETTA` env
+/// var — cargo runs tests multi-threaded within one process, and more than
+/// one test module touches this sentinel.
+#[cfg(test)]
+pub(crate) fn env_lock() -> parking_lot::MutexGuard<'static, ()> {
+    static LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    LOCK.lock()
+}
+
 /// Bind-mount the Rosetta runtime into a workload container so the wrapper's
 /// `execve("/mnt/rosetta/rosetta")` resolves inside the container's mount
 /// namespace. binfmt_misc's `F` flag pins the wrapper fd itself, but the
@@ -233,6 +242,7 @@ mod tests {
 
     #[test]
     fn is_enabled_reflects_env_sentinel() {
+        let _guard = env_lock();
         // Save/restore to avoid cross-test env bleed.
         let prev = std::env::var(guest_env::ROSETTA).ok();
 

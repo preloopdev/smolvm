@@ -467,6 +467,22 @@ fn should_expose_storage(mounts: &[(String, String, bool)], unprivileged: bool) 
         .any(|(_, path, _)| path.trim_end_matches('/') == STORAGE_ROOT)
 }
 
+/// Inject the boot-enabled runtime features (SSH agent socket, Rosetta
+/// runtime, forkpoint helpers, CUDA shims) into a workload container spec.
+///
+/// Every container that runs user processes gets the same sibling set — the
+/// pod shim and main's bundle builders apply it too — so a feature requested
+/// at boot (e.g. `--rosetta`) reaches the workload no matter which exec/run
+/// path spawned the container. Centralized here: when each call site repeated
+/// the sibling lines, `run_command`/`spawn_in_overlay` drifted and dropped
+/// the Rosetta mount (binfmt wrapper died 32512 inside such containers).
+fn inject_container_features(spec: &mut OciSpec, rootfs_path: &Path) {
+    crate::ssh_agent::inject_into_container(spec);
+    crate::rosetta::inject_into_container(spec);
+    crate::forkpoint::inject_into_container(spec);
+    crate::cuda::inject_into_container(spec, rootfs_path);
+}
+
 /// Name of the optional index file (written into the packed-layers dir at
 /// extraction time) recording the layers in OCI order, bottom-most first, one
 /// short layer id per line.
@@ -2741,10 +2757,8 @@ pub fn run_command(
         add_workspace_fallback(&mut spec, mounts);
         add_storage_fallback(&mut spec, mounts, unprivileged);
 
-        // Forward SSH agent into the container if enabled at boot.
-        crate::ssh_agent::inject_into_container(&mut spec);
-        crate::forkpoint::inject_into_container(&mut spec);
-        crate::cuda::inject_into_container(&mut spec, Path::new(&prepared.rootfs_path));
+        // Forward the boot-enabled runtime features into the container.
+        inject_container_features(&mut spec, Path::new(&prepared.rootfs_path));
 
         // Write config.json to bundle
         spec.write_to(&bundle_path)
@@ -2836,9 +2850,8 @@ pub fn spawn_in_overlay(
     add_workspace_fallback(&mut spec, mounts);
     add_storage_fallback(&mut spec, mounts, unprivileged);
 
-    crate::ssh_agent::inject_into_container(&mut spec);
-    crate::forkpoint::inject_into_container(&mut spec);
-    crate::cuda::inject_into_container(&mut spec, Path::new(&prepared.rootfs_path));
+    // Forward the boot-enabled runtime features into the container.
+    inject_container_features(&mut spec, Path::new(&prepared.rootfs_path));
     spec.add_gpu_devices_if_available();
 
     spec.write_to(&bundle_path)
@@ -3904,6 +3917,69 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn bare_spec() -> OciSpec {
+        OciSpec::new(
+            &["true".to_string()],
+            &[],
+            "/",
+            false,
+            &crate::oci::ProcessIdentity::root(),
+            false,
+        )
+    }
+
+    #[test]
+    fn inject_container_features_adds_rosetta_mount_when_enabled() {
+        // The binfmt wrapper's execve("/mnt/rosetta/rosetta") resolves in the
+        // container's mount namespace, so every spec assembly path that runs
+        // user processes (run_command, spawn_in_overlay) must carry this
+        // mount — without it the wrapper dies with 32512 inside the container.
+        // Serializes with rosetta.rs's env tests via its shared lock.
+        let _guard = crate::rosetta::env_lock();
+        let prev = std::env::var(guest_env::ROSETTA).ok();
+        std::env::set_var(guest_env::ROSETTA, guest_env::VALUE_ON);
+
+        let mut spec = bare_spec();
+        inject_container_features(&mut spec, Path::new("/nonexistent-rootfs"));
+
+        let mount = spec
+            .mounts
+            .iter()
+            .find(|m| m.destination == smolvm_protocol::ROSETTA_GUEST_PATH)
+            .expect("rosetta runtime mount missing from assembled spec");
+        assert_eq!(mount.source, smolvm_protocol::ROSETTA_GUEST_PATH);
+        // Read-only: the container only execs the translator.
+        assert!(mount.options.iter().any(|o| o == "ro"));
+
+        match prev {
+            Some(v) => std::env::set_var(guest_env::ROSETTA, v),
+            None => std::env::remove_var(guest_env::ROSETTA),
+        }
+    }
+
+    #[test]
+    fn inject_container_features_omits_rosetta_mount_when_disabled() {
+        let _guard = crate::rosetta::env_lock();
+        let prev = std::env::var(guest_env::ROSETTA).ok();
+        std::env::remove_var(guest_env::ROSETTA);
+
+        let mut spec = bare_spec();
+        inject_container_features(&mut spec, Path::new("/nonexistent-rootfs"));
+
+        assert!(
+            !spec
+                .mounts
+                .iter()
+                .any(|m| m.destination == smolvm_protocol::ROSETTA_GUEST_PATH),
+            "rosetta mount must not appear when the boot sentinel is unset"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var(guest_env::ROSETTA, v),
+            None => std::env::remove_var(guest_env::ROSETTA),
+        }
     }
 
     #[test]
