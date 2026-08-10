@@ -253,6 +253,24 @@ if [ -f "$ROSETTA_WRAPPER" ]; then
     chmod 755 "$OUTPUT_DIR/usr/bin/rosetta-wrapper"
 fi
 
+# Install the dockerd default-runtime shim and wire the engine to it.
+# Containers created by an in-guest dockerd never pass through the agent's
+# spec assembly, so they miss the agent's /mnt/rosetta injection (see
+# crates/smolvm-agent/src/rosetta.rs) and amd64 execs die inside them with
+# `rosetta-wrapper: unexpected initial stop: 32512`. dockerd resolves a named
+# default-runtime to a binary path and execs it with the OCI runtime CLI, so
+# the shim adds the read-only /mnt/rosetta bind mount to the bundle's
+# config.json (only when SMOLVM_ROSETTA=1) before exec'ing the real crun.
+# Sources: scripts/rosetta/crun-rosetta, scripts/rosetta/docker-daemon.json
+CRUN_ROSETTA_SHIM="$(dirname "$0")/rosetta/crun-rosetta"
+DOCKER_DAEMON_JSON="$(dirname "$0")/rosetta/docker-daemon.json"
+if [ -f "$CRUN_ROSETTA_SHIM" ]; then
+    cp "$CRUN_ROSETTA_SHIM" "$OUTPUT_DIR/usr/local/bin/crun-rosetta"
+    chmod 755 "$OUTPUT_DIR/usr/local/bin/crun-rosetta"
+    mkdir -p "$OUTPUT_DIR/etc/docker"
+    cp "$DOCKER_DAEMON_JSON" "$OUTPUT_DIR/etc/docker/daemon.json"
+fi
+
 # Remove existing init (it's a symlink to busybox) and replace with
 # symlink to the agent binary. The agent handles overlayfs setup +
 # pivot_root internally before starting the vsock listener.

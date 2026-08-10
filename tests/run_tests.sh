@@ -31,6 +31,7 @@
 #   pack            test_pack.sh
 #   pack-quick      test_pack.sh --quick
 #   gpu             test_gpu.sh  (requires GPU hardware)
+#   rosetta-shim    test_rosetta_runtime_shim.sh (no VMs; host sh+jq only)
 #
 # Non-pass/fail:
 #   bench           bench_vm_startup.sh (prints timing, always exits 0)
@@ -72,6 +73,7 @@ get_suite() {
         pack-quick)  echo "$SCRIPT_DIR/test_pack.sh --quick" ;;
         gpu)         echo "$SCRIPT_DIR/test_gpu.sh" ;;
         scale)       echo "$SCRIPT_DIR/test_scale.sh" ;;
+        rosetta-shim) echo "$SCRIPT_DIR/test_rosetta_runtime_shim.sh" ;;
         *)           return 1 ;;
     esac
 }

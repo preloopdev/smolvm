@@ -1,0 +1,8 @@
+{
+    "runtimes": {
+        "crun-rosetta": {
+            "path": "/usr/local/bin/crun-rosetta"
+        }
+    },
+    "default-runtime": "crun-rosetta"
+}
