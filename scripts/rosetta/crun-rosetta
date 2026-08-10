@@ -1,5 +1,8 @@
 #!/bin/sh
-# crun-rosetta -- OCI runtime shim wired as dockerd's default-runtime.
+# crun-rosetta -- OCI runtime shim wired as dockerd's default-runtime, and
+# also installed as /usr/local/bin/runc (PATH precedes /usr/bin): buildx's
+# embedded executor (`docker build` on Docker >= 23) finds its "runc" by PATH
+# lookup and never consults the daemon's runtime config.
 #
 # Containers created by an in-guest dockerd never pass through the smolvm
 # agent's spec assembly, so they miss the /mnt/rosetta bind mount that
@@ -11,22 +14,29 @@
 # the same read-only mount to the bundle's config.json before exec'ing the
 # real crun with the original argv.
 #
-# Injection happens only when ALL of these hold:
-#   * Rosetta is enabled for the machine, as seen from THIS namespace --
-#     either SMOLVM_ROSETTA=1 (the sentinel the host sets on guest init;
-#     VALUE_ON in crates/smolvm-protocol/src/guest_env.rs, same check as
-#     rosetta.rs::is_enabled; bare-VM processes descend from the agent, PID 1,
-#     and inherit it) OR the translator is visible at /mnt/rosetta/rosetta
-#     (the mount the agent adds to every workload container's spec when Rosetta
-#     is on; exec'd containers don't inherit PID 1's env, so the mount is the
-#     signal there). Both signal the same boot-time
-#     crates/smolvm-agent/src/rosetta.rs::setup().
-#   * argv carries --bundle/-b (only `create` and `run` take one, and
-#     dockerd's containerd-shim always passes it) and $bundle/config.json
-#     parses. Other runtime invocations (features, kill, delete, ...) pass
-#     through untouched.
-#   * No existing mount already claims /mnt/rosetta -- a user's explicit
-#     `-v /mnt/rosetta:...` mount wins.
+# Two normalizations happen to every bundle (when writable):
+#
+# 1. dockerd's spec generator emits "blockIO": {} on every container; crun
+#    treats a present blockIO section as a directive to write io.max /
+#    io.weight, which this VM's kernel (libkrunfw, built without
+#    CONFIG_BLK_DEV_THROTTLING) has no files for: `open `io.max`:
+#    No such file or directory`. runc silently skips the empty section;
+#    drop it the same way so crun under dockerd works at all (arm64
+#    included). A blockIO section with real limits is left untouched.
+#
+# 2. The Rosetta mount injection described above, only when ALL of these
+#    hold:
+#    * Rosetta is enabled for the machine, as seen from THIS namespace --
+#      either SMOLVM_ROSETTA=1 (the sentinel the host sets on guest init;
+#      VALUE_ON in crates/smolvm-protocol/src/guest_env.rs, same check as
+#      rosetta.rs::is_enabled; bare-VM processes descend from the agent,
+#      PID 1, and inherit it) OR the translator is visible at
+#      /mnt/rosetta/rosetta (the mount the agent adds to every workload
+#      container's spec when Rosetta is on; exec'd containers don't inherit
+#      PID 1's env, so the mount is the signal there). Both signal the same
+#      boot-time crates/smolvm-agent/src/rosetta.rs::setup().
+#    * No existing mount already claims /mnt/rosetta -- a user's explicit
+#      `-v /mnt/rosetta:...` mount wins.
 #
 # Everything fails SOFT: any scan/jq problem still execs crun untouched, so a
 # shim bug can degrade x86_64 translation but never block container startup.
@@ -57,29 +67,35 @@ done
 
 # Enabled for the machine = env sentinel in this process, or the translator
 # already visible from this namespace (see header for why both).
-rosetta_on=0
+inject=0
 if [ "${SMOLVM_ROSETTA:-}" = "1" ] || [ -e "$ROSETTA_PATH/rosetta" ]; then
-    rosetta_on=1
+    inject=1
 fi
 
-if [ -n "$bundle" ] && [ "$rosetta_on" = "1" ]; then
+if [ -n "$bundle" ]; then
     config=$bundle/config.json
     if [ -f "$config" ]; then
         tmp=$config.crun-rosetta.$$
-        # One jq pass: outputs the doc unchanged when a mount already claims
-        # the path (cmp below then skips the swap), so a user mount wins.
-        if jq --arg dst "$ROSETTA_PATH" '
-                if (.mounts // []) | any(.destination == $dst) then .
-                else .mounts += [{
-                    destination: $dst,
-                    type: "bind",
-                    source: $dst,
-                    options: ["bind", "ro"]
-                }] end
+        # One jq pass: drops dockerd's empty blockIO (kernel has no io.max;
+        # see header) and, when enabled, appends the ro runtime bind mount.
+        # Outputs the doc unchanged when neither case applies (the cmp below
+        # then skips the swap), so user mounts and real IO limits always win.
+        if jq --arg dst "$ROSETTA_PATH" --argjson inject "$inject" '
+                (if .linux.resources.blockIO == {} then
+                     del(.linux.resources.blockIO)
+                 else . end)
+                | if $inject == 1 and (((.mounts // []) | any(.destination == $dst)) == false) then
+                    .mounts = ((.mounts // []) + [{
+                        destination: $dst,
+                        type: "bind",
+                        source: $dst,
+                        options: ["bind", "ro"]
+                    }])
+                else . end
             ' "$config" > "$tmp" 2>/dev/null; then
             if ! cmp -s "$tmp" "$config"; then
                 mv "$tmp" "$config"
-                echo "crun-rosetta: injected $ROSETTA_PATH (ro) into $config" >&2
+                echo "crun-rosetta: patched $config (blockIO strip; rosetta mount inject=$inject)" >&2
             fi
         fi
         rm -f "$tmp"

@@ -45,11 +45,13 @@ case "$DETECTED_ARCH" in
     arm64|aarch64)
         ALPINE_ARCH="aarch64"
         CRANE_ARCH="arm64"
+        CRUN_ARCH="arm64"
         RUST_TARGET="aarch64-unknown-linux-musl"
         ;;
     x86_64|amd64)
         ALPINE_ARCH="x86_64"
         CRANE_ARCH="x86_64"
+        CRUN_ARCH="amd64"
         RUST_TARGET="x86_64-unknown-linux-musl"
         ;;
     *)
@@ -66,9 +68,19 @@ ALPINE_URL="${ALPINE_MIRROR}/v${ALPINE_VERSION}/releases/${ALPINE_ARCH}/${ALPINE
 CRANE_VERSION="0.19.0"
 CRANE_URL="https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/go-containerregistry_Linux_${CRANE_ARCH}.tar.gz"
 
+# crun version (pinned static upstream build). Alpine 3.19's apk crun (1.12)
+# is too old for an in-guest dockerd: buildx's embedded executor invokes
+# `runc run --keep` (added in crun 1.14), and both it and dockerd's containerd
+# path exercise OCI surface the 1.12 CLI predates. The agent's own containers
+# are undemanding, so one static build serves both. Static: no musl/libcap/
+# seccomp ABI coupling to the minirootfs.
+CRUN_VERSION="1.23.1"
+CRUN_URL="https://github.com/containers/crun/releases/download/${CRUN_VERSION}/crun-${CRUN_VERSION}-linux-${CRUN_ARCH}"
+
 echo "Building agent rootfs..."
 echo "  Alpine: ${ALPINE_VERSION} (${ALPINE_ARCH})"
 echo "  Crane: ${CRANE_VERSION}"
+echo "  crun: ${CRUN_VERSION} (static)"
 echo "  Output: ${OUTPUT_DIR}"
 
 # Create output directory
@@ -98,12 +110,23 @@ echo "Installing crane..."
 mkdir -p "$OUTPUT_DIR/usr/local/bin"
 tar -xzf "$CRANE_TAR" -C "$OUTPUT_DIR/usr/local/bin" crane
 
+# Install the pinned static crun over the Alpine base.
+echo "Installing crun ${CRUN_VERSION}..."
+CRUN_BIN="/tmp/crun-${CRUN_VERSION}-linux-${CRUN_ARCH}"
+if [ ! -f "$CRUN_BIN" ]; then
+    curl -fsSL -o "$CRUN_BIN" "$CRUN_URL"
+fi
+install -m 0755 "$CRUN_BIN" "$OUTPUT_DIR/usr/bin/crun"
+
 # Install additional Alpine packages into the rootfs.
 # Strategies:
 #   1. apk.static (Linux only) — runs natively, supports cross-arch via --arch
 #   2. smolvm (any host) — only for native-arch builds (pulls host-arch image)
 echo "Installing additional packages..."
-APK_PACKAGES="jq e2fsprogs e2fsprogs-extra crun util-linux libcap seatd"
+# crun intentionally absent: a pinned static upstream build lands at
+# /usr/bin/crun below (see CRUN_VERSION; apk 1.12 predates `run --keep`,
+# which buildx's executor requires).
+APK_PACKAGES="jq e2fsprogs e2fsprogs-extra util-linux libcap seatd"
 
 # Determine if this is a cross-arch build
 HOST_ARCH="$(uname -m)"
@@ -206,7 +229,14 @@ elif [[ "$CROSS_ARCH" == "1" ]]; then
     exit 1
 elif command -v smolvm &> /dev/null; then
     echo "  Using smolvm..."
-    smolvm machine run --net -v "$OUTPUT_DIR:/rootfs" --image "alpine:${ALPINE_VERSION}" \
+    # Hosts on overlay DNS (e.g. Tailscale MagicDNS at 100.100.100.100) hand
+    # guests a resolver they cannot reach; SMOLVM_BUILD_DNS overrides the
+    # bootstrap VM's resolver for the package fetch.
+    SMOLVM_DNS_ARGS=()
+    if [[ -n "${SMOLVM_BUILD_DNS:-}" ]]; then
+        SMOLVM_DNS_ARGS=(--dns "$SMOLVM_BUILD_DNS")
+    fi
+    smolvm machine run --net "${SMOLVM_DNS_ARGS[@]}" -v "$OUTPUT_DIR:/rootfs" --image "alpine:${ALPINE_VERSION}" \
         -- sh -c "apk add --root /rootfs --initdb --no-cache $APK_PACKAGES"
     echo "Packages installed successfully"
 else
@@ -267,6 +297,14 @@ DOCKER_DAEMON_JSON="$(dirname "$0")/rosetta/docker-daemon.json"
 if [ -f "$CRUN_ROSETTA_SHIM" ]; then
     cp "$CRUN_ROSETTA_SHIM" "$OUTPUT_DIR/usr/local/bin/crun-rosetta"
     chmod 755 "$OUTPUT_DIR/usr/local/bin/crun-rosetta"
+
+    # default-runtime only governs dockerd's own containers: buildx's
+    # embedded executor (`docker build` on Docker >= 23) execs "runc" by
+    # PATH lookup, bypassing the daemon's runtime config. /usr/local/bin
+    # precedes /usr/bin in the guest PATH, so an alias here intercepts
+    # buildkit while leaving an apk/docker-installed /usr/bin/runc intact.
+    ln -sf crun-rosetta "$OUTPUT_DIR/usr/local/bin/runc"
+
     mkdir -p "$OUTPUT_DIR/etc/docker"
     cp "$DOCKER_DAEMON_JSON" "$OUTPUT_DIR/etc/docker/daemon.json"
 fi

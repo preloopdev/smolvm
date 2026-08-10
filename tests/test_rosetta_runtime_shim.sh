@@ -135,7 +135,9 @@ test_noop_when_sentinel_unset() {
 
     run_shim create --bundle "$bundle" ctr2 || return 1
 
-    cmp -s "$SCRATCH/disabled.orig" "$bundle/config.json" || {
+    # jq rewrites the doc in passing (formatting); the spec content must be
+    # unchanged. -S canonicalizes key order for a semantic compare.
+    [[ "$(jq -S . "$SCRATCH/disabled.orig")" == "$(jq -S . "$bundle/config.json")" ]] || {
         echo "config.json modified with SMOLVM_ROSETTA unset"
         return 1
     }
@@ -151,7 +153,7 @@ test_noop_when_sentinel_wrong_value() {
     env SMOLVM_ROSETTA=0 CRUN_ROSETTA_PATH="$NO_ROSETTA" CRUN_ROSETTA_CRUN="$CRUN_STUB" \
         CRUN_STUB_ARGV="$STUB_ARGV" "$SHIM" create --bundle "$bundle" ctr3 || return 1
 
-    cmp -s "$SCRATCH/wrongval.orig" "$bundle/config.json" || {
+    [[ "$(jq -S . "$SCRATCH/wrongval.orig")" == "$(jq -S . "$bundle/config.json")" ]] || {
         echo "config.json modified with SMOLVM_ROSETTA=0"
         return 1
     }
@@ -265,6 +267,78 @@ test_invalid_json_never_blocks() {
     }
 }
 
+# Give $1's bundle dockerd's exact resources block: default device rules plus
+# the always-present EMPTY blockIO section (see shim header).
+add_docker_resources() {
+    jq '.linux.resources = {
+            devices: [{allow: false, access: "rwm"}],
+            blockIO: {}
+        }' "$1/config.json" > "$1/config.tmp" && mv "$1/config.tmp" "$1/config.json"
+}
+
+test_strips_empty_blockio_and_injects_when_enabled() {
+    # dockerd-authored bundles always carry "blockIO": {}. crun errors on it
+    # (`open `io.max``) because the libkrunfw kernel has no io.max/io.weight
+    # files, so the shim must drop it while injecting the mount.
+    local bundle="$SCRATCH/blockio"
+    make_bundle "$bundle"
+    add_docker_resources "$bundle"
+
+    env SMOLVM_ROSETTA=1 CRUN_ROSETTA_CRUN="$CRUN_STUB" CRUN_STUB_ARGV="$STUB_ARGV" \
+        "$SHIM" create --bundle "$bundle" ctrA || return 1
+
+    jq -e 'has("linux") and (.linux.resources.blockIO == null)' "$bundle/config.json" >/dev/null || {
+        echo "empty blockIO not stripped:"
+        jq '.linux.resources' "$bundle/config.json"
+        return 1
+    }
+    # Device rules and the injected mount must both survive.
+    jq -e '.linux.resources.devices | length == 1' "$bundle/config.json" >/dev/null || {
+        echo "device rules lost:"
+        jq '.linux.resources' "$bundle/config.json"
+        return 1
+    }
+    [[ "$(rosetta_mount_count "$bundle/config.json")" == "1" ]] || {
+        echo "rosetta mount missing alongside resources rewrite"
+        return 1
+    }
+}
+
+test_strips_empty_blockio_even_when_disabled() {
+    # The strip is dockerd-vs-kernel normalization, not Rosetta behavior: a
+    # non-Rosetta VM runs crun under dockerd too, and must start containers.
+    local bundle="$SCRATCH/blockio-off"
+    make_bundle "$bundle"
+    add_docker_resources "$bundle"
+
+    run_shim create --bundle "$bundle" ctrB || return 1
+
+    jq -e '.linux.resources.blockIO == null' "$bundle/config.json" >/dev/null || {
+        echo "empty blockIO kept when sentinel unset"
+        return 1
+    }
+    [[ "$(rosetta_mount_count "$bundle/config.json")" == "0" ]] || {
+        echo "mount injected without rosetta enabled"
+        return 1
+    }
+}
+
+test_preserves_non_empty_blockio() {
+    # Real IO limits are the operator's intent, not normalization fodder.
+    local bundle="$SCRATCH/blockio-real"
+    make_bundle "$bundle"
+    jq '.linux.resources = {blockIO: {weight: 500}}' "$bundle/config.json" \
+        > "$SCRATCH/blockio-real.tmp" && mv "$SCRATCH/blockio-real.tmp" "$bundle/config.json"
+
+    run_shim create --bundle "$bundle" ctrC || return 1
+
+    jq -e '.linux.resources.blockIO.weight == 500' "$bundle/config.json" >/dev/null || {
+        echo "non-empty blockIO rewritten:"
+        jq '.linux.resources' "$bundle/config.json"
+        return 1
+    }
+}
+
 test_crun_exit_code_propagates() {
     local bundle="$SCRATCH/exitcode"
     make_bundle "$bundle"
@@ -300,6 +374,9 @@ run_test "inject: user mount at /mnt/rosetta wins, no duplicate" test_user_mount
 run_test "argv: --bundle=PATH form honored" test_bundle_equals_form || true
 run_test "argv: bundle-less invocation passes through untouched" test_no_bundle_is_passthrough || true
 run_test "shim: invalid config.json never blocks the exec" test_invalid_json_never_blocks || true
+run_test "blockIO: dockerd's empty blockIO stripped + mount injected" test_strips_empty_blockio_and_injects_when_enabled || true
+run_test "blockIO: stripped even when rosetta disabled (dockerd-under-crun works)" test_strips_empty_blockio_even_when_disabled || true
+run_test "blockIO: real IO limits preserved" test_preserves_non_empty_blockio || true
 run_test "shim: crun exit code propagates" test_crun_exit_code_propagates || true
 run_test "wiring: baked daemon.json default-runtime points at the shim" test_baked_daemon_json_wiring || true
 
