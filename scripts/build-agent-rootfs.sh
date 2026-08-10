@@ -46,12 +46,14 @@ case "$DETECTED_ARCH" in
         ALPINE_ARCH="aarch64"
         CRANE_ARCH="arm64"
         CRUN_ARCH="arm64"
+        CRUN_SHA256="a06911e40b52722e1aa462c61bcab085e09901de9565ba611f3de9a5b7122631"
         RUST_TARGET="aarch64-unknown-linux-musl"
         ;;
     x86_64|amd64)
         ALPINE_ARCH="x86_64"
         CRANE_ARCH="x86_64"
         CRUN_ARCH="amd64"
+        CRUN_SHA256="9ca2edc15f366b385eaae29a97ee06a390cb9baccf07a07fb48bb60e168e6056"
         RUST_TARGET="x86_64-unknown-linux-musl"
         ;;
     *)
@@ -74,6 +76,12 @@ CRANE_URL="https://github.com/google/go-containerregistry/releases/download/v${C
 # path exercise OCI surface the 1.12 CLI predates. The agent's own containers
 # are undemanding, so one static build serves both. Static: no musl/libcap/
 # seccomp ABI coupling to the minirootfs.
+#
+# The binary is verified against its pinned digest before every install.
+# Digests are the sha256 of each release asset, as published by upstream
+# (GitHub release API, releases/tags/1.23.1 asset "digest" fields):
+#   crun-1.23.1-linux-arm64  sha256:a06911e40b52722e1aa462c61bcab085e09901de9565ba611f3de9a5b7122631
+#   crun-1.23.1-linux-amd64  sha256:9ca2edc15f366b385eaae29a97ee06a390cb9baccf07a07fb48bb60e168e6056
 CRUN_VERSION="1.23.1"
 CRUN_URL="https://github.com/containers/crun/releases/download/${CRUN_VERSION}/crun-${CRUN_VERSION}-linux-${CRUN_ARCH}"
 
@@ -115,6 +123,20 @@ echo "Installing crun ${CRUN_VERSION}..."
 CRUN_BIN="/tmp/crun-${CRUN_VERSION}-linux-${CRUN_ARCH}"
 if [ ! -f "$CRUN_BIN" ]; then
     curl -fsSL -o "$CRUN_BIN" "$CRUN_URL"
+fi
+# Verify the binary against the pinned digest before every install — including
+# /tmp cache hits: the cache key is only version+arch, so a truncated or
+# tampered cached file must fail the build here rather than ship to guests.
+# Both hasher invocations consume the same "<digest>  <path>" line on stdin
+# and exit non-zero on mismatch, which `set -e` turns into a build failure.
+# macOS goes through shasum(1) unconditionally: /usr/bin/shasum is always
+# present there, while a "sha256sum" on PATH may be a partial reimplementation
+# that cannot read checklists from stdin.
+echo "Verifying crun sha256..."
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    echo "$CRUN_SHA256  $CRUN_BIN" | shasum -a 256 -c
+else
+    echo "$CRUN_SHA256  $CRUN_BIN" | sha256sum -c
 fi
 install -m 0755 "$CRUN_BIN" "$OUTPUT_DIR/usr/bin/crun"
 
