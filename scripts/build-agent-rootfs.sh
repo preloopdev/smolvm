@@ -45,11 +45,15 @@ case "$DETECTED_ARCH" in
     arm64|aarch64)
         ALPINE_ARCH="aarch64"
         CRANE_ARCH="arm64"
+        CRUN_ARCH="arm64"
+        CRUN_SHA256="a06911e40b52722e1aa462c61bcab085e09901de9565ba611f3de9a5b7122631"
         RUST_TARGET="aarch64-unknown-linux-musl"
         ;;
     x86_64|amd64)
         ALPINE_ARCH="x86_64"
         CRANE_ARCH="x86_64"
+        CRUN_ARCH="amd64"
+        CRUN_SHA256="9ca2edc15f366b385eaae29a97ee06a390cb9baccf07a07fb48bb60e168e6056"
         RUST_TARGET="x86_64-unknown-linux-musl"
         ;;
     *)
@@ -66,9 +70,25 @@ ALPINE_URL="${ALPINE_MIRROR}/v${ALPINE_VERSION}/releases/${ALPINE_ARCH}/${ALPINE
 CRANE_VERSION="0.19.0"
 CRANE_URL="https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/go-containerregistry_Linux_${CRANE_ARCH}.tar.gz"
 
+# crun version (pinned static upstream build). Alpine 3.19's apk crun (1.12)
+# is too old for an in-guest dockerd: buildx's embedded executor invokes
+# `runc run --keep` (added in crun 1.14), and both it and dockerd's containerd
+# path exercise OCI surface the 1.12 CLI predates. The agent's own containers
+# are undemanding, so one static build serves both. Static: no musl/libcap/
+# seccomp ABI coupling to the minirootfs.
+#
+# The binary is verified against its pinned digest before every install.
+# Digests are the sha256 of each release asset, as published by upstream
+# (GitHub release API, releases/tags/1.23.1 asset "digest" fields):
+#   crun-1.23.1-linux-arm64  sha256:a06911e40b52722e1aa462c61bcab085e09901de9565ba611f3de9a5b7122631
+#   crun-1.23.1-linux-amd64  sha256:9ca2edc15f366b385eaae29a97ee06a390cb9baccf07a07fb48bb60e168e6056
+CRUN_VERSION="1.23.1"
+CRUN_URL="https://github.com/containers/crun/releases/download/${CRUN_VERSION}/crun-${CRUN_VERSION}-linux-${CRUN_ARCH}"
+
 echo "Building agent rootfs..."
 echo "  Alpine: ${ALPINE_VERSION} (${ALPINE_ARCH})"
 echo "  Crane: ${CRANE_VERSION}"
+echo "  crun: ${CRUN_VERSION} (static)"
 echo "  Output: ${OUTPUT_DIR}"
 
 # Create output directory
@@ -98,12 +118,37 @@ echo "Installing crane..."
 mkdir -p "$OUTPUT_DIR/usr/local/bin"
 tar -xzf "$CRANE_TAR" -C "$OUTPUT_DIR/usr/local/bin" crane
 
+# Install the pinned static crun over the Alpine base.
+echo "Installing crun ${CRUN_VERSION}..."
+CRUN_BIN="/tmp/crun-${CRUN_VERSION}-linux-${CRUN_ARCH}"
+if [ ! -f "$CRUN_BIN" ]; then
+    curl -fsSL -o "$CRUN_BIN" "$CRUN_URL"
+fi
+# Verify the binary against the pinned digest before every install — including
+# /tmp cache hits: the cache key is only version+arch, so a truncated or
+# tampered cached file must fail the build here rather than ship to guests.
+# Both hasher invocations consume the same "<digest>  <path>" line on stdin
+# and exit non-zero on mismatch, which `set -e` turns into a build failure.
+# macOS goes through shasum(1) unconditionally: /usr/bin/shasum is always
+# present there, while a "sha256sum" on PATH may be a partial reimplementation
+# that cannot read checklists from stdin.
+echo "Verifying crun sha256..."
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    echo "$CRUN_SHA256  $CRUN_BIN" | shasum -a 256 -c
+else
+    echo "$CRUN_SHA256  $CRUN_BIN" | sha256sum -c
+fi
+install -m 0755 "$CRUN_BIN" "$OUTPUT_DIR/usr/bin/crun"
+
 # Install additional Alpine packages into the rootfs.
 # Strategies:
 #   1. apk.static (Linux only) — runs natively, supports cross-arch via --arch
 #   2. smolvm (any host) — only for native-arch builds (pulls host-arch image)
 echo "Installing additional packages..."
-APK_PACKAGES="jq e2fsprogs e2fsprogs-extra crun util-linux libcap seatd"
+# crun intentionally absent: a pinned static upstream build lands at
+# /usr/bin/crun below (see CRUN_VERSION; apk 1.12 predates `run --keep`,
+# which buildx's executor requires).
+APK_PACKAGES="jq e2fsprogs e2fsprogs-extra util-linux libcap seatd"
 
 # Determine if this is a cross-arch build
 HOST_ARCH="$(uname -m)"
@@ -206,7 +251,14 @@ elif [[ "$CROSS_ARCH" == "1" ]]; then
     exit 1
 elif command -v smolvm &> /dev/null; then
     echo "  Using smolvm..."
-    smolvm machine run --net -v "$OUTPUT_DIR:/rootfs" --image "alpine:${ALPINE_VERSION}" \
+    # Hosts on overlay DNS (e.g. Tailscale MagicDNS at 100.100.100.100) hand
+    # guests a resolver they cannot reach; SMOLVM_BUILD_DNS overrides the
+    # bootstrap VM's resolver for the package fetch.
+    SMOLVM_DNS_ARGS=()
+    if [[ -n "${SMOLVM_BUILD_DNS:-}" ]]; then
+        SMOLVM_DNS_ARGS=(--dns "$SMOLVM_BUILD_DNS")
+    fi
+    smolvm machine run --net "${SMOLVM_DNS_ARGS[@]}" -v "$OUTPUT_DIR:/rootfs" --image "alpine:${ALPINE_VERSION}" \
         -- sh -c "apk add --root /rootfs --initdb --no-cache $APK_PACKAGES"
     echo "Packages installed successfully"
 else
@@ -251,6 +303,32 @@ ROSETTA_WRAPPER="$(dirname "$0")/rosetta/rosetta-wrapper"
 if [ -f "$ROSETTA_WRAPPER" ]; then
     cp "$ROSETTA_WRAPPER" "$OUTPUT_DIR/usr/bin/rosetta-wrapper"
     chmod 755 "$OUTPUT_DIR/usr/bin/rosetta-wrapper"
+fi
+
+# Install the dockerd default-runtime shim and wire the engine to it.
+# Containers created by an in-guest dockerd never pass through the agent's
+# spec assembly, so they miss the agent's /mnt/rosetta injection (see
+# crates/smolvm-agent/src/rosetta.rs) and amd64 execs die inside them with
+# `rosetta-wrapper: unexpected initial stop: 32512`. dockerd resolves a named
+# default-runtime to a binary path and execs it with the OCI runtime CLI, so
+# the shim adds the read-only /mnt/rosetta bind mount to the bundle's
+# config.json (only when SMOLVM_ROSETTA=1) before exec'ing the real crun.
+# Sources: scripts/rosetta/crun-rosetta, scripts/rosetta/docker-daemon.json
+CRUN_ROSETTA_SHIM="$(dirname "$0")/rosetta/crun-rosetta"
+DOCKER_DAEMON_JSON="$(dirname "$0")/rosetta/docker-daemon.json"
+if [ -f "$CRUN_ROSETTA_SHIM" ]; then
+    cp "$CRUN_ROSETTA_SHIM" "$OUTPUT_DIR/usr/local/bin/crun-rosetta"
+    chmod 755 "$OUTPUT_DIR/usr/local/bin/crun-rosetta"
+
+    # default-runtime only governs dockerd's own containers: buildx's
+    # embedded executor (`docker build` on Docker >= 23) execs "runc" by
+    # PATH lookup, bypassing the daemon's runtime config. /usr/local/bin
+    # precedes /usr/bin in the guest PATH, so an alias here intercepts
+    # buildkit while leaving an apk/docker-installed /usr/bin/runc intact.
+    ln -sf crun-rosetta "$OUTPUT_DIR/usr/local/bin/runc"
+
+    mkdir -p "$OUTPUT_DIR/etc/docker"
+    cp "$DOCKER_DAEMON_JSON" "$OUTPUT_DIR/etc/docker/daemon.json"
 fi
 
 # Remove existing init (it's a symlink to busybox) and replace with

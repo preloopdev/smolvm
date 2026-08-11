@@ -199,7 +199,7 @@ script = [
 # =============================================================================
 
 [tasks.test]
-description = "Run all feature suites (11 groups, ~10 min)"
+description = "Run all feature suites (14 groups, ~10 min)"
 category = "Test"
 dependencies = ["test-lib"]
 script_runner = "bash"
