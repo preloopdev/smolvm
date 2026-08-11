@@ -34,7 +34,7 @@ jobs:
             runner: ubuntu-22.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           submodules: recursive   # libkrun links against the libkrunfw source
           lfs: true               # committed libkrunfw.so reused under SKIP_LIBKRUNFW
@@ -70,7 +70,7 @@ jobs:
           fi
           echo "OK: glibc floor is <= 2.35"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: libkrun-linux-${{ matrix.arch }}
           path: lib/linux-${{ matrix.arch }}/
@@ -85,7 +85,7 @@ jobs:
     if: ${{ inputs.rebuild_libkrunfw }}
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           submodules: recursive
           lfs: false
@@ -104,7 +104,7 @@ jobs:
       - name: Build libkrunfw.dll (mingw cross)
         run: cd libkrunfw && make OS=Windows -j"$(nproc)"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: libkrunfw-windows-x86_64
           path: libkrunfw/libkrunfw.dll

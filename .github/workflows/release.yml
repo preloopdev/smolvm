@@ -33,14 +33,14 @@ jobs:
             linker_pkg: gcc-aarch64-linux-gnu
             linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cargo/bin/
@@ -71,7 +71,7 @@ jobs:
       - name: Verify static binary
         run: file target/${{ matrix.target }}/release-small/smolvm-agent
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: agent-${{ matrix.arch }}
           path: target/${{ matrix.target }}/release-small/smolvm-agent
@@ -108,14 +108,14 @@ jobs:
             musl_linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
             gnu_linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           targets: ${{ matrix.musl_target }}, ${{ matrix.gnu_target }}
 
       - name: Cache cargo
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cargo/bin/
@@ -151,7 +151,7 @@ jobs:
           cp target/${{ matrix.gnu_target }}/release/libcuda.so   /tmp/cuda/libcuda.so.1
           file /tmp/cuda/*
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: cuda-${{ matrix.arch }}
           path: /tmp/cuda/
@@ -169,16 +169,16 @@ jobs:
           - arch: aarch64
           - arch: x86_64
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Download agent binary
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: agent-${{ matrix.arch }}
           path: /tmp/agent/
 
       - name: Download CUDA artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: cuda-${{ matrix.arch }}
           path: /tmp/cuda/
@@ -222,7 +222,7 @@ jobs:
           # to restricted dirs like /var/run/chrony (owned by chrony:chrony 700)
           sudo tar -cf target/agent-rootfs.tar -C target/agent-rootfs .
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: rootfs-${{ matrix.arch }}
           path: target/agent-rootfs.tar
@@ -259,7 +259,7 @@ jobs:
             agent_arch: aarch64
             lib_dir: lib/linux-aarch64
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           lfs: true
           submodules: ${{ startsWith(matrix.platform, 'linux-') && 'recursive' || 'false' }}
@@ -267,10 +267,10 @@ jobs:
       - name: Pull LFS files
         run: git lfs pull
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
 
       - name: Cache cargo
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cargo/bin/
@@ -307,7 +307,7 @@ jobs:
           file ${{ matrix.lib_dir }}/*
 
       - name: Download rootfs
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: rootfs-${{ matrix.rootfs_arch }}
           path: /tmp/rootfs-dl/
@@ -318,7 +318,7 @@ jobs:
           sudo tar -xf /tmp/rootfs-dl/agent-rootfs.tar -C target/agent-rootfs
 
       - name: Download agent binary
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: agent-${{ matrix.agent_arch }}
           path: /tmp/agent/
@@ -358,7 +358,7 @@ jobs:
       # if you want reproducible smol-CLI releases.
       - name: Check out smol CLI source
         if: env.SMOL_REPO_TOKEN != ''
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: smol-machines/smol
           path: smol
@@ -425,7 +425,7 @@ jobs:
           VERSION="$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)"
           ls -la "dist/smolvm-${VERSION}-"*/
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: dist-${{ matrix.platform }}
           path: dist/smolvm-*.tar.gz
@@ -440,14 +440,14 @@ jobs:
     env:
       CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           lfs: true
 
       - name: Pull LFS files
         run: git lfs pull
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           targets: x86_64-pc-windows-gnu
 
@@ -465,7 +465,7 @@ jobs:
           file lib/windows-x86_64/*.dll
 
       - name: Download rootfs (x86_64)
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: rootfs-x86_64
           path: /tmp/rootfs-dl/
@@ -476,7 +476,7 @@ jobs:
           sudo tar -xf /tmp/rootfs-dl/agent-rootfs.tar -C target/agent-rootfs
 
       - name: Download agent binary (x86_64)
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: agent-x86_64
           path: /tmp/agent/
@@ -494,7 +494,7 @@ jobs:
         env:
           LIB_DIR: lib/windows-x86_64
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: dist-windows-x86_64
           path: dist/smolvm-*-windows-x86_64.zip
@@ -509,10 +509,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Download all dist artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: dist-*
           path: dist/
