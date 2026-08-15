@@ -1159,6 +1159,13 @@ impl AgentClient {
     /// Missing or empty entries are dropped guest-side, so callers can append a
     /// container overlay's upper dir without probing it first.
     pub fn flatten_layers(&mut self, lowerdirs: &[String], output: &str) -> Result<()> {
+        // Merging the lower dirs and tarring the result runs for minutes on a
+        // large base, and the agent sends nothing in between — far past the
+        // default read timeout, which surfaces as a spurious EAGAIN. Widen the
+        // window for the whole flatten, as the file-read paths do for large
+        // transfers.
+        const FLATTEN_TIMEOUT: Duration = Duration::from_secs(900);
+        let _timeout_guard = self.set_extended_read_timeout(FLATTEN_TIMEOUT)?;
         let resp = self.request(&AgentRequest::FlattenLayers {
             lowerdirs: lowerdirs.to_vec(),
             output: output.to_string(),
