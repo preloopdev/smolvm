@@ -242,10 +242,21 @@ impl<K: DiskType> VmDisk<K> {
         let size_bytes = size_gb * BYTES_PER_GIB;
 
         if path.exists() {
-            let metadata = std::fs::metadata(path)?;
+            // An existing disk keeps whatever size it was created at, so a
+            // machine whose data dir outlived a delete would boot the previous,
+            // smaller disk while its record reports the requested size. Grow it
+            // to the request instead (sparse, so it costs nothing); the guest's
+            // resize2fs expands the filesystem into the new space at boot. A
+            // disk that is already larger is left alone — callers that open with
+            // the default size must not shrink a machine's storage.
+            let mut on_disk = std::fs::metadata(path)?.len();
+            if on_disk < size_bytes {
+                expand_disk::<K>(path, size_gb)?;
+                on_disk = std::fs::metadata(path)?.len();
+            }
             Ok(Self {
                 path: path.to_path_buf(),
-                size_bytes: metadata.len(),
+                size_bytes: on_disk,
                 format: DiskFormat::Raw,
                 _kind: PhantomData,
             })
@@ -712,6 +723,35 @@ mod tests {
         assert_eq!(disk.size_gib(), 2);
         let metadata = std::fs::metadata(&disk_path).unwrap();
         assert_eq!(metadata.len(), 2 * BYTES_PER_GIB);
+
+        let _ = std::fs::remove_file(&disk_path);
+        let _ = std::fs::remove_dir(&temp_dir);
+    }
+
+    #[test]
+    fn open_or_create_at_grows_an_existing_smaller_disk() {
+        let temp_dir = std::env::temp_dir().join("smolvm_test_open_grows");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let disk_path = temp_dir.join("grow_test.raw");
+        let _ = std::fs::remove_file(&disk_path);
+
+        // A disk left behind at the old size (a data dir that outlived a
+        // delete) must present the newly requested size, not the stale one.
+        disk_utils::create_sparse_disk::<Storage>(&disk_path, BYTES_PER_GIB).unwrap();
+        let disk = StorageDisk::open_or_create_at(&disk_path, 2).unwrap();
+        assert_eq!(disk.size_gib(), 2);
+        assert_eq!(
+            std::fs::metadata(&disk_path).unwrap().len(),
+            2 * BYTES_PER_GIB
+        );
+
+        // Opening with a smaller size never shrinks an existing disk.
+        let disk = StorageDisk::open_or_create_at(&disk_path, 1).unwrap();
+        assert_eq!(disk.size_gib(), 2);
+        assert_eq!(
+            std::fs::metadata(&disk_path).unwrap().len(),
+            2 * BYTES_PER_GIB
+        );
 
         let _ = std::fs::remove_file(&disk_path);
         let _ = std::fs::remove_dir(&temp_dir);
