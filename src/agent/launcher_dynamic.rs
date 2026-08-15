@@ -756,7 +756,72 @@ pub(crate) fn describe_krun_start_error(ret: i32) -> String {
     #[cfg(not(target_os = "linux"))]
     let kvm_error: Option<String> = None;
 
+    // Same idea on macOS: `hv_vm_create` returns HV_UNSUPPORTED without the
+    // com.apple.security.hypervisor entitlement, and libkrun reports that in
+    // the same errno class as a disk that could not be opened — so the generic
+    // hint sends the user after disks when the real fix is re-signing. A
+    // re-signed (`codesign --force --sign -` with no `--entitlements`) or
+    // freshly built binary silently loses the entitlement.
+    #[cfg(target_os = "macos")]
+    if matches!(-ret, 1 | 13 | 19 | 22) && !has_hypervisor_entitlement() {
+        return format!(
+            "krun_start_enter returned: {ret} (this binary is not signed with the \
+             com.apple.security.hypervisor entitlement required by \
+             Hypervisor.framework — re-sign it: codesign --force --sign - \
+             --entitlements hv.entitlements <path-to-binary>)"
+        );
+    }
+
     describe_start_error_with_probe(ret, kvm_error.as_deref())
+}
+
+/// Whether the running binary carries the macOS hypervisor entitlement.
+///
+/// Probed with `codesign`, the same tool `smolvm_pack::signing` uses to add the
+/// entitlement when packing. An unreadable signature counts as missing (an
+/// unsigned binary is not entitled); a missing `codesign` counts as present, so
+/// a tooling gap never rewrites an unrelated boot failure.
+#[cfg(target_os = "macos")]
+fn has_hypervisor_entitlement() -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return true;
+    };
+    // The packed run/start paths install a global `waitpid(-1)` SIGCHLD reaper
+    // before forking (`process::install_sigchld_handler`), which can reap
+    // `codesign` before `output()` waits and yield ECHILD — the same race
+    // `smolvm_pack::signing` documents. Probe under the default disposition.
+    let previous = unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
+    let probed = std::process::Command::new("codesign")
+        .args(["-d", "--entitlements", "-"])
+        .arg(&exe)
+        .output();
+    unsafe { libc::signal(libc::SIGCHLD, previous) };
+
+    let Ok(out) = probed else {
+        return true;
+    };
+    out.status.success() && entitlement_enabled(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Whether a `codesign -d --entitlements -` dump grants the hypervisor
+/// entitlement.
+///
+/// codesign names the key even when a signature sets it to `false`, so the
+/// value decides. It prints either `[Key] … [Value] [Bool] true` lines or an
+/// XML plist, so require a `true` between the key and the next entitlement.
+#[cfg(target_os = "macos")]
+fn entitlement_enabled(entitlements: &str) -> bool {
+    let Some((_, rest)) = entitlements.split_once("com.apple.security.hypervisor") else {
+        return false;
+    };
+    let mut value = rest;
+    if let Some(end) = value.find("[Key]") {
+        value = &value[..end];
+    }
+    if let Some(end) = value.find("<key>") {
+        value = &value[..end];
+    }
+    value.contains("true")
 }
 
 /// Pure core of [`describe_krun_start_error`], with the KVM probe result
@@ -881,6 +946,46 @@ mod tests {
         let eio = describe_start_error_with_probe(-5, Some("should be ignored"));
         assert!(eio.contains("EIO"));
         assert!(!eio.contains("privilege drop"));
+    }
+
+    // cargo's test binaries are ad-hoc signed without entitlements, so a
+    // hypervisor-access errno must name the missing entitlement instead of the
+    // generic disk/overlay guess — while keeping the grep contract intact.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn describe_krun_start_error_names_missing_hypervisor_entitlement() {
+        let msg = describe_krun_start_error(-22);
+        assert!(msg.contains("krun_start_enter returned: -22"), "{msg}");
+        assert!(msg.contains("com.apple.security.hypervisor"), "{msg}");
+        assert!(msg.contains("codesign"), "{msg}");
+    }
+
+    // codesign names the entitlement key even when a signature sets it to
+    // false, so the value — not the key's presence — decides.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn entitlement_is_granted_only_when_value_is_true() {
+        assert!(entitlement_enabled(
+            "[Key] com.apple.security.hypervisor\n[Value]\n[Bool] true"
+        ));
+        assert!(!entitlement_enabled(
+            "[Key] com.apple.security.hypervisor\n[Value]\n[Bool] false"
+        ));
+        assert!(entitlement_enabled(
+            "<key>com.apple.security.hypervisor</key><true/>"
+        ));
+        assert!(!entitlement_enabled(
+            "<key>com.apple.security.hypervisor</key><false/>"
+        ));
+        // A later entitlement's `true` must not leak into the decision.
+        assert!(!entitlement_enabled(
+            "<key>com.apple.security.hypervisor</key><false/>\
+             <key>com.apple.security.cs.allow-jit</key><true/>"
+        ));
+        // A dump without the key at all is not granted.
+        assert!(!entitlement_enabled(
+            "<key>com.apple.security.cs.allow-jit</key><true/>"
+        ));
     }
 
     #[test]
