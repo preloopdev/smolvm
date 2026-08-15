@@ -97,8 +97,11 @@ struct TrackedConnection {
     // `source` and `destination` identify the guest-side flow.
     source: SocketAddr,
     destination: SocketAddr,
-    // guest -> host relay payloads
-    to_proxy: SyncSender<Vec<u8>>,
+    // guest -> host relay payloads. Taken (set to `None`) once the guest has
+    // sent FIN and every byte it sent is on its way to the relay thread: the
+    // resulting channel disconnect is how the relay thread learns to mirror
+    // that half-close onto its host socket.
+    to_proxy: Option<SyncSender<Vec<u8>>>,
     // host -> guest relay payloads
     from_proxy: Receiver<Vec<u8>>,
     // endpoints are held here until the guest-side handshake completes
@@ -318,7 +321,7 @@ impl TcpRelayTable {
             TrackedConnection {
                 source,
                 destination,
-                to_proxy: to_proxy_tx,
+                to_proxy: Some(to_proxy_tx),
                 from_proxy: from_proxy_rx,
                 pending_proxy_endpoints: Some(PendingProxyEndpoints {
                     from_smoltcp: to_proxy_rx,
@@ -412,7 +415,7 @@ impl TcpRelayTable {
             TrackedConnection {
                 source,
                 destination,
-                to_proxy: to_proxy_tx,
+                to_proxy: Some(to_proxy_tx),
                 from_proxy: from_proxy_rx,
                 pending_proxy_endpoints: Some(PendingProxyEndpoints {
                     from_smoltcp: to_proxy_rx,
@@ -496,6 +499,28 @@ impl TcpRelayTable {
                 }
             }
 
+            // The guest sent FIN and everything it sent is now with the relay
+            // thread: mirror that half-close onto the host socket. Dropping the
+            // sender is the signal `tcp_relay_loop` already understands
+            // (`TryRecvError::Disconnected` -> `shutdown(Shutdown::Write)`), so
+            // the remote peer finally observes EOF. The guest-facing send half
+            // stays open, so a peer still streaming a response keeps reaching
+            // the guest — this is the guest->host mirror of `HalfClosed`.
+            //
+            // Skipping this stranded the flow permanently: `cleanup_closed`
+            // only reclaims `Closed` sockets, leaving `CloseWait` needs
+            // `socket.close()`, that needs a non-`Running` exit state, and that
+            // needs the host EOF which can only follow the FIN we never sent.
+            // One table slot, one relay thread and its 128 KiB of buffers
+            // leaked per guest-closed connection until `MAX_CONNECTIONS` was
+            // exhausted and the VM lost outbound TCP for the rest of its life.
+            if socket.state() == tcp::State::CloseWait
+                && connection.buffered_guest_data.is_none()
+                && !socket.can_recv()
+            {
+                connection.to_proxy = None;
+            }
+
             flush_proxy_data(socket, connection);
         }
     }
@@ -514,7 +539,17 @@ impl TcpRelayTable {
             }
 
             let socket = sockets.get::<tcp::Socket>(handle);
-            if socket.state() == tcp::State::Established {
+            // `CloseWait` counts too: a guest that connects and immediately
+            // closes (a port scan, `nc -z`, a probe) can have its FIN processed
+            // in the same poll batch that completed the handshake. Ignoring
+            // those stranded the socket for good — no relay thread would ever
+            // exist to drive the connection to `Closed`, so the slot never came
+            // back. Spawning is also what puts the guest's connect+close on the
+            // wire toward the real peer.
+            if matches!(
+                socket.state(),
+                tcp::State::Established | tcp::State::CloseWait
+            ) {
                 connection.relay_spawned = true;
 
                 if let Some(endpoints) = connection.pending_proxy_endpoints.take() {
@@ -793,7 +828,13 @@ fn flush_guest_data(connection: &mut TrackedConnection) {
 }
 
 fn send_guest_payload(connection: &mut TrackedConnection, payload: Vec<u8>) -> bool {
-    match connection.to_proxy.try_send(payload) {
+    // No sender means the guest already half-closed and the relay thread was
+    // told about it; a socket in `CloseWait` cannot produce more guest bytes.
+    let Some(to_proxy) = connection.to_proxy.as_ref() else {
+        return false;
+    };
+
+    match to_proxy.try_send(payload) {
         Ok(()) => true,
         Err(TrySendError::Full(payload)) => {
             connection.buffered_guest_data = Some(payload);
@@ -854,7 +895,7 @@ mod tests {
         TrackedConnection {
             source: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 12_345),
             destination: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 80),
-            to_proxy,
+            to_proxy: Some(to_proxy),
             from_proxy,
             pending_proxy_endpoints: None,
             relay_spawned: true,
@@ -930,6 +971,420 @@ mod tests {
         assert_eq!(
             table.host_connect_addr(SocketAddr::new(gateway, 10_081)),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40_081)
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Guest half-close (guest -> host FIN).
+    //
+    // These drive the real poll-side objects — `VirtioNetworkDevice`, a
+    // smoltcp `Interface` and `TcpRelayTable` — with hand-built guest frames
+    // against a real host listener, because that is the only vantage where the
+    // contract is observable: a guest `close()` has to reach the remote peer as
+    // EOF, and the table slot has to come back once the peer closes too.
+    // ---------------------------------------------------------------------
+
+    use crate::device::VirtioNetworkDevice;
+    use crate::queues::{NetworkFrameQueues, DEFAULT_FRAME_QUEUE_CAPACITY};
+    use smoltcp::iface::Config;
+    use smoltcp::phy::ChecksumCapabilities;
+    use smoltcp::time::Instant;
+    use smoltcp::wire::{
+        ArpOperation, ArpPacket, ArpRepr, EthernetAddress, EthernetFrame, EthernetProtocol,
+        EthernetRepr, HardwareAddress, IpAddress, IpCidr, IpProtocol, Ipv4Packet, Ipv4Repr,
+        TcpControl, TcpPacket, TcpRepr, TcpSeqNumber,
+    };
+    use std::io::{ErrorKind, Read};
+    use std::net::{TcpListener, TcpStream};
+    use std::time::Instant as StdInstant;
+
+    const GATEWAY_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+    const GUEST_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+    const GATEWAY_IPV4: Ipv4Addr = Ipv4Addr::new(100, 96, 0, 1);
+    const GUEST_IPV4: Ipv4Addr = Ipv4Addr::new(100, 96, 0, 2);
+    const GUEST_PORT: u16 = 40_001;
+    const STEP_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// A minimal guest-side TCP peer wired to a real relay table.
+    ///
+    /// It speaks enough of the wire protocol to be indistinguishable from a
+    /// guest kernel for this purpose: it answers ARP, acknowledges data and
+    /// FINs, and sends its own SYN/data/FIN.
+    struct GuestLink {
+        queues: Arc<NetworkFrameQueues>,
+        device: VirtioNetworkDevice,
+        interface: Interface,
+        sockets: SocketSet<'static>,
+        relays: TcpRelayTable,
+        wake: Arc<WakePipe>,
+        destination: SocketAddr,
+        seq: TcpSeqNumber,
+        ack: Option<TcpSeqNumber>,
+    }
+
+    impl GuestLink {
+        /// The guest dials its gateway on `host_port`; `host_connect_addr` maps
+        /// that to loopback, so the relay thread dials the test's listener.
+        fn new(host_port: u16) -> Self {
+            let queues = NetworkFrameQueues::shared(DEFAULT_FRAME_QUEUE_CAPACITY);
+            let mut device = VirtioNetworkDevice::new(queues.clone(), 1500);
+            let mut interface = Interface::new(
+                Config::new(HardwareAddress::Ethernet(EthernetAddress(GATEWAY_MAC))),
+                &mut device,
+                Instant::now(),
+            );
+            interface.update_ip_addrs(|addresses| {
+                addresses
+                    .push(IpCidr::new(IpAddress::Ipv4(GATEWAY_IPV4), 30))
+                    .expect("gateway address fits");
+            });
+
+            let mut sockets = SocketSet::new(Vec::new());
+            let mut relays = TcpRelayTable::new(
+                None,
+                EgressPolicy::unrestricted(),
+                vec![IpAddr::V4(GATEWAY_IPV4)],
+                None,
+            );
+            let source = SocketAddr::new(IpAddr::V4(GUEST_IPV4), GUEST_PORT);
+            let destination = SocketAddr::new(IpAddr::V4(GATEWAY_IPV4), host_port);
+            assert!(relays.create_tcp_socket(source, destination, &mut sockets));
+
+            Self {
+                queues,
+                device,
+                interface,
+                sockets,
+                relays,
+                wake: Arc::new(WakePipe::new()),
+                destination,
+                seq: TcpSeqNumber(1_000),
+                ack: None,
+            }
+        }
+
+        /// Queue one guest TCP segment.
+        fn send(&mut self, control: TcpControl, payload: &[u8]) {
+            let tcp = TcpRepr {
+                src_port: GUEST_PORT,
+                dst_port: self.destination.port(),
+                control,
+                seq_number: self.seq,
+                ack_number: self.ack,
+                window_len: 32 * 1024,
+                window_scale: None,
+                max_seg_size: None,
+                sack_permitted: false,
+                sack_ranges: [None; 3],
+                timestamp: None,
+                payload,
+            };
+            let ip = Ipv4Repr {
+                src_addr: GUEST_IPV4,
+                dst_addr: GATEWAY_IPV4,
+                next_header: IpProtocol::Tcp,
+                payload_len: tcp.buffer_len(),
+                hop_limit: 64,
+            };
+            let mut frame = vec![0u8; 14 + ip.buffer_len() + tcp.buffer_len()];
+            let mut ethernet = EthernetFrame::new_unchecked(&mut frame[..]);
+            EthernetRepr {
+                src_addr: EthernetAddress(GUEST_MAC),
+                dst_addr: EthernetAddress(GATEWAY_MAC),
+                ethertype: EthernetProtocol::Ipv4,
+            }
+            .emit(&mut ethernet);
+            let mut packet = Ipv4Packet::new_unchecked(ethernet.payload_mut());
+            ip.emit(&mut packet, &ChecksumCapabilities::default());
+            let mut segment = TcpPacket::new_unchecked(packet.payload_mut());
+            tcp.emit(
+                &mut segment,
+                &IpAddress::Ipv4(GUEST_IPV4),
+                &IpAddress::Ipv4(GATEWAY_IPV4),
+                &ChecksumCapabilities::default(),
+            );
+
+            // SYN and FIN each consume one sequence number, like real TCP.
+            self.seq = self.seq
+                + payload.len()
+                + usize::from(matches!(control, TcpControl::Syn | TcpControl::Fin));
+            self.queues
+                .guest_to_host
+                .push(frame)
+                .expect("guest frame queued");
+        }
+
+        /// Answer the gateway's ARP request so it can reach the guest at all.
+        fn send_arp_reply(&mut self) {
+            let arp = ArpRepr::EthernetIpv4 {
+                operation: ArpOperation::Reply,
+                source_hardware_addr: EthernetAddress(GUEST_MAC),
+                source_protocol_addr: GUEST_IPV4,
+                target_hardware_addr: EthernetAddress(GATEWAY_MAC),
+                target_protocol_addr: GATEWAY_IPV4,
+            };
+            let mut frame = vec![0u8; 14 + arp.buffer_len()];
+            let mut ethernet = EthernetFrame::new_unchecked(&mut frame[..]);
+            EthernetRepr {
+                src_addr: EthernetAddress(GUEST_MAC),
+                dst_addr: EthernetAddress(GATEWAY_MAC),
+                ethertype: EthernetProtocol::Arp,
+            }
+            .emit(&mut ethernet);
+            arp.emit(&mut ArpPacket::new_unchecked(ethernet.payload_mut()));
+            self.queues
+                .guest_to_host
+                .push(frame)
+                .expect("arp reply queued");
+        }
+
+        /// Consume everything the stack emitted, acknowledging it like a real
+        /// peer. Returns whether that produced a frame the stack still has to
+        /// see (so the caller knows to keep pumping).
+        fn absorb(&mut self) -> bool {
+            let mut answer_arp = false;
+            let mut acknowledge = None;
+
+            while let Some(frame) = self.queues.host_to_guest.pop() {
+                let Ok(ethernet) = EthernetFrame::new_checked(&frame[..]) else {
+                    continue;
+                };
+                match ethernet.ethertype() {
+                    EthernetProtocol::Arp => answer_arp = true,
+                    EthernetProtocol::Ipv4 => {
+                        let Ok(packet) = Ipv4Packet::new_checked(ethernet.payload()) else {
+                            continue;
+                        };
+                        if packet.next_header() != IpProtocol::Tcp {
+                            continue;
+                        }
+                        let source = IpAddress::Ipv4(packet.src_addr());
+                        let target = IpAddress::Ipv4(packet.dst_addr());
+                        let Ok(segment) = TcpPacket::new_checked(packet.payload()) else {
+                            continue;
+                        };
+                        let Ok(repr) = TcpRepr::parse(
+                            &segment,
+                            &source,
+                            &target,
+                            &ChecksumCapabilities::default(),
+                        ) else {
+                            continue;
+                        };
+                        let consumed = repr.payload.len()
+                            + usize::from(matches!(
+                                repr.control,
+                                TcpControl::Syn | TcpControl::Fin
+                            ));
+                        if consumed > 0 {
+                            acknowledge = Some(repr.seq_number + consumed);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if answer_arp {
+                self.send_arp_reply();
+            }
+            if let Some(ack) = acknowledge {
+                self.ack = Some(ack);
+                self.send(TcpControl::None, &[]);
+            }
+
+            answer_arp || acknowledge.is_some()
+        }
+
+        /// Deliver queued guest frames into smoltcp and absorb the replies,
+        /// Deliver every queued guest frame into smoltcp, without running the
+        /// relay stages.
+        fn drain_to_stack(&mut self) {
+            while self.device.stage_next_frame().is_some() {
+                self.interface
+                    .poll(Instant::now(), &mut self.device, &mut self.sockets);
+            }
+            self.interface
+                .poll(Instant::now(), &mut self.device, &mut self.sockets);
+        }
+
+        /// Complete the handshake exchange up to — but not including — the
+        /// delivery of the guest's ACK, so the caller can land that ACK in the
+        /// same poll batch as whatever it sends next.
+        fn stage_handshake_ack(&mut self) {
+            self.send(TcpControl::Syn, &[]);
+            let deadline = StdInstant::now() + STEP_TIMEOUT;
+            while self.ack.is_none() {
+                assert!(
+                    StdInstant::now() < deadline,
+                    "the stack never answered the guest SYN"
+                );
+                self.drain_to_stack();
+                self.absorb();
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        /// One full poll-loop iteration, in the same order as `stack.rs`.
+        fn pump(&mut self) {
+            for _ in 0..8 {
+                while self.device.stage_next_frame().is_some() {
+                    self.interface
+                        .poll(Instant::now(), &mut self.device, &mut self.sockets);
+                }
+                self.interface
+                    .poll(Instant::now(), &mut self.device, &mut self.sockets);
+
+                self.relays.relay_data(&mut self.sockets);
+                for connection in self.relays.take_new_connections(&mut self.sockets) {
+                    spawn_tcp_relay(
+                        connection.destination,
+                        connection.relay_target,
+                        connection.from_smoltcp,
+                        connection.to_smoltcp,
+                        self.wake.clone(),
+                        connection.exit_state,
+                    );
+                }
+                self.relays.cleanup_closed(&mut self.sockets);
+
+                self.interface
+                    .poll(Instant::now(), &mut self.device, &mut self.sockets);
+                if !self.absorb() {
+                    break;
+                }
+            }
+        }
+
+        /// Open the guest connection and let the relay thread start.
+        fn handshake(&mut self) {
+            self.send(TcpControl::Syn, &[]);
+            self.pump();
+        }
+
+        /// Keep the poll loop running until the table reclaims every slot.
+        fn pump_until_reclaimed(&mut self) {
+            let deadline = StdInstant::now() + STEP_TIMEOUT;
+            while StdInstant::now() < deadline {
+                self.pump();
+                if self.relays.connections.is_empty() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+
+    /// Accept the relay's host connection, pumping the poll loop while waiting
+    /// so a regression fails the test instead of hanging it.
+    fn accept_within(listener: &TcpListener, link: &mut GuestLink) -> TcpStream {
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let deadline = StdInstant::now() + STEP_TIMEOUT;
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).expect("blocking peer");
+                    stream
+                        .set_read_timeout(Some(STEP_TIMEOUT))
+                        .expect("peer read timeout");
+                    return stream;
+                }
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                    assert!(
+                        StdInstant::now() < deadline,
+                        "relay never dialed the destination"
+                    );
+                    link.pump();
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(err) => panic!("accept failed: {err}"),
+            }
+        }
+    }
+
+    /// Wait for the peer to observe EOF while the poll loop keeps running —
+    /// production never stops polling, and the half-close is mirrored from
+    /// `relay_data`.
+    fn expect_peer_eof(peer: &mut TcpStream, link: &mut GuestLink) {
+        peer.set_nonblocking(true).expect("nonblocking peer");
+        let deadline = StdInstant::now() + STEP_TIMEOUT;
+        let mut trailing = [0u8; 1];
+        loop {
+            match peer.read(&mut trailing) {
+                Ok(0) => return,
+                Ok(bytes) => panic!("unexpected {bytes} bytes after the guest closed"),
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                    assert!(
+                        StdInstant::now() < deadline,
+                        "the guest's FIN never reached the remote peer as EOF"
+                    );
+                    link.pump();
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(err) => panic!("read failed: {err}"),
+            }
+        }
+    }
+
+    #[test]
+    fn guest_close_reaches_the_peer_as_eof_and_frees_the_slot() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("host listener");
+        let mut link = GuestLink::new(listener.local_addr().expect("listener addr").port());
+
+        link.handshake();
+        let mut peer = accept_within(&listener, &mut link);
+
+        // Request, then close: the shape of every one-shot client whose peer
+        // waits for EOF before it answers or hangs up.
+        link.send(TcpControl::Psh, b"ping");
+        link.pump();
+        let mut request = [0u8; 4];
+        peer.read_exact(&mut request)
+            .expect("guest payload reaches the peer");
+        assert_eq!(&request, b"ping");
+
+        link.send(TcpControl::Fin, &[]);
+        link.pump();
+
+        expect_peer_eof(&mut peer, &mut link);
+        assert_eq!(
+            link.relays.connections.len(),
+            1,
+            "half-open is not closed: the peer has not hung up yet"
+        );
+
+        // The peer answers EOF with its own close: the relay reports the host
+        // EOF, the poll loop FINs the guest, and the slot comes back.
+        drop(peer);
+        link.pump_until_reclaimed();
+        assert!(
+            link.relays.connections.is_empty(),
+            "relay slot must be reclaimed once both sides closed"
+        );
+    }
+
+    #[test]
+    fn connect_then_immediate_close_still_reaches_the_peer() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("host listener");
+        let mut link = GuestLink::new(listener.local_addr().expect("listener addr").port());
+
+        // Land the handshake ACK and the FIN in the same poll batch, so the
+        // socket is already in `CloseWait` the first time the relay stage looks
+        // at it — the `nc -z` shape. Without spawning a relay for that state
+        // nothing would ever dial the peer or close the socket.
+        link.stage_handshake_ack();
+        link.send(TcpControl::Fin, &[]);
+        link.pump();
+
+        let mut peer = accept_within(&listener, &mut link);
+        expect_peer_eof(&mut peer, &mut link);
+
+        drop(peer);
+        link.pump_until_reclaimed();
+        assert!(
+            link.relays.connections.is_empty(),
+            "relay slot must be reclaimed once both sides closed"
         );
     }
 }
