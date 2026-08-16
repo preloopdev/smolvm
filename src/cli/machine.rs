@@ -55,6 +55,30 @@ fn is_likely_image_ref(s: &str) -> bool {
     s.contains('/') && !s.starts_with('/') && !s.starts_with("./") && !s.starts_with("../")
 }
 
+/// `machine create`'s own long options that appear in a workload command, i.e.
+/// after the `--` separator, where they are arguments for the guest process
+/// rather than machine options.
+///
+/// Short flags are deliberately ignored: `-v`, `-e` and `-p` are far too common
+/// in ordinary commands to name without drowning the real signal. The long
+/// options come from clap itself, so a newly added flag is covered without
+/// touching this list.
+fn create_flags_in_workload(command: &[String]) -> Vec<String> {
+    use clap::Args as _;
+    let spec = CreateCmd::augment_args(clap::Command::new("create"));
+    let longs: std::collections::HashSet<String> = spec
+        .get_arguments()
+        .filter_map(|arg| arg.get_long().map(|long| format!("--{long}")))
+        .collect();
+    let mut found: Vec<String> = Vec::new();
+    for word in command {
+        if longs.contains(word.as_str()) && !found.contains(word) {
+            found.push(word.clone());
+        }
+    }
+    found
+}
+
 fn resolve_egress_flags(
     mut allow_cidr: Vec<String>,
     allow_host: Vec<String>,
@@ -2326,6 +2350,49 @@ mod tests {
         assert!(is_likely_image_ref(&cmd.command[0]));
     }
 
+    // Machine options after `--` are workload arguments; clap cannot reject
+    // them, so they must at least be named.
+    #[test]
+    fn create_flags_after_separator_are_detected() {
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "create",
+            "--name",
+            "x",
+            "--",
+            "/bin/sh",
+            "-c",
+            "sleep infinity",
+            "--mem",
+            "32768",
+            "--storage",
+            "120",
+            "--net",
+        ]);
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create command");
+        };
+        // They configured nothing: the machine still has the defaults.
+        assert_eq!(cmd.mem, DEFAULT_MICROVM_MEMORY_MIB);
+        assert_eq!(cmd.storage, None);
+        assert!(!cmd.net);
+        assert_eq!(
+            create_flags_in_workload(&cmd.command),
+            ["--mem", "--storage", "--net"]
+        );
+    }
+
+    #[test]
+    fn create_workload_own_options_are_not_reported() {
+        // A workload's own long options are not machine options, and short
+        // flags are never reported — `-v`, `-e` and `-p` are too common.
+        let words: Vec<String> = ["myserver", "--listen", "0.0.0.0", "-v", "-e", "-p", "8080"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(create_flags_in_workload(&words).is_empty());
+    }
+
     #[test]
     fn create_accepts_trailing_workload_command() {
         let cli = TestMachineCli::parse_from([
@@ -2915,6 +2982,26 @@ pub struct CreateCmd {
 
 impl CreateCmd {
     pub fn run(self) -> smolvm::Result<()> {
+        // Everything after `--` is the workload, so machine options written
+        // there are handed to the guest command and quietly do not configure the
+        // machine — a swallowed `--mem`/`--storage` boots a machine at the
+        // defaults with no diagnostic. Rejecting them is not an option (a
+        // workload may legitimately take an option of the same name), so name
+        // them. Checked before the `--from` branch so both create paths warn.
+        let stray_flags = create_flags_in_workload(&self.command);
+        if !stray_flags.is_empty() {
+            eprintln!(
+                "note: {} came after `--`, so {} passed to the workload and did not \
+                 configure the machine. Machine options go before `--`.",
+                stray_flags.join(", "),
+                if stray_flags.len() == 1 {
+                    "it was"
+                } else {
+                    "they were"
+                }
+            );
+        }
+
         // --max-image-size raises the archive cap for this invocation by setting
         // the env var the resolver reads (image_source::max_archive_bytes).
         if let Some(bytes) = self.max_image_size {
