@@ -452,7 +452,12 @@ impl PackCreateCmd {
             let merged_file = collector.layer_staging_path(&merged_digest);
 
             let total_bytes = client
-                .read_file_to_path("/tmp/merged-layers.tar", &merged_file, |_| {})
+                .read_file_to_path_capped(
+                    "/tmp/merged-layers.tar",
+                    &merged_file,
+                    smolvm::agent::pack_export_max_total(),
+                    |_| {},
+                )
                 .map_err(|e| Error::agent("export merged layer", e.to_string()))?;
             println!(" {} MB done", total_bytes / (1024 * 1024));
 
@@ -969,13 +974,9 @@ impl PackCreateCmd {
         let mut total_bytes = 0u64;
         let mut last_progress = Instant::now();
         // Pack export legitimately streams multi-GiB layers (a provisioned
-        // VM's rootfs with baked venvs / model caches), so the general 4 GiB
-        // file-transfer cap is too small here: honor an explicit override,
-        // otherwise allow 64 GiB before calling the stream runaway.
-        let cap = std::env::var("SMOLVM_FILE_TRANSFER_MAX_BYTES")
-            .ok()
-            .and_then(|s| smolvm::util::parse_size_bytes(s.trim()).ok())
-            .unwrap_or(64 << 30);
+        // VM's rootfs with baked venvs / model caches), so it carries the
+        // pack ceiling rather than the general file-transfer cap.
+        let cap = smolvm::agent::pack_export_max_total();
         loop {
             if start.elapsed() > LAYER_EXPORT_TIMEOUT {
                 return Err(Error::agent(

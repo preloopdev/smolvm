@@ -2132,6 +2132,26 @@ impl AgentClient {
         &mut self,
         guest_path: &str,
         local_path: &std::path::Path,
+        on_progress: F,
+    ) -> Result<u64> {
+        self.read_file_to_path_capped(
+            guest_path,
+            local_path,
+            file_transfer_max_total(),
+            on_progress,
+        )
+    }
+
+    /// [`Self::read_file_to_path`] with an explicit byte ceiling.
+    ///
+    /// The pack paths read back a layer smolvm itself asked the guest to
+    /// produce, so they pass [`pack_export_max_total`] instead of the general
+    /// guest-driven transfer bound.
+    pub fn read_file_to_path_capped<F: FnMut(u64)>(
+        &mut self,
+        guest_path: &str,
+        local_path: &std::path::Path,
+        cap: u64,
         mut on_progress: F,
     ) -> Result<u64> {
         use std::io::Write;
@@ -2150,7 +2170,6 @@ impl AgentClient {
         })?;
 
         let mut total = 0u64;
-        let cap = file_transfer_max_total();
         loop {
             match self.recv_raw()? {
                 AgentResponse::DataChunk { data, done } => {
@@ -2541,6 +2560,25 @@ pub fn file_transfer_max_total() -> u64 {
         .unwrap_or(FILE_TRANSFER_MAX_TOTAL)
 }
 
+/// Default ceiling for pack-export reads (64 GiB).
+const PACK_EXPORT_MAX_TOTAL: u64 = 64 << 30;
+
+/// The size cap for pack-export reads, in bytes. Defaults to 64 GiB and honors
+/// the same `SMOLVM_FILE_TRANSFER_MAX_BYTES` override as
+/// [`file_transfer_max_total`].
+///
+/// Pack export reads back a layer smolvm itself asked the guest to write, and a
+/// provisioned machine's flattened rootfs is routinely tens of GiB, so the
+/// general transfer bound — sized for `machine cp` against a guest that chooses
+/// its own payload — is the wrong ceiling here. Every pack read shares this one
+/// so the routes of a single export cannot disagree.
+pub fn pack_export_max_total() -> u64 {
+    std::env::var("SMOLVM_FILE_TRANSFER_MAX_BYTES")
+        .ok()
+        .and_then(|s| crate::util::parse_size_bytes(s.trim()).ok())
+        .unwrap_or(PACK_EXPORT_MAX_TOTAL)
+}
+
 fn consume_streamed_read_with_progress<F, P>(next_response: F, on_progress: P) -> Result<Vec<u8>>
 where
     F: FnMut() -> Result<AgentResponse>,
@@ -2639,6 +2677,15 @@ mod read_cap_tests {
     fn read_cap_terminator_returns_full_buffer() {
         let out = drive(vec![chunk(100, false), chunk(50, true)]).unwrap();
         assert_eq!(out.len(), 150);
+    }
+
+    // Pack export reads back a layer smolvm asked the guest to produce, not a
+    // guest-chosen payload, so its ceiling must never be the more restrictive
+    // of the two. Holds with or without the shared override, since both caps
+    // read it.
+    #[test]
+    fn pack_export_cap_is_never_below_the_transfer_cap() {
+        assert!(pack_export_max_total() >= file_transfer_max_total());
     }
 
     #[test]

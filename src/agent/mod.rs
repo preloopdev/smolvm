@@ -20,8 +20,8 @@ pub use crate::data::network::PortMapping;
 pub use crate::data::resources::VmResources;
 pub use crate::data::storage::HostMount;
 pub use client::{
-    file_transfer_max_total, AgentClient, ExecEvent, InteractiveInput, InteractiveOutput,
-    PullOptions, RunConfig,
+    file_transfer_max_total, pack_export_max_total, AgentClient, ExecEvent, InteractiveInput,
+    InteractiveOutput, PullOptions, RunConfig,
 };
 pub use fsnotify_watch::FsNotifyWatcher;
 pub use krun::KrunFunctions;
