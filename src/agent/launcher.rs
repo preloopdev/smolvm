@@ -480,10 +480,14 @@ impl LaunchFeatures {
             return Ok(self);
         }
 
-        if !smolvm_pack::extract::is_extracted(layers_cache_dir) {
+        let marker_present = smolvm_pack::extract::is_extracted(layers_cache_dir);
+        if !marker_present || !smolvm_pack::extract::cached_layers_usable(layers_cache_dir) {
             // Fallback: layers not yet extracted into this machine's own dir
-            // (pre-this-layout machine, or an interrupted create). Extract from
-            // the source bundle, which must still be present in that case.
+            // (pre-this-layout machine, or an interrupted create), OR the
+            // extraction marker survived while the layer files themselves were
+            // deleted (cache cleaners take the large files and leave the tiny
+            // marker). Extract from the source bundle, which must still be
+            // present in that case; force past the marker when it lies.
             let sidecar = Path::new(sidecar_path);
             if !sidecar.exists() {
                 return Err(Error::agent(
@@ -496,10 +500,22 @@ impl LaunchFeatures {
                     ),
                 ));
             }
+            if marker_present {
+                tracing::info!(
+                    cache = %layers_cache_dir.display(),
+                    "layer cache marked extracted but unusable; re-extracting from the source bundle"
+                );
+            }
             let footer = smolvm_pack::packer::read_footer_from_sidecar(sidecar)
                 .map_err(|e| Error::agent("read sidecar footer", e.to_string()))?;
-            smolvm_pack::extract::extract_sidecar(sidecar, layers_cache_dir, &footer, false, false)
-                .map_err(|e| Error::agent("extract sidecar", e.to_string()))?;
+            smolvm_pack::extract::extract_sidecar(
+                sidecar,
+                layers_cache_dir,
+                &footer,
+                marker_present,
+                false,
+            )
+            .map_err(|e| Error::agent("extract sidecar", e.to_string()))?;
         }
 
         let layers_lease = smolvm_pack::extract::acquire_layers_lease(layers_cache_dir, false)
@@ -1032,6 +1048,24 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 if let Some(dns) = resources.dns {
                     guest_network.upstream_dns = dns;
                 }
+                // A named network (--network) leases this VM a distinct /30 so
+                // members can address each other; the lease is handed to the
+                // virtio runtime below, which starts the fabric threads.
+                let mut fabric_lease = None;
+                if let Some(network_name) = resources.network_name.as_deref() {
+                    let registry = crate::agent::manager::network_registry_dir(network_name);
+                    let lease = smolvm_network::fabric::allocate_lease(&registry).map_err(|e| {
+                        krun_free_ctx(ctx);
+                        Error::agent(
+                            "join network",
+                            format!("failed to lease a subnet on network '{network_name}': {e}"),
+                        )
+                    })?;
+                    guest_network.guest_ip = lease.guest_ip;
+                    guest_network.gateway_ip = lease.gateway_ip;
+                    guest_network.dns_server = lease.gateway_ip;
+                    fabric_lease = Some(lease);
+                }
                 let mut guest_mac = guest_network.guest_mac;
 
                 // Kubernetes pod networking: adopt the CNI interface's IP/prefix/
@@ -1139,6 +1173,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                                 guest_network,
                                 &virtio_port_mappings,
                                 egress,
+                                fabric_lease,
                             ) {
                                 Ok(runtime) => runtime,
                                 Err(err) => {
@@ -1224,6 +1259,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                                 guest_network,
                                 &virtio_port_mappings,
                                 egress,
+                                fabric_lease,
                             ) {
                                 Ok(runtime) => {
                                     if let Some(path) = egress_path {
@@ -1746,6 +1782,28 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             )));
         }
 
+        // The disk-trim tunable is read by the guest agent (fstrim runs in the
+        // guest), so forward the host's setting into the guest environment.
+        if let Ok(trim) = std::env::var(guest_env::DISK_TRIM) {
+            env_strings.push(cstr(&format!("{}={}", guest_env::DISK_TRIM, trim)));
+        }
+
+        // The machine's name rides along so the guest can hostname the
+        // container after it — distinct k8s node names, distinguishable
+        // shell prompts — instead of every machine being "container". The
+        // per-VM dir records the plaintext name beside the vsock socket.
+        if let Some(name) = vsock_socket
+            .parent()
+            .and_then(|dir| std::fs::read_to_string(dir.join("name")).ok())
+        {
+            let name = name.trim();
+            if !name.is_empty() {
+                if let Ok(cstr) = CString::new(format!("{}={}", guest_env::MACHINE_NAME, name)) {
+                    env_strings.push(cstr);
+                }
+            }
+        }
+
         // Pass mount info to the agent via environment
         // Format: SMOLVM_MOUNT_0=tag:guest_path:ro
         for (i, mount) in mounts.iter().enumerate() {
@@ -1954,7 +2012,9 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         return None;
                     }
                     Some(
-                        buf.chunks_exact(3)
+                        buf.as_chunks::<3>()
+                            .0
+                            .iter()
                             .map(|c| (c[0], c[1], c[2]))
                             .collect::<Vec<_>>(),
                     )

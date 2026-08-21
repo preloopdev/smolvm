@@ -33,7 +33,7 @@ use smolvm_cuda::client::{Client, CudaRpcError};
 mod cublas_stubs;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
 use std::io::{Read, Write};
 use std::sync::Mutex;
 
@@ -46,6 +46,7 @@ const CUDA_ERROR_INITIALIZATION: c_int = 3;
 const CUDA_ERROR_INVALID_SYMBOL: c_int = 13;
 const CUDA_ERROR_INVALID_DEVICE_POINTER: c_int = 17;
 const CUDA_ERROR_INVALID_RESOURCE_HANDLE: c_int = 400;
+const CUDA_ERROR_ILLEGAL_STATE: c_int = 401;
 const CUDA_ERROR_NO_DEVICE: c_int = 100;
 const CUDA_ERROR_NOT_SUPPORTED: c_int = 801;
 const CUDA_ERROR_UNKNOWN: c_int = 999;
@@ -202,6 +203,18 @@ struct SymbolRec {
     address: u64,
 }
 
+#[derive(Clone)]
+struct StaticFuncRec {
+    fatbin: usize,
+    name: String,
+}
+
+#[derive(Clone)]
+struct StaticSymbolRec {
+    fatbin: usize,
+    name: String,
+}
+
 struct ShimState {
     client: Client<Stream>,
     initialized: bool,
@@ -220,11 +233,19 @@ struct ShimState {
     /// interior to a cudaMalloc'd block — `cudaPointerGetAttributes` on one
     /// must still report Device or torch's `getDeviceFromPtr` throws.
     dev_allocs: std::collections::BTreeMap<u64, u64>,
-    /// Active CUDA graph capture, `(stream_handle, capture_id)`. Kept
-    /// guest-side so the per-launch hot queries (`cudaStreamIsCapturing`,
-    /// `cudaStreamGetCaptureInfo` — PyTorch's allocator calls them constantly)
-    /// answer locally instead of round-tripping.
-    capture: Option<(u64, u64)>,
+    /// Active CUDA graph captures keyed by root stream. Multiple relaxed-mode
+    /// captures may coexist in one process. Root-stream queries stay local;
+    /// side streams use the host capture ID to find the matching local record.
+    captures: HashMap<u64, CaptureRecord>,
+    /// Virtual captured graph handle → exact node count returned alongside the
+    /// synchronous EndCapture response. This makes GraphGetNodes a local,
+    /// truthful query rather than one extra RTT per graph.
+    graph_node_counts: HashMap<u64, usize>,
+    /// Same-flag raw events provisioned in one host round trip. Frameworks
+    /// create/destroy events at very high frequency; keeping a small local
+    /// handle reserve removes synchronous creation RTTs without changing event
+    /// ordering, query, or destruction semantics.
+    event_spares: HashMap<u32, Vec<u64>>,
     /// PID that opened `client`. If the process forks (or a snapshotted VM is
     /// restored as a clone), the inherited socket fd + ring mapping belong to
     /// the parent and are dead here; a mismatch triggers a transparent
@@ -248,7 +269,20 @@ struct ShimState {
     force_reconnect: bool,
 }
 
+#[derive(Clone, Copy)]
+struct CaptureRecord {
+    local_id: u64,
+    host_id: Option<u64>,
+}
+
 static STATE: Mutex<Option<ShimState>> = Mutex::new(None);
+// Native libcudart only records static fatbins during ELF initialization and
+// materializes a module when one of its kernels/globals is first used. Keep the
+// same split here: registration must not connect to the host or upload hundreds
+// of unused modules in tokenizer/controller processes that merely import torch.
+static STATIC_MODULES: Mutex<Option<HashMap<usize, Vec<u8>>>> = Mutex::new(None);
+static STATIC_FUNCS: Mutex<Option<HashMap<usize, StaticFuncRec>>> = Mutex::new(None);
+static STATIC_SYMBOLS: Mutex<Option<HashMap<usize, StaticSymbolRec>>> = Mutex::new(None);
 
 thread_local! {
     /// `__cudaPushCallConfiguration` stash, popped by `__cudaPopCallConfiguration`.
@@ -283,6 +317,10 @@ fn map_err(e: CudaRpcError) -> c_int {
             200 | 218 => CUDA_ERROR_INVALID_VALUE, // invalid image / PTX
             400 => CUDA_ERROR_INVALID_RESOURCE_HANDLE,
             801 => CUDA_ERROR_NOT_SUPPORTED,
+            // Driver and Runtime capture failures intentionally use the same
+            // numeric range. Preserve them so frameworks can distinguish an
+            // invalidated capture from a transport or unknown device failure.
+            900..=910 => code,
             other => {
                 if std::env::var_os("SMOLVM_CUDA_SHIM_TRACE").is_some() {
                     eprintln!("[map-err] unmapped driver code {other}");
@@ -802,7 +840,9 @@ fn with_client<T>(
                 symbols: HashMap::new(),
                 host_allocs: HashMap::new(),
                 dev_allocs: std::collections::BTreeMap::new(),
-                capture: None,
+                captures: HashMap::new(),
+                graph_node_counts: HashMap::new(),
+                event_spares: HashMap::new(),
                 conn_pid: pid,
                 conn_token: token,
                 conn_fd: fd,
@@ -850,7 +890,10 @@ fn with_client<T>(
                 st.conn_pid = pid;
                 st.conn_fd = fd;
                 st.force_reconnect = false;
-                st.capture = None; // any in-flight capture belonged to the parent
+                st.captures.clear(); // in-flight captures belonged to the parent
+                                     // The old session owns and reclaims unused provisioned events;
+                                     // none of its raw handles may be issued after reconnect/fork.
+                st.event_spares.clear();
             }
         }
     }
@@ -2075,19 +2118,36 @@ pub extern "C" fn cudaSetDeviceFlags(_flags: c_uint) -> c_int {
     CUDA_SUCCESS
 }
 
-/// Whole-graph exec update: report "update failed" — ggml (and torch) fall
-/// back to destroying and re-instantiating the graph, which we forward.
+/// Whole-graph exec update. The host driver checks topology compatibility and
+/// patches the executable graph in place; error-node handles remain host-local,
+/// so only the portable result enum is returned to the guest.
 #[no_mangle]
 pub extern "C" fn cudaGraphExecUpdate(
-    _exec: *mut c_void,
-    _graph: *mut c_void,
+    exec: *mut c_void,
+    graph: *mut c_void,
     result_info: *mut c_void,
 ) -> c_int {
-    if !result_info.is_null() {
-        // cudaGraphExecUpdateResultInfo { result, errorNode, errorFromNode }
-        unsafe { std::ptr::write_bytes(result_info as *mut u8, 0, 24) };
+    if result_info.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
     }
-    910 // cudaErrorGraphExecUpdateFailure
+    set_last(
+        match with_client_retrying(|c| c.graph_exec_update(exec as u64, graph as u64)) {
+            Ok(result) => {
+                // cudaGraphExecUpdateResultInfo { i32 result; pad; ptr; ptr }.
+                // Raw host graph-node pointers cannot cross the transport.
+                unsafe {
+                    std::ptr::write_bytes(result_info as *mut u8, 0, 24);
+                    (result_info as *mut c_int).write(result);
+                }
+                if result == 0 {
+                    CUDA_SUCCESS
+                } else {
+                    910 // cudaErrorGraphExecUpdateFailure
+                }
+            }
+            Err(error) => error,
+        },
+    )
 }
 
 /// Cooperative launches need grid-wide sync the transport can't fake; the
@@ -2233,19 +2293,39 @@ pub extern "C" fn cudaGetDeviceProperties_v2(prop: *mut c_void, device: c_int) -
 
 // ---- events (forward to host) -----------------------------------------------
 
+const EVENT_CREATE_BATCH_SIZE: u32 = 64;
+
+fn event_create_cached(event: *mut *mut c_void, flags: c_uint) -> c_int {
+    if event.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    set_last(
+        match with_state(|st| {
+            if let Some(handle) = st.event_spares.get_mut(&flags).and_then(Vec::pop) {
+                return Ok(handle);
+            }
+
+            let mut handles = st
+                .client
+                .event_create_batch(flags, EVENT_CREATE_BATCH_SIZE)
+                .map_err(map_err)?;
+            let handle = handles.pop().ok_or(CUDA_ERROR_UNKNOWN)?;
+            st.event_spares.entry(flags).or_default().extend(handles);
+            Ok(handle)
+        }) {
+            Ok(handle) => unsafe { out(event, handle as *mut c_void) },
+            Err(code) => code,
+        },
+    )
+}
+
 #[no_mangle]
 pub extern "C" fn cudaEventCreate(event: *mut *mut c_void) -> c_int {
-    set_last(match with_client(|c| c.event_create(0)) {
-        Ok(h) => unsafe { out(event, h as *mut c_void) },
-        Err(e) => e,
-    })
+    event_create_cached(event, 0)
 }
 #[no_mangle]
 pub extern "C" fn cudaEventCreateWithFlags(event: *mut *mut c_void, flags: c_uint) -> c_int {
-    set_last(match with_client(|c| c.event_create(flags)) {
-        Ok(h) => unsafe { out(event, h as *mut c_void) },
-        Err(e) => e,
-    })
+    event_create_cached(event, flags)
 }
 #[no_mangle]
 pub extern "C" fn cudaEventDestroy(event: *mut c_void) -> c_int {
@@ -2350,27 +2430,108 @@ pub extern "C" fn cudaStreamQuery(stream: *mut c_void) -> c_int {
 // recorded (not executed) by the real driver. Replay is a single GraphLaunch
 // message for the whole graph — the antidote to per-launch round-trips in
 // launch-bound inference. The hot capture-status queries answer from the
-// guest-side `capture` field, costing nothing outside capture.
+// guest-side `capture` field, costing nothing outside capture and on the root
+// stream. Queries for side streams participating through event edges go to the
+// host driver; treating them as inactive leaves a forked capture branch
+// unjoined and breaks segmented graph implementations that track side-stream
+// forks.
 
+/// cudaStreamCaptureStatusNone.
+const CAPTURE_NONE: c_int = 0;
 /// cudaStreamCaptureStatusActive.
 const CAPTURE_ACTIVE: c_int = 1;
+
+fn local_capture_info(captures: &HashMap<u64, CaptureRecord>, stream: u64) -> Option<(c_int, u64)> {
+    if let Some(record) = captures.get(&stream) {
+        Some((CAPTURE_ACTIVE, record.local_id))
+    } else if captures.is_empty() {
+        Some((CAPTURE_NONE, 0))
+    } else {
+        None
+    }
+}
+
+fn capture_info_for_stream(s: &mut ShimState, stream: u64) -> Result<(c_int, u64), c_int> {
+    if let Some(info) = local_capture_info(&s.captures, stream) {
+        return Ok(info);
+    }
+
+    // CUDA owns side-stream participation: event edges can join a non-root
+    // stream to one of several active captures. Ask the host which capture it
+    // joined, then translate the host's ID to the process-local ID frameworks
+    // use to correlate allocator state.
+    let (status, side_host_id) = s.client.stream_capture_info(stream).map_err(map_err)?;
+    if status as c_int != CAPTURE_ACTIVE {
+        return Ok((status as c_int, 0));
+    }
+    if let Some(record) = s
+        .captures
+        .values()
+        .find(|record| record.host_id == Some(side_host_id))
+    {
+        return Ok((CAPTURE_ACTIVE, record.local_id));
+    }
+
+    // BeginCapture is pipelined, so host IDs are populated lazily only when a
+    // side-stream query needs them. This keeps the common root-only path at
+    // zero RTT while correctly disambiguating concurrent capture DAGs.
+    let unresolved: Vec<u64> = s
+        .captures
+        .iter()
+        .filter_map(|(&root, record)| record.host_id.is_none().then_some(root))
+        .collect();
+    for root in unresolved {
+        let (root_status, root_host_id) = s.client.stream_capture_info(root).map_err(map_err)?;
+        if root_status as c_int == CAPTURE_ACTIVE {
+            if let Some(record) = s.captures.get_mut(&root) {
+                record.host_id = Some(root_host_id);
+                if root_host_id == side_host_id {
+                    return Ok((CAPTURE_ACTIVE, record.local_id));
+                }
+            }
+        }
+    }
+
+    // A capture started outside this runtime shim can still be reported by the
+    // host. Its host ID is already stable, so expose it rather than claiming the
+    // stream is inactive or attaching it to the wrong local capture.
+    Ok((CAPTURE_ACTIVE, side_host_id))
+}
 
 #[no_mangle]
 pub extern "C" fn cudaStreamBeginCapture(stream: *mut c_void, mode: c_int) -> c_int {
     set_last(
         match with_state(|s| {
+            let stream = stream as u64;
+            if s.captures.contains_key(&stream) {
+                return Err(CUDA_ERROR_ILLEGAL_STATE);
+            }
             // Fire-and-forget: the host starts capture when this drains, and
             // the (also-deferred) launches record in order. The capture id is
             // torch-visible only (its allocator correlates via the local
             // GetCaptureInfo queries; the host tracks capture by stream), so
-            // mint it locally. Both save a host round-trip per captured graph,
-            // which dominates coldstart over a network (~1400 graphs).
-            s.client
-                .stream_begin_capture_deferred(stream as u64, mode)
-                .map_err(map_err)?;
+            // mint it locally. This saves a host round-trip per captured graph;
+            // EndCapture remains synchronous because it reports invalidation.
+            if s.captures.is_empty() {
+                s.client
+                    .stream_begin_capture_deferred(stream, mode)
+                    .map_err(map_err)?;
+            } else {
+                // Concurrent captures are uncommon and need host validation;
+                // keep only the first/root-only capture on the zero-RTT path.
+                s.client
+                    .stream_begin_capture(stream, mode)
+                    .map_err(map_err)?;
+            }
             static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
             let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            s.capture = Some((stream as u64, id));
+            s.captures.insert(
+                stream,
+                CaptureRecord {
+                    local_id: id,
+                    host_id: None,
+                },
+            );
             Ok(())
         }) {
             Ok(()) => CUDA_SUCCESS,
@@ -2384,21 +2545,25 @@ pub extern "C" fn cudaStreamEndCapture(stream: *mut c_void, graph: *mut *mut c_v
     if graph.is_null() {
         return set_last(CUDA_ERROR_INVALID_VALUE);
     }
+    unsafe { *graph = std::ptr::null_mut() };
     set_last(
         match with_state(|s| {
-            // Mint a virtual graph handle; the host maps it to the real
-            // captured graph when this deferred end drains.
+            // Mint a virtual graph handle; the host maps it to the real graph.
+            // EndCapture is a validation boundary: it must synchronously report
+            // an invalidated capture and leave `graph` null, matching libcudart.
             let vh = alloc_vhandle();
-            s.client
-                .stream_end_capture_deferred(stream as u64, vh)
+            let node_count = s
+                .client
+                .stream_end_capture(stream as u64, vh)
                 .map_err(map_err)?;
-            s.capture = None;
+            s.captures.remove(&(stream as u64));
+            s.graph_node_counts.insert(vh, node_count as usize);
             Ok(vh)
         }) {
             Ok(g) => unsafe { out(graph, g as *mut c_void) },
             Err(e) => {
                 let _ = with_state(|s| {
-                    s.capture = None;
+                    s.captures.remove(&(stream as u64));
                     Ok(())
                 });
                 e
@@ -2409,9 +2574,15 @@ pub extern "C" fn cudaStreamEndCapture(stream: *mut c_void, graph: *mut *mut c_v
 
 #[no_mangle]
 pub extern "C" fn cudaStreamIsCapturing(stream: *mut c_void, status: *mut c_int) -> c_int {
-    let active = with_state(|s| Ok(matches!(s.capture, Some((cs, _)) if cs == stream as u64)))
-        .unwrap_or(false);
-    set_last(unsafe { out(status, if active { CAPTURE_ACTIVE } else { 0 }) })
+    if status.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    set_last(
+        match with_state(|s| capture_info_for_stream(s, stream as u64)) {
+            Ok((capture_status, _)) => unsafe { out(status, capture_status) },
+            Err(error) => error,
+        },
+    )
 }
 
 #[no_mangle]
@@ -2423,10 +2594,12 @@ pub extern "C" fn cudaStreamGetCaptureInfo_v2(
     deps: *mut *mut *const c_void,
     num_deps: *mut usize,
 ) -> c_int {
-    let cap = with_state(|s| Ok(s.capture)).unwrap_or(None);
-    let (st, cid) = match cap {
-        Some((cs, cid)) if cs == stream as u64 => (CAPTURE_ACTIVE, cid),
-        _ => (0, 0),
+    if status.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    let (st, cid) = match with_state(|s| capture_info_for_stream(s, stream as u64)) {
+        Ok(info) => info,
+        Err(error) => return set_last(error),
     };
     unsafe {
         let _ = out(status, st);
@@ -2468,10 +2641,10 @@ pub extern "C" fn cudaGraphInstantiateWithFlags(
     }
     set_last(
         match with_client(|c| {
-            // Mint a virtual exec handle; host maps it when this deferred
-            // instantiate drains (graph is itself a virtual graph handle).
+            // Mint a virtual exec handle; the host maps it after validating the
+            // graph. Instantiation errors are synchronous in libcudart.
             let exec_vh = alloc_vhandle();
-            c.graph_instantiate_deferred(graph as u64, exec_vh)?;
+            c.graph_instantiate(graph as u64, exec_vh)?;
             Ok(exec_vh)
         }) {
             Ok(e) => unsafe { out(graph_exec, e as *mut c_void) },
@@ -2495,25 +2668,27 @@ pub extern "C" fn cudaGraphLaunch(graph_exec: *mut c_void, stream: *mut c_void) 
 /// empty captures. Filling a caller-provided node array is not supported.
 #[no_mangle]
 pub extern "C" fn cudaGraphGetNodes(
-    _graph: *mut c_void,
+    graph: *mut c_void,
     nodes: *mut *mut c_void,
     num_nodes: *mut usize,
 ) -> c_int {
     if num_nodes.is_null() {
         return set_last(CUDA_ERROR_INVALID_VALUE);
     }
-    // The real node list is never requested (nodes != NULL is rejected below);
-    // torch calls this only with nodes = NULL to check for an EMPTY graph and
-    // warn. A captured decode graph is never empty, so answer the count query
-    // locally with a non-zero value instead of a host round-trip — fetching
-    // the true count cost one RTT per captured graph (~1400), dominating
-    // coldstart over a network. (This can only suppress a cosmetic empty-graph
-    // warning, never cause wrong behavior — unlike the fake-data stubs that
-    // were replaced with real values.)
     if !nodes.is_null() {
         return set_last(CUDA_ERROR_INVALID_VALUE);
     }
-    set_last(unsafe { out(num_nodes, 1usize) })
+    set_last(
+        match with_state(|s| {
+            s.graph_node_counts
+                .get(&(graph as u64))
+                .copied()
+                .ok_or(CUDA_ERROR_INVALID_RESOURCE_HANDLE)
+        }) {
+            Ok(count) => unsafe { out(num_nodes, count) },
+            Err(error) => error,
+        },
+    )
 }
 
 #[no_mangle]
@@ -2528,10 +2703,15 @@ pub extern "C" fn cudaGraphExecDestroy(graph_exec: *mut c_void) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn cudaGraphDestroy(graph: *mut c_void) -> c_int {
-    set_last(match with_client(|c| c.graph_destroy(graph as u64)) {
-        Ok(()) => CUDA_SUCCESS,
-        Err(e) => e,
-    })
+    set_last(
+        match with_state(|s| {
+            s.graph_node_counts.remove(&(graph as u64));
+            s.client.graph_destroy(graph as u64).map_err(map_err)
+        }) {
+            Ok(()) => CUDA_SUCCESS,
+            Err(e) => e,
+        },
+    )
 }
 
 /// Manual graph-build APIs. Conda `libtorch_cuda.so` version-requires these at
@@ -2881,11 +3061,7 @@ pub extern "C" fn cudaFuncGetAttributes(attr: *mut c_void, func: *const c_void) 
     // CUfunction_attribute: MAX_THREADS_PER_BLOCK=0, SHARED=1, CONST=2,
     // LOCAL=3, NUM_REGS=4, PTX_VERSION=5, BINARY_VERSION=6.
     let r = with_state(|s| {
-        let fid = s
-            .funcs
-            .get(&(func as usize))
-            .ok_or(CUDA_ERROR_INVALID_DEVICE_POINTER)?
-            .fid;
+        let (fid, _) = ensure_registered_func(s, func as usize)?;
         let get = |s: &mut ShimState, a: i32| s.client.func_get_attribute(fid, a).unwrap_or(0);
         let shared = get(s, 1);
         let cst = get(s, 2);
@@ -2938,11 +3114,7 @@ pub extern "C" fn cudaFuncSetAttribute(func: *const c_void, attr: c_int, value: 
         return CUDA_SUCCESS;
     }
     let r = with_state(|s| {
-        let fid = s
-            .funcs
-            .get(&(func as usize))
-            .ok_or(CUDA_ERROR_INVALID_DEVICE_POINTER)?
-            .fid;
+        let (fid, _) = ensure_registered_func(s, func as usize)?;
         s.client
             .func_set_attribute(fid, attr, value)
             .map_err(map_err)
@@ -2980,8 +3152,17 @@ pub extern "C" fn cudaStreamGetCaptureInfo(
     id: *mut u64,
     graph: *mut *mut c_void,
     deps: *mut *mut *const c_void,
+    edge_data: *mut *const c_void,
     num_deps: *mut usize,
 ) -> c_int {
+    // CUDA 13 added the edge-data output before `numDependencies`; current
+    // cuda-python bindings call this seven-argument ABI.
+    if !edge_data.is_null() && deps.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    if !edge_data.is_null() {
+        unsafe { *edge_data = std::ptr::null() };
+    }
     cudaStreamGetCaptureInfo_v2(stream, status, id, graph, deps, num_deps)
 }
 
@@ -3352,11 +3533,32 @@ fn resolve_symbol(symbol: *const c_void) -> Result<(u64, u64), c_int> {
         return Err(CUDA_ERROR_INVALID_SYMBOL);
     }
     with_state(|s| {
-        let rec = s
-            .symbols
-            .get(&(symbol as usize))
-            .cloned()
-            .ok_or(CUDA_ERROR_INVALID_SYMBOL)?;
+        let key = symbol as usize;
+        if !s.symbols.contains_key(&key) {
+            let source = STATIC_SYMBOLS
+                .lock()
+                .map_err(|_| CUDA_ERROR_UNKNOWN)?
+                .as_ref()
+                .and_then(|symbols| symbols.get(&key))
+                .cloned()
+                .ok_or(CUDA_ERROR_INVALID_SYMBOL)?;
+            let module = ensure_static_module(s, source.fatbin)?;
+            let (address, size) = s
+                .client
+                .module_get_global(module, &source.name)
+                .map_err(map_symbol_err)?;
+            s.dev_allocs.insert(address, size);
+            s.symbols.insert(
+                key,
+                SymbolRec {
+                    module,
+                    name: source.name,
+                    address,
+                },
+            );
+            return Ok((address, size));
+        }
+        let rec = s.symbols.get(&key).cloned().expect("checked above");
         let result = s
             .client
             .module_get_global(rec.module, &rec.name)
@@ -3365,7 +3567,7 @@ fn resolve_symbol(symbol: *const c_void) -> Result<(u64, u64), c_int> {
             s.dev_allocs.remove(&rec.address);
         }
         s.dev_allocs.insert(result.0, result.1);
-        if let Some(stored) = s.symbols.get_mut(&(symbol as usize)) {
+        if let Some(stored) = s.symbols.get_mut(&key) {
             stored.address = result.0;
         }
         Ok(result)
@@ -3455,6 +3657,49 @@ pub extern "C" fn cudaDeviceGetByPCIBusId(device: *mut c_int, pci_bus_id: *const
 }
 
 // ---- kernel registration + launch -------------------------------------------
+
+fn ensure_static_module(s: &mut ShimState, fatbin: usize) -> Result<u64, c_int> {
+    if let Some(&module) = s.modules.get(&fatbin) {
+        return Ok(module);
+    }
+    let blob = STATIC_MODULES
+        .lock()
+        .map_err(|_| CUDA_ERROR_UNKNOWN)?
+        .as_ref()
+        .and_then(|modules| modules.get(&fatbin))
+        .cloned()
+        .ok_or(CUDA_ERROR_INVALID_RESOURCE_HANDLE)?;
+    let module = s.client.module_load_data(&blob).map_err(map_err)?;
+    s.modules.insert(fatbin, module);
+    Ok(module)
+}
+
+fn ensure_registered_func(s: &mut ShimState, key: usize) -> Result<(u64, Vec<u32>), c_int> {
+    if let Some(rec) = s.funcs.get(&key) {
+        return Ok((rec.fid, rec.param_sizes.clone()));
+    }
+    let source = STATIC_FUNCS
+        .lock()
+        .map_err(|_| CUDA_ERROR_UNKNOWN)?
+        .as_ref()
+        .and_then(|funcs| funcs.get(&key))
+        .cloned()
+        .ok_or(CUDA_ERROR_INVALID_DEVICE_POINTER)?;
+    let module = ensure_static_module(s, source.fatbin)?;
+    let fid = s
+        .client
+        .module_get_function(module, &source.name)
+        .map_err(map_err)?;
+    let param_sizes = s.client.func_get_param_info(fid).map_err(map_err)?;
+    s.funcs.insert(
+        key,
+        FuncRec {
+            fid,
+            param_sizes: param_sizes.clone(),
+        },
+    );
+    Ok((fid, param_sizes))
+}
 
 /// `__fatBinC_Wrapper_t`: what `__cudaRegisterFatBinary` receives. `data` points
 /// at the fatbin container (its own header carries the length).
@@ -3581,8 +3826,8 @@ unsafe fn module_image_len(image: *const c_void) -> Result<usize, c_int> {
 
 #[no_mangle]
 pub extern "C" fn __cudaRegisterFatBinary(fat_cubin: *mut c_void) -> *mut *mut c_void {
-    // Mint a stable handle the app hands back to Register/Unregister; map it to
-    // the driver module we load from the embedded fatbin.
+    // Mint a stable handle the app hands back to Register/Unregister. Preserve
+    // the image locally; the first kernel/global use uploads it to the host.
     let handle = Box::into_raw(Box::new(0u8)) as *mut *mut c_void;
     if fat_cubin.is_null() {
         return handle;
@@ -3593,15 +3838,11 @@ pub extern "C" fn __cudaRegisterFatBinary(fat_cubin: *mut c_void) -> *mut *mut c
         return handle;
     };
     let blob = unsafe { std::slice::from_raw_parts(data as *const u8, len) }.to_vec();
-    let _ = with_state(|s| {
-        match s.client.module_load_data(&blob) {
-            Ok(module) => {
-                s.modules.insert(handle as usize, module);
-            }
-            Err(e) => return Err(map_err(e)),
-        }
-        Ok(())
-    });
+    if let Ok(mut modules) = STATIC_MODULES.lock() {
+        modules
+            .get_or_insert_with(HashMap::new)
+            .insert(handle as usize, blob);
+    }
     handle
 }
 
@@ -3637,21 +3878,15 @@ pub extern "C" fn __cudaRegisterFunction(
         Ok(n) => n.to_string(),
         Err(_) => return,
     };
-    let _ = with_state(|s| {
-        let module = *s
-            .modules
-            .get(&(fat_cubin_handle as usize))
-            .ok_or(CUDA_ERROR_INVALID_RESOURCE_HANDLE)?;
-        let cname = CString::new(name.clone()).map_err(|_| CUDA_ERROR_INVALID_VALUE)?;
-        let fid = s
-            .client
-            .module_get_function(module, cname.to_str().unwrap())
-            .map_err(map_err)?;
-        let param_sizes = s.client.func_get_param_info(fid).map_err(map_err)?;
-        s.funcs
-            .insert(host_fun as usize, FuncRec { fid, param_sizes });
-        Ok(())
-    });
+    if let Ok(mut funcs) = STATIC_FUNCS.lock() {
+        funcs.get_or_insert_with(HashMap::new).insert(
+            host_fun as usize,
+            StaticFuncRec {
+                fatbin: fat_cubin_handle as usize,
+                name,
+            },
+        );
+    }
 }
 
 #[no_mangle]
@@ -3681,48 +3916,82 @@ pub extern "C" fn __cudaRegisterVar(
         Ok(name) => name.to_owned(),
         Err(_) => return,
     };
-    let _ = with_state(|s| {
-        let module = *s
-            .modules
-            .get(&(fat_cubin_handle as usize))
-            .ok_or(CUDA_ERROR_INVALID_RESOURCE_HANDLE)?;
-        // Validate the registration now. Calls re-resolve by module/name so an
-        // isolating fork can translate the inherited module to its local copy.
-        let (address, size) = s
-            .client
-            .module_get_global(module, &name)
-            .map_err(map_symbol_err)?;
-        s.dev_allocs.insert(address, size);
-        s.symbols.insert(
+    if let Ok(mut symbols) = STATIC_SYMBOLS.lock() {
+        symbols.get_or_insert_with(HashMap::new).insert(
             host_var as usize,
-            SymbolRec {
-                module,
+            StaticSymbolRec {
+                fatbin: fat_cubin_handle as usize,
                 name,
-                address,
             },
         );
-        Ok(())
-    });
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn __cudaUnregisterFatBinary(handle: *mut *mut c_void) {
-    let _ = with_state(|s| {
-        if let Some(module) = s.modules.remove(&(handle as usize)) {
-            let global_addresses: Vec<u64> = s
-                .symbols
-                .values()
-                .filter(|symbol| symbol.module == module)
-                .map(|symbol| symbol.address)
-                .collect();
-            s.symbols.retain(|_, symbol| symbol.module != module);
-            for address in global_addresses {
-                s.dev_allocs.remove(&address);
-            }
-            let _ = s.client.module_unload(module);
+    let fatbin = handle as usize;
+    if let Ok(mut modules) = STATIC_MODULES.lock() {
+        if let Some(modules) = modules.as_mut() {
+            modules.remove(&fatbin);
         }
-        Ok(())
-    });
+    }
+    let function_keys = STATIC_FUNCS
+        .lock()
+        .ok()
+        .and_then(|mut funcs| {
+            let funcs = funcs.as_mut()?;
+            let keys: Vec<usize> = funcs
+                .iter()
+                .filter_map(|(&key, rec)| (rec.fatbin == fatbin).then_some(key))
+                .collect();
+            for key in &keys {
+                funcs.remove(key);
+            }
+            Some(keys)
+        })
+        .unwrap_or_default();
+    let symbol_keys = STATIC_SYMBOLS
+        .lock()
+        .ok()
+        .and_then(|mut symbols| {
+            let symbols = symbols.as_mut()?;
+            let keys: Vec<usize> = symbols
+                .iter()
+                .filter_map(|(&key, rec)| (rec.fatbin == fatbin).then_some(key))
+                .collect();
+            for key in &keys {
+                symbols.remove(key);
+            }
+            Some(keys)
+        })
+        .unwrap_or_default();
+    // Do not create a CUDA connection during ELF teardown. Unload only when
+    // this process actually materialized the module earlier.
+    if let Ok(mut state) = STATE.lock() {
+        if let Some(s) = state.as_mut() {
+            for key in function_keys {
+                s.funcs.remove(&key);
+            }
+            for key in symbol_keys {
+                if let Some(symbol) = s.symbols.remove(&key) {
+                    s.dev_allocs.remove(&symbol.address);
+                }
+            }
+            if let Some(module) = s.modules.remove(&fatbin) {
+                let global_addresses: Vec<u64> = s
+                    .symbols
+                    .values()
+                    .filter(|symbol| symbol.module == module)
+                    .map(|symbol| symbol.address)
+                    .collect();
+                s.symbols.retain(|_, symbol| symbol.module != module);
+                for address in global_addresses {
+                    s.dev_allocs.remove(&address);
+                }
+                let _ = s.client.module_unload(module);
+            }
+        }
+    }
     if !handle.is_null() {
         unsafe { drop(Box::from_raw(handle as *mut u8)) };
     }
@@ -3848,12 +4117,7 @@ fn do_launch_inner(
         return CUDA_SUCCESS;
     }
     with_state(|s| {
-        let rec = s
-            .funcs
-            .get(&(func as usize))
-            .ok_or(CUDA_ERROR_INVALID_DEVICE_POINTER)?;
-        let fid = rec.fid;
-        let sizes = rec.param_sizes.clone();
+        let (fid, sizes) = ensure_registered_func(s, func as usize)?;
         // Reconstruct one byte-blob per kernel argument from `args[i]`.
         let params: Vec<Vec<u8>> = if sizes.is_empty() {
             Vec::new()
@@ -4909,8 +5173,8 @@ fn bn_memo_key(func: u16, args: &[u8]) -> Option<Vec<u8>> {
     let mut key = Vec::with_capacity(args.len() * 4);
     key.extend_from_slice(&func.to_le_bytes());
     key.extend_from_slice(&args[..16]);
-    for chunk in args[16..].chunks_exact(8) {
-        let h = u64::from_le_bytes(chunk.try_into().unwrap());
+    for chunk in args[16..].as_chunks::<8>().0 {
+        let h = u64::from_le_bytes(*chunk);
         if h == 0 {
             key.push(0);
             continue;
@@ -5043,6 +5307,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn capture_info_stays_local_for_independent_roots() {
+        let mut captures = HashMap::new();
+        assert_eq!(local_capture_info(&captures, 22), Some((CAPTURE_NONE, 0)));
+        captures.insert(
+            11,
+            CaptureRecord {
+                local_id: 77,
+                host_id: None,
+            },
+        );
+        captures.insert(
+            22,
+            CaptureRecord {
+                local_id: 88,
+                host_id: None,
+            },
+        );
+        assert_eq!(
+            local_capture_info(&captures, 11),
+            Some((CAPTURE_ACTIVE, 77))
+        );
+        assert_eq!(
+            local_capture_info(&captures, 22),
+            Some((CAPTURE_ACTIVE, 88))
+        );
+    }
+
+    #[test]
+    fn unrelated_side_stream_stays_outside_capture() {
+        let captures = HashMap::from([(
+            11,
+            CaptureRecord {
+                local_id: 77,
+                host_id: None,
+            },
+        )]);
+        assert_eq!(local_capture_info(&captures, 22), None);
+    }
+
+    #[test]
+    fn capture_errors_preserve_runtime_codes() {
+        for code in 900..=910 {
+            assert_eq!(map_err(CudaRpcError::Cuda(code)), code);
+        }
+    }
+
+    #[test]
     fn module_image_lengths_cover_ptx_fatbin_and_elf() {
         let ptx = b".version 7.0\0";
         assert_eq!(
@@ -5079,6 +5390,55 @@ mod tests {
             unsafe { module_image_len(oversized_elf.as_ptr().cast()) },
             Err(CUDA_ERROR_INVALID_VALUE)
         );
+    }
+
+    #[test]
+    fn static_registration_stays_local_until_first_use() {
+        let ptx = b".version 7.0\n.entry lazy_test() { ret; }\0";
+        let wrapper = FatBinWrapper {
+            magic: 0x4662_43b1_u32 as c_int,
+            version: 1,
+            data: ptx.as_ptr().cast(),
+            filename_or_fatbins: std::ptr::null(),
+        };
+        let handle = __cudaRegisterFatBinary((&wrapper as *const FatBinWrapper).cast_mut().cast());
+        let host_stub = std::ptr::dangling::<c_char>();
+        __cudaRegisterFunction(
+            handle,
+            host_stub,
+            std::ptr::null_mut(),
+            c"lazy_test".as_ptr(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+
+        assert!(STATIC_MODULES
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|modules| modules.contains_key(&(handle as usize))));
+        assert!(STATIC_FUNCS
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|funcs| funcs.contains_key(&(host_stub as usize))));
+        assert!(STATE.lock().unwrap().is_none());
+
+        __cudaUnregisterFatBinary(handle);
+        assert!(!STATIC_MODULES
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|modules| modules.contains_key(&(handle as usize))));
+        assert!(!STATIC_FUNCS
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|funcs| funcs.contains_key(&(host_stub as usize))));
     }
 
     #[test]

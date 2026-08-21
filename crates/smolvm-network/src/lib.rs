@@ -61,6 +61,7 @@ pub mod device;
 pub mod dns;
 pub mod dns_relay;
 pub mod egress;
+pub mod fabric;
 // The libkrun frame bridge speaks over an AF_UNIX stream socket, available on
 // both Unix and Windows (10 1809+), so the whole stack is cross-platform.
 pub mod frame_stream;
@@ -191,6 +192,22 @@ impl GuestNetworkConfig {
 /// socket by the launcher and read back by the host's `read_egress_denials`.
 pub const EGRESS_DENIALS_LOG: &str = "egress-denials.log";
 
+/// Whether the host can route IPv6 to the internet.
+///
+/// Advertising the guest a global-scope IPv6 address (the ULA link pair) makes
+/// every dual-stack client sort AAAA answers first (RFC 6724) — but the
+/// gateway can only relay v6 flows the host itself can dial. On a v6-less
+/// host every such connection dies, so callers use this probe to withhold the
+/// guest's IPv6 configuration entirely and keep such guests v4-first.
+///
+/// A connected UDP socket performs only a local route lookup — no packets are
+/// sent — which is the same signal the host's own applications act on.
+pub fn host_has_ipv6_route() -> bool {
+    std::net::UdpSocket::bind("[::]:0")
+        .and_then(|socket| socket.connect("[2001:4860:4860::8888]:53"))
+        .is_ok()
+}
+
 pub(crate) fn format_network_log_line(timestamp: SystemTime, message: &str) -> String {
     format!(
         "[{}]: {}",
@@ -285,6 +302,7 @@ pub fn start_virtio_network(
     guest_network: GuestNetworkConfig,
     published_ports: &[PortMapping],
     egress: EgressPolicy,
+    fabric_lease: Option<fabric::FabricLease>,
 ) -> io::Result<VirtioNetworkRuntime> {
     virtio_net_log!(
         "virtio-net: starting runtime guest_ip={} gateway_ip={} dns_server={}",
@@ -293,6 +311,15 @@ pub fn start_virtio_network(
         guest_network.dns_server
     );
     let queues = NetworkFrameQueues::shared(DEFAULT_FRAME_QUEUE_CAPACITY);
+    let fabric = match fabric_lease {
+        Some(lease) => Some(fabric::start_fabric(
+            lease,
+            queues.clone(),
+            guest_network.gateway_mac,
+            guest_network.guest_mac,
+        )?),
+        None => None,
+    };
     let frame_bridge = start_frame_stream_bridge(host_stream, queues.clone())?;
     // tcp_sender sends the accepted TCP connections to the channel
     // tcp_receiver receives the accepted TCP connections via the channel, and let it be consumed in poll thread.
@@ -322,6 +349,7 @@ pub fn start_virtio_network(
         },
         tcp_listeners.as_ref().map(|_| tcp_receiver),
         egress,
+        fabric,
     )?;
 
     Ok(VirtioNetworkRuntime {

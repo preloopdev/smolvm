@@ -78,6 +78,13 @@ struct RunningVmConfig {
     mounts: Vec<HostMount>,
     ports: Vec<PortMapping>,
     resources: VmResources,
+    /// Whether the running VM was launched forkable (memfd-backed RAM). Persisted
+    /// so a config-change restart can re-assert it: without this a routine
+    /// reconfigure relaunches a forkable golden without memfd and silently breaks
+    /// forking — the live VM loses forkability while the control DB still marks
+    /// the machine forkable, so every later fork fails "no memfd-backed RAM".
+    #[serde(default)]
+    forkable: bool,
 }
 
 impl RunningVmConfig {
@@ -184,6 +191,10 @@ struct AgentInner {
     resources: VmResources,
     /// Whether the in-memory config is trustworthy.
     config_state: ConfigState,
+    /// Whether the running VM was launched forkable (memfd-backed RAM). Tracked so
+    /// a config-change restart preserves forkability instead of relaunching a
+    /// forkable golden as a plain VM. Restored from disk on reconnect.
+    forkable: bool,
     /// If true, the agent has been detached and should not be stopped on drop.
     detached: bool,
     /// True for the most recent launch via a fork snapshot. A clone resumes past
@@ -498,6 +509,19 @@ pub fn vm_cache_root() -> PathBuf {
         .join("vms")
 }
 
+/// Registry directory for a named inter-VM network
+/// (`<cache_dir>/smolvm/net/<hash16>/`), a sibling of the VM data dirs. Each
+/// member VM binds its fabric subnet's Unix socket here; the same 16-char
+/// name hash as [`vm_data_dir`] keeps every socket path inside the kernel's
+/// `sockaddr_un` budget regardless of the network's name.
+pub fn network_registry_dir(network: &str) -> PathBuf {
+    vm_cache_root()
+        .parent()
+        .map(|smolvm_root| smolvm_root.join("net"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/smolvm-net"))
+        .join(vm_dir_hash(network))
+}
+
 /// Per-node registry for the collision-free per-VM uid allocator
 /// (`<cache_dir>/smolvm/uids/`), a sibling of the VM data dirs. Root-managed; the
 /// dropped VMMs never touch it. See `process::allocate_vm_uid`.
@@ -798,6 +822,7 @@ impl AgentManager {
                 ports: Vec::new(),
                 resources: VmResources::default(),
                 config_state: ConfigState::Unknown,
+                forkable: false,
                 detached: false,
                 is_clone: false,
                 is_cuda_clone: false,
@@ -1193,6 +1218,7 @@ impl AgentManager {
                             inner.mounts = config.mounts;
                             inner.ports = config.ports;
                             inner.resources = config.resources;
+                            inner.forkable = config.forkable;
                             inner.config_state = ConfigState::Known;
                         }
                         Err(reason) => {
@@ -1236,6 +1262,9 @@ impl AgentManager {
             mounts: mounts.to_vec(),
             ports: ports.to_vec(),
             resources: resources.clone(),
+            // Read from inner: the launch path sets `inner.forkable` before this
+            // runs, so the persisted config records how the VM was actually booted.
+            forkable: self.inner.lock().forkable,
         };
         match serde_json::to_string(&config) {
             Ok(json) => {
@@ -1476,6 +1505,16 @@ impl AgentManager {
         // Re-attach packed layers if a config-change restart dropped them
         // (see `rewire_packed_layers_if_extracted`).
         self.rewire_packed_layers_if_extracted(&mut features)?;
+
+        // Preserve forkability across the restart. `forkable` is durable in the
+        // control DB, but this path uses whatever features the caller assembled —
+        // usually non-forkable — so without this a routine reconfigure relaunches
+        // a forkable golden without memfd-backed RAM, silently breaking every
+        // later fork. `stop()` above leaves `inner.forkable` intact, so it still
+        // reflects how the VM was actually running.
+        if self.inner.lock().forkable {
+            features.forkable = true;
+        }
 
         // Start with new config
         self.start_with_full_config(mounts, ports, resources, features)?;
@@ -2010,6 +2049,7 @@ impl AgentManager {
             let mut inner = self.inner.lock();
             inner.is_clone = fork_clone;
             inner.is_cuda_clone = cuda_clone;
+            inner.forkable = features.forkable;
         }
 
         // Per-VM uid isolation: when running privileged (root `serve`), give this
@@ -2074,6 +2114,15 @@ impl AgentManager {
                 crate::process::ensure_traversable(&self.rootfs_path);
                 if let Some(home) = dirs::home_dir() {
                     crate::process::ensure_traversable(&home.join(".smolvm"));
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    // VM-mode `create --from` qcow2 disks point at immutable bases
+                    // in the node-wide COW store. libkrun opens those paths after
+                    // this process drops to the per-VM uid, so make the store's
+                    // ancestor chain traversable (the store itself remains
+                    // non-listable and Landlock grants only this VM's exact chain).
+                    crate::process::ensure_traversable(&crate::storage::cow_base_cache_root());
                 }
                 // Pre-create this VM's per-VM readiness marker owned by its uid
                 // (0600): the dropped guest can overwrite it but couldn't create a
@@ -2413,6 +2462,13 @@ impl AgentManager {
         // Re-attach packed layers if a config-change restart dropped them
         // (see `rewire_packed_layers_if_extracted`).
         self.rewire_packed_layers_if_extracted(&mut features)?;
+
+        // Preserve forkability across the restart (see the note in
+        // `ensure_running_with_full_config`): a reconfigure must not silently
+        // relaunch a forkable golden without memfd-backed RAM.
+        if self.inner.lock().forkable {
+            features.forkable = true;
+        }
 
         self.start_via_subprocess(mounts, ports, resources, features)?;
         Ok(true)
@@ -3116,6 +3172,38 @@ mod tests {
     fn restored_cuda_clones_fail_faster_than_other_boots() {
         assert_eq!(agent_ready_timeout(true), Duration::from_secs(10));
         assert_eq!(agent_ready_timeout(false), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn running_config_persists_forkable_and_stays_backward_compatible() {
+        // Round-trip: forkable survives save/load, so a config-change restart can
+        // re-assert it — the fix for a golden silently losing memfd-backed RAM
+        // when a routine reconfigure relaunches it without SMOLVM_FORKABLE.
+        let cfg = RunningVmConfig {
+            version: RunningVmConfig::CURRENT_VERSION,
+            mounts: Vec::new(),
+            ports: Vec::new(),
+            resources: VmResources::default(),
+            forkable: true,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: RunningVmConfig = serde_json::from_str(&json).unwrap();
+        assert!(
+            back.forkable,
+            "forkable must round-trip through the config file"
+        );
+
+        // Backward compatibility: a config written before this field existed (drop
+        // it from a real serialization) must still load, defaulting to
+        // non-forkable rather than failing the reconnect and forcing a restart.
+        let mut val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        val.as_object_mut().unwrap().remove("forkable");
+        let parsed: RunningVmConfig =
+            serde_json::from_value(val).expect("a pre-forkable config must still deserialize");
+        assert!(
+            !parsed.forkable,
+            "a missing forkable field defaults to false"
+        );
     }
 
     /// The three denial shapes the virtio-net runtime emits parse into

@@ -744,8 +744,10 @@ impl<S: Read + Write> Client<S> {
             | Op::StreamQuery
             | Op::EventQuery
             | Op::EventCreate
+            | Op::EventCreateBatch
             | Op::EventDestroy
             | Op::EventElapsedTime
+            | Op::CtxGetStreamPriorityRange
             | Op::StreamCaptureInfo => {}
             _ => self.clean = false,
         }
@@ -1113,28 +1115,56 @@ impl<S: Read + Write> Client<S> {
     pub fn memcpy_htod(&mut self, dptr: u64, data: &[u8], stream: u64) -> Result<()> {
         // Deferred: the bytes are copied into the request, so the caller may
         // reuse its buffer immediately — synchronous-memcpy semantics hold.
-        self.call_deferred(
-            &Request::MemcpyHtoD {
-                dptr,
-                stream,
-                data: data.to_vec(),
-            },
-            Op::MemcpyHtoD,
-        )
+        // Chunk here (rather than only in the runtime shim) because CUDA
+        // libraries and static runtimes call the driver shim directly. Large
+        // embedding tensors routinely exceed the protocol's 256 MiB frame.
+        const CHUNK: usize = 64 * 1024 * 1024;
+        for (offset, chunk) in data.chunks(CHUNK).enumerate() {
+            let chunk_dptr = dptr
+                .checked_add((offset * CHUNK) as u64)
+                .ok_or(CudaRpcError::Protocol("copy address overflow"))?;
+            self.call_deferred(
+                &Request::MemcpyHtoD {
+                    dptr: chunk_dptr,
+                    stream,
+                    data: chunk.to_vec(),
+                },
+                Op::MemcpyHtoD,
+            )?;
+        }
+        Ok(())
     }
 
     pub fn memcpy_dtoh(&mut self, dptr: u64, bytes: u64, stream: u64) -> Result<Vec<u8>> {
-        match self.call(
-            &Request::MemcpyDtoH {
-                dptr,
-                bytes,
-                stream,
-            },
-            Op::MemcpyDtoH,
-        )? {
-            Response::Data(d) => Ok(d),
-            _ => Err(CudaRpcError::Protocol("expected Data")),
+        const CHUNK: u64 = 64 * 1024 * 1024;
+        let capacity = usize::try_from(bytes)
+            .map_err(|_| CudaRpcError::Protocol("copy size exceeds address space"))?;
+        let mut out = Vec::with_capacity(capacity);
+        let mut offset = 0_u64;
+        while offset < bytes {
+            let count = (bytes - offset).min(CHUNK);
+            let chunk_dptr = dptr
+                .checked_add(offset)
+                .ok_or(CudaRpcError::Protocol("copy address overflow"))?;
+            match self.call(
+                &Request::MemcpyDtoH {
+                    dptr: chunk_dptr,
+                    bytes: count,
+                    stream,
+                },
+                Op::MemcpyDtoH,
+            )? {
+                Response::Data(data) if data.len() == count as usize => {
+                    out.extend_from_slice(&data)
+                }
+                Response::Data(_) => {
+                    return Err(CudaRpcError::Protocol("invalid memcpy response length"));
+                }
+                _ => return Err(CudaRpcError::Protocol("expected Data")),
+            }
+            offset += count;
         }
+        Ok(out)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1193,13 +1223,18 @@ impl<S: Read + Write> Client<S> {
         )
     }
 
-    /// Fire-and-forget end-capture: the guest supplies a virtual graph handle
-    /// it minted; the host maps it to the real captured graph when it drains.
-    pub fn stream_end_capture_deferred(&mut self, stream: u64, graph_vh: u64) -> Result<()> {
-        self.call_deferred(
+    /// End capture synchronously so capture invalidation is reported by
+    /// `cudaStreamEndCapture` instead of being deferred until a later fence.
+    /// Returns the real node count with the same response, avoiding the extra
+    /// graph-introspection RTT frameworks otherwise pay after every capture.
+    pub fn stream_end_capture(&mut self, stream: u64, graph_vh: u64) -> Result<u64> {
+        match self.call(
             &Request::StreamEndCapture { stream, graph_vh },
             Op::StreamEndCapture,
-        )
+        )? {
+            Response::Pair(_, node_count) => Ok(node_count),
+            _ => Err(CudaRpcError::Protocol("expected Pair")),
+        }
     }
 
     /// `(capture_status, capture_id)` straight from the host driver.
@@ -1222,6 +1257,18 @@ impl<S: Read + Write> Client<S> {
         )
     }
 
+    /// Instantiate synchronously: unlike graph launch, instantiation is a
+    /// validation API and must return malformed/invalid graph errors directly.
+    pub fn graph_instantiate(&mut self, graph: u64, exec_vh: u64) -> Result<()> {
+        match self.call(
+            &Request::GraphInstantiate { graph, exec_vh },
+            Op::GraphInstantiate,
+        )? {
+            Response::Handle(_) => Ok(()),
+            _ => Err(CudaRpcError::Protocol("expected Handle")),
+        }
+    }
+
     /// Replay an instantiated graph — the hot path (one message replays every
     /// captured kernel), so it pipelines like a kernel launch.
     pub fn graph_launch(&mut self, graph_exec: u64, stream: u64) -> Result<()> {
@@ -1229,6 +1276,19 @@ impl<S: Read + Write> Client<S> {
             &Request::GraphLaunch { graph_exec, stream },
             Op::GraphLaunch,
         )
+    }
+
+    /// Patch an instantiated graph from a topology-compatible captured graph.
+    /// The returned value is `cudaGraphExecUpdateResult`; transport/driver
+    /// failures remain ordinary RPC errors.
+    pub fn graph_exec_update(&mut self, graph_exec: u64, graph: u64) -> Result<i32> {
+        match self.call(
+            &Request::GraphExecUpdate { graph_exec, graph },
+            Op::GraphExecUpdate,
+        )? {
+            Response::Count(result) => Ok(result),
+            _ => Err(CudaRpcError::Protocol("expected Count")),
+        }
     }
 
     /// Node count of a captured graph (count-only query; PyTorch uses it to
@@ -1297,6 +1357,16 @@ impl<S: Read + Write> Client<S> {
         match self.take_sticky() {
             0 => Ok(()),
             code => Err(CudaRpcError::Cuda(code)),
+        }
+    }
+
+    pub fn ctx_get_stream_priority_range(&mut self) -> Result<(i32, i32)> {
+        match self.call(
+            &Request::CtxGetStreamPriorityRange,
+            Op::CtxGetStreamPriorityRange,
+        )? {
+            Response::Pair(least, greatest) => Ok((least as i64 as i32, greatest as i64 as i32)),
+            _ => Err(CudaRpcError::Protocol("expected Pair")),
         }
     }
 
@@ -1379,8 +1449,10 @@ impl<S: Read + Write> Client<S> {
             Op::FuncGetParamInfo,
         )? {
             Response::Data(d) if d.len() % 4 == 0 => Ok(d
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c))
                 .collect()),
             _ => Err(CudaRpcError::Protocol("expected u32-array Data")),
         }
@@ -1470,6 +1542,25 @@ impl<S: Read + Write> Client<S> {
         match self.call(&Request::EventCreate { flags }, Op::EventCreate)? {
             Response::Handle(h) => Ok(h),
             _ => Err(CudaRpcError::Protocol("expected Handle")),
+        }
+    }
+
+    /// Provision several raw host events with identical flags in one blocking
+    /// call. Individual event use and destruction remain unchanged; this only
+    /// amortizes the synchronous handle-return path used by high-churn runtimes.
+    pub fn event_create_batch(&mut self, flags: u32, count: u32) -> Result<Vec<u64>> {
+        match self.call(
+            &Request::EventCreateBatch { flags, count },
+            Op::EventCreateBatch,
+        )? {
+            Response::Data(bytes) if bytes.len() == count as usize * 8 => Ok(bytes
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|chunk| u64::from_le_bytes(*chunk))
+                .collect()),
+            Response::Data(_) => Err(CudaRpcError::Protocol("invalid event batch length")),
+            _ => Err(CudaRpcError::Protocol("expected Data")),
         }
     }
 

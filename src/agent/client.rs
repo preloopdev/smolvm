@@ -19,6 +19,29 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Metadata applied to an uploaded file after it lands: permissions and
+/// ownership. Ownership matters for non-root workload images — a root-owned
+/// upload is unreadable/unwritable to the user the container actually runs as.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FileWriteMeta {
+    /// File mode (e.g. 0o644). None = the agent's default.
+    pub mode: Option<u32>,
+    /// Owner uid. None = leave as written.
+    pub uid: Option<u32>,
+    /// Owner gid. None = leave as written.
+    pub gid: Option<u32>,
+}
+
+impl FileWriteMeta {
+    /// The pre-existing mode-only shape, for callers without ownership needs.
+    pub fn mode_only(mode: Option<u32>) -> Self {
+        Self {
+            mode,
+            ..Self::default()
+        }
+    }
+}
+
 /// Events from a streaming exec session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecEvent {
@@ -1936,7 +1959,7 @@ impl AgentClient {
     ///   limit — without it the send blocks the socket (EAGAIN
     ///   after write timeout) and risks OOMing the guest agent.
     pub fn write_file(&mut self, path: &str, data: &[u8], mode: Option<u32>) -> Result<()> {
-        self.write_file_with_progress(path, data, mode, |_| {})
+        self.write_file_with_progress(path, data, FileWriteMeta::mode_only(mode), |_| {})
     }
 
     /// Write a file into the VM with a progress callback.
@@ -1949,20 +1972,22 @@ impl AgentClient {
         &mut self,
         path: &str,
         data: &[u8],
-        mode: Option<u32>,
+        meta: FileWriteMeta,
         mut on_progress: F,
     ) -> Result<()> {
         if data.len() <= FILE_WRITE_SINGLE_SHOT_MAX {
             let resp = self.request(&AgentRequest::FileWrite {
                 path: path.to_string(),
                 data: data.to_vec(),
-                mode,
+                mode: meta.mode,
+                uid: meta.uid,
+                gid: meta.gid,
             })?;
             expect_ok(resp, "write file")?;
             on_progress(data.len() as u64);
             Ok(())
         } else {
-            self.write_file_streaming(path, data, mode, &mut on_progress)
+            self.write_file_streaming(path, data, meta, &mut on_progress)
         }
     }
 
@@ -1971,14 +1996,14 @@ impl AgentClient {
         &mut self,
         path: &str,
         data: &[u8],
-        mode: Option<u32>,
+        meta: FileWriteMeta,
         on_progress: &mut F,
     ) -> Result<()> {
         self.write_file_streaming_from_reader(
             path,
             &mut std::io::Cursor::new(data),
             data.len() as u64,
-            mode,
+            meta,
             on_progress,
         )
     }
@@ -1996,7 +2021,13 @@ impl AgentClient {
         total_size: u64,
         mode: Option<u32>,
     ) -> Result<()> {
-        self.write_file_from_reader_with_progress(path, reader, total_size, mode, |_| {})
+        self.write_file_from_reader_with_progress(
+            path,
+            reader,
+            total_size,
+            FileWriteMeta::mode_only(mode),
+            |_| {},
+        )
     }
 
     /// Stream a file from a [`Read`] source with progress callback.
@@ -2005,7 +2036,7 @@ impl AgentClient {
         path: &str,
         reader: R,
         total_size: u64,
-        mode: Option<u32>,
+        meta: FileWriteMeta,
         mut on_progress: F,
     ) -> Result<()> {
         if total_size <= FILE_WRITE_SINGLE_SHOT_MAX as u64 {
@@ -2013,13 +2044,13 @@ impl AgentClient {
             let mut data = Vec::with_capacity(total_size as usize);
             std::io::Read::read_to_end(&mut std::io::Read::take(reader, total_size), &mut data)
                 .map_err(|e| Error::agent("read source file", e.to_string()))?;
-            return self.write_file_with_progress(path, &data, mode, on_progress);
+            return self.write_file_with_progress(path, &data, meta, on_progress);
         }
         self.write_file_streaming_from_reader(
             path,
             &mut { reader },
             total_size,
-            mode,
+            meta,
             &mut on_progress,
         )
     }
@@ -2032,12 +2063,14 @@ impl AgentClient {
         path: &str,
         reader: &mut R,
         total_size: u64,
-        mode: Option<u32>,
+        meta: FileWriteMeta,
         on_progress: &mut F,
     ) -> Result<()> {
         let resp = self.request(&AgentRequest::FileWriteBegin {
             path: path.to_string(),
-            mode,
+            mode: meta.mode,
+            uid: meta.uid,
+            gid: meta.gid,
             total_size,
         })?;
         expect_ok(resp, "begin streaming write")?;
@@ -2132,6 +2165,26 @@ impl AgentClient {
         &mut self,
         guest_path: &str,
         local_path: &std::path::Path,
+        on_progress: F,
+    ) -> Result<u64> {
+        self.read_file_to_path_capped(
+            guest_path,
+            local_path,
+            file_transfer_max_total(),
+            on_progress,
+        )
+    }
+
+    /// [`Self::read_file_to_path`] with an explicit byte ceiling.
+    ///
+    /// The pack paths read back a layer smolvm itself asked the guest to
+    /// produce, so they pass [`pack_export_max_total`] instead of the general
+    /// guest-driven transfer bound.
+    pub fn read_file_to_path_capped<F: FnMut(u64)>(
+        &mut self,
+        guest_path: &str,
+        local_path: &std::path::Path,
+        cap: u64,
         mut on_progress: F,
     ) -> Result<u64> {
         use std::io::Write;
@@ -2150,7 +2203,6 @@ impl AgentClient {
         })?;
 
         let mut total = 0u64;
-        let cap = file_transfer_max_total();
         loop {
             match self.recv_raw()? {
                 AgentResponse::DataChunk { data, done } => {
@@ -2541,6 +2593,25 @@ pub fn file_transfer_max_total() -> u64 {
         .unwrap_or(FILE_TRANSFER_MAX_TOTAL)
 }
 
+/// Default ceiling for pack-export reads (64 GiB).
+const PACK_EXPORT_MAX_TOTAL: u64 = 64 << 30;
+
+/// The size cap for pack-export reads, in bytes. Defaults to 64 GiB and honors
+/// the same `SMOLVM_FILE_TRANSFER_MAX_BYTES` override as
+/// [`file_transfer_max_total`].
+///
+/// Pack export reads back a layer smolvm itself asked the guest to write, and a
+/// provisioned machine's flattened rootfs is routinely tens of GiB, so the
+/// general transfer bound — sized for `machine cp` against a guest that chooses
+/// its own payload — is the wrong ceiling here. Every pack read shares this one
+/// so the routes of a single export cannot disagree.
+pub fn pack_export_max_total() -> u64 {
+    std::env::var("SMOLVM_FILE_TRANSFER_MAX_BYTES")
+        .ok()
+        .and_then(|s| crate::util::parse_size_bytes(s.trim()).ok())
+        .unwrap_or(PACK_EXPORT_MAX_TOTAL)
+}
+
 fn consume_streamed_read_with_progress<F, P>(next_response: F, on_progress: P) -> Result<Vec<u8>>
 where
     F: FnMut() -> Result<AgentResponse>,
@@ -2639,6 +2710,15 @@ mod read_cap_tests {
     fn read_cap_terminator_returns_full_buffer() {
         let out = drive(vec![chunk(100, false), chunk(50, true)]).unwrap();
         assert_eq!(out.len(), 150);
+    }
+
+    // Pack export reads back a layer smolvm asked the guest to produce, not a
+    // guest-chosen payload, so its ceiling must never be the more restrictive
+    // of the two. Holds with or without the shared override, since both caps
+    // read it.
+    #[test]
+    fn pack_export_cap_is_never_below_the_transfer_cap() {
+        assert!(pack_export_max_total() >= file_transfer_max_total());
     }
 
     #[test]

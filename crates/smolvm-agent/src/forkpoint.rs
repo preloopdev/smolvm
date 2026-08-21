@@ -242,6 +242,18 @@ mod tests {
     use super::*;
     use crate::oci::{OciSpec, ProcessIdentity};
 
+    fn wait_for_marker(path: &Path) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !path.is_file() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            path.is_file(),
+            "marker was not published: {}",
+            path.display()
+        );
+    }
+
     fn spec() -> OciSpec {
         OciSpec::new(
             &["true".to_string()],
@@ -327,13 +339,7 @@ mod tests {
                 false,
             )
         });
-        for _ in 0..100 {
-            if ready.is_file() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert!(ready.is_file());
+        wait_for_marker(&ready);
         assert_eq!(
             std::fs::read_to_string(&ready).unwrap(),
             ready_content(false)
@@ -368,13 +374,7 @@ mod tests {
                 false,
             )
         });
-        for _ in 0..100 {
-            if ready.is_file() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert!(ready.is_file());
+        wait_for_marker(&ready);
         assert!(!restored.exists());
         std::fs::write(&release, b"release\n").unwrap();
         helper.join().unwrap().unwrap();

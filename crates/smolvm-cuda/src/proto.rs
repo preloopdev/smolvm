@@ -55,6 +55,7 @@ pub enum Op {
     CtxDestroy = 0x11,
     PrimaryCtxRetain = 0x12,
     PrimaryCtxRelease = 0x13,
+    CtxGetStreamPriorityRange = 0x14,
     ModuleLoadData = 0x20,
     ModuleGetFunction = 0x21,
     ModuleUnload = 0x22,
@@ -95,6 +96,11 @@ pub enum Op {
     EventElapsedTime = 0x74,
     StreamWaitEvent = 0x75,
     EventQuery = 0x76,
+    /// Create several same-flag events in one round trip. Frameworks commonly
+    /// churn thousands of short-lived events; batching only the handle-return
+    /// control plane preserves ordinary CUDA semantics while removing most of
+    /// that synchronous remoting tax.
+    EventCreateBatch = 0x77,
     // CUDA graphs: capture forwarded to the host driver (which records the
     // stream's work into a graph), replayed with a single GraphLaunch.
     StreamBeginCapture = 0xC0,
@@ -110,6 +116,7 @@ pub enum Op {
     MemcpyDtoDAsync = 0xC8,
     GraphGetNodes = 0xC9,
     ThreadExchangeCaptureMode = 0xCA,
+    GraphExecUpdate = 0xCB,
     // nvcomp (forward-to-host-lib): batched Deflate decompression. Device-pointer
     // args are real host device addresses, forwarded by value.
     NvcompDeflateTempSize = 0x80,
@@ -181,6 +188,7 @@ impl Op {
             0x11 => Op::CtxDestroy,
             0x12 => Op::PrimaryCtxRetain,
             0x13 => Op::PrimaryCtxRelease,
+            0x14 => Op::CtxGetStreamPriorityRange,
             0x20 => Op::ModuleLoadData,
             0x21 => Op::ModuleGetFunction,
             0x22 => Op::ModuleUnload,
@@ -221,6 +229,7 @@ impl Op {
             0xC8 => Op::MemcpyDtoDAsync,
             0xC9 => Op::GraphGetNodes,
             0xCA => Op::ThreadExchangeCaptureMode,
+            0xCB => Op::GraphExecUpdate,
             0x60 => Op::StreamCreate,
             0x61 => Op::StreamDestroy,
             0x62 => Op::StreamSynchronize,
@@ -232,6 +241,7 @@ impl Op {
             0x74 => Op::EventElapsedTime,
             0x75 => Op::StreamWaitEvent,
             0x76 => Op::EventQuery,
+            0x77 => Op::EventCreateBatch,
             0x80 => Op::NvcompDeflateTempSize,
             0x81 => Op::NvcompDeflateDecompress,
             0x90 => Op::CublasCreate,
@@ -307,6 +317,7 @@ pub enum Request {
     PrimaryCtxRelease {
         device: i32,
     },
+    CtxGetStreamPriorityRange,
     ModuleLoadData {
         image: Vec<u8>,
     },
@@ -468,6 +479,10 @@ pub enum Request {
         graph_exec: u64,
         stream: u64,
     },
+    GraphExecUpdate {
+        graph_exec: u64,
+        graph: u64,
+    },
     GraphExecDestroy {
         graph_exec: u64,
     },
@@ -529,6 +544,10 @@ pub enum Request {
     },
     EventCreate {
         flags: u32,
+    },
+    EventCreateBatch {
+        flags: u32,
+        count: u32,
     },
     EventDestroy {
         event: u64,
@@ -920,6 +939,9 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             w_u8(&mut b, Op::PrimaryCtxRelease as u8);
             w_i32(&mut b, *device);
         }
+        Request::CtxGetStreamPriorityRange => {
+            w_u8(&mut b, Op::CtxGetStreamPriorityRange as u8);
+        }
         Request::ModuleLoadData { image } => {
             w_u8(&mut b, Op::ModuleLoadData as u8);
             w_bytes(&mut b, image);
@@ -1127,6 +1149,11 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             w_u64(&mut b, *graph_exec);
             w_u64(&mut b, *stream);
         }
+        Request::GraphExecUpdate { graph_exec, graph } => {
+            w_u8(&mut b, Op::GraphExecUpdate as u8);
+            w_u64(&mut b, *graph_exec);
+            w_u64(&mut b, *graph);
+        }
         Request::GraphExecDestroy { graph_exec } => {
             w_u8(&mut b, Op::GraphExecDestroy as u8);
             w_u64(&mut b, *graph_exec);
@@ -1204,6 +1231,11 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
         Request::EventCreate { flags } => {
             w_u8(&mut b, Op::EventCreate as u8);
             w_u32(&mut b, *flags);
+        }
+        Request::EventCreateBatch { flags, count } => {
+            w_u8(&mut b, Op::EventCreateBatch as u8);
+            w_u32(&mut b, *flags);
+            w_u32(&mut b, *count);
         }
         Request::EventDestroy { event } => {
             w_u8(&mut b, Op::EventDestroy as u8);
@@ -1496,6 +1528,7 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
         Op::CtxDestroy => Request::CtxDestroy { ctx: c.u64()? },
         Op::PrimaryCtxRetain => Request::PrimaryCtxRetain { device: c.i32()? },
         Op::PrimaryCtxRelease => Request::PrimaryCtxRelease { device: c.i32()? },
+        Op::CtxGetStreamPriorityRange => Request::CtxGetStreamPriorityRange,
         Op::ModuleLoadData => Request::ModuleLoadData { image: c.bytes()? },
         Op::ModuleGetFunction => Request::ModuleGetFunction {
             module: c.u64()?,
@@ -1634,6 +1667,10 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
             graph_exec: c.u64()?,
             stream: c.u64()?,
         },
+        Op::GraphExecUpdate => Request::GraphExecUpdate {
+            graph_exec: c.u64()?,
+            graph: c.u64()?,
+        },
         Op::GraphExecDestroy => Request::GraphExecDestroy {
             graph_exec: c.u64()?,
         },
@@ -1664,6 +1701,10 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
         },
         Op::EventQuery => Request::EventQuery { event: c.u64()? },
         Op::EventCreate => Request::EventCreate { flags: c.u32()? },
+        Op::EventCreateBatch => Request::EventCreateBatch {
+            flags: c.u32()?,
+            count: c.u32()?,
+        },
         Op::EventDestroy => Request::EventDestroy { event: c.u64()? },
         Op::EventRecord => Request::EventRecord {
             event: c.u64()?,
@@ -1885,7 +1926,10 @@ pub fn decode_response(op: Op, payload: &[u8]) -> io::Result<(i32, Response)> {
         | Op::DeviceGetMemPool => Response::Handle(c.u64()?),
         Op::ModuleLoadData | Op::ModuleGetFunction => Response::Handle(c.u64()?),
         Op::StreamCreate | Op::EventCreate => Response::Handle(c.u64()?),
-        Op::StreamEndCapture | Op::GraphInstantiate => Response::Handle(c.u64()?),
+        Op::EventCreateBatch => Response::Data(c.bytes()?),
+        Op::StreamEndCapture => Response::Pair(c.u64()?, c.u64()?),
+        Op::CtxGetStreamPriorityRange => Response::Pair(c.u64()?, c.u64()?),
+        Op::GraphInstantiate => Response::Handle(c.u64()?),
         Op::GraphGetNodes => Response::Bytes(c.u64()?),
         Op::StreamCaptureInfo => Response::Pair(c.u64()?, c.u64()?),
         Op::MemAlloc | Op::MemAllocFromPoolAsync | Op::MemAllocAsync => Response::Dptr(c.u64()?),
@@ -1899,7 +1943,7 @@ pub fn decode_response(op: Op, payload: &[u8]) -> io::Result<(i32, Response)> {
         // nvcomp calls carry their own nvcompStatus in the body (transport
         // status stays 0): TempSize -> (status, temp_bytes); Decompress -> status.
         Op::NvcompDeflateTempSize => Response::Pair(c.u64()?, c.u64()?),
-        Op::NvcompDeflateDecompress => Response::Count(c.i32()?),
+        Op::NvcompDeflateDecompress | Op::GraphExecUpdate => Response::Count(c.i32()?),
         Op::CublasCreate => Response::Handle(c.u64()?),
         Op::LibCall => Response::LibResult(c.i32()?, c.bytes()?),
         Op::EventElapsedTime => Response::Millis(f32::from_bits(c.u32()?)),
@@ -2106,6 +2150,7 @@ mod tests {
         });
         roundtrip(Request::PrimaryCtxRetain { device: 0 });
         roundtrip(Request::PrimaryCtxRelease { device: 0 });
+        roundtrip(Request::CtxGetStreamPriorityRange);
         roundtrip(Request::ModuleUnload { module: 7 });
         roundtrip(Request::ModuleGetGlobal {
             module: 7,
@@ -2132,6 +2177,10 @@ mod tests {
         roundtrip(Request::StreamDestroy { stream: 3 });
         roundtrip(Request::StreamSynchronize { stream: 3 });
         roundtrip(Request::EventCreate { flags: 0 });
+        roundtrip(Request::EventCreateBatch {
+            flags: 2,
+            count: 64,
+        });
         roundtrip(Request::EventDestroy { event: 4 });
         roundtrip(Request::EventRecord {
             event: 4,
@@ -2147,6 +2196,10 @@ mod tests {
         });
         roundtrip(Request::EventQuery { event: 4 });
         roundtrip(Request::ThreadExchangeCaptureMode { mode: 2 });
+        roundtrip(Request::GraphExecUpdate {
+            graph_exec: 0x8000_0000_0000_0011,
+            graph: 0x8000_0000_0000_0022,
+        });
         roundtrip(Request::PublishTensorBundle {
             manifest: br#"{"name":"adapter"}"#.to_vec(),
             tensors: vec![(0x1000, 64), (0x2200, 128)],
@@ -2161,6 +2214,10 @@ mod tests {
             (Op::DeviceGetUuid, Response::Data(vec![0u8; 16])),
             (Op::PrimaryCtxRetain, Response::Handle(11)),
             (
+                Op::CtxGetStreamPriorityRange,
+                Response::Pair(0, (-5_i64) as u64),
+            ),
+            (
                 Op::FuncGetParamInfo,
                 Response::Data(vec![8, 0, 0, 0, 4, 0, 0, 0]),
             ),
@@ -2168,7 +2225,17 @@ mod tests {
             (Op::MemGetInfo, Response::Pair(6 << 30, 8 << 30)),
             (Op::StreamCreate, Response::Handle(21)),
             (Op::EventCreate, Response::Handle(22)),
+            (
+                Op::EventCreateBatch,
+                Response::Data(
+                    [22_u64, 23]
+                        .into_iter()
+                        .flat_map(u64::to_le_bytes)
+                        .collect(),
+                ),
+            ),
             (Op::EventElapsedTime, Response::Millis(1.25)),
+            (Op::GraphExecUpdate, Response::Count(0)),
             (
                 Op::PublishTensorBundle,
                 Response::Data(b"one-use-token".to_vec()),

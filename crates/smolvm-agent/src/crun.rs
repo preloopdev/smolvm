@@ -275,7 +275,8 @@ impl CrunCommand {
         let mut c = Self::new();
         c.cmd.arg("exec").arg("--tty");
         c.cmd.arg("--console-socket").arg(console_socket);
-        let env_with_path = crate::cuda::augment_exec_env(ensure_path_in_env(env));
+        let env_with_path =
+            crate::vulkan::augment_exec_env(crate::cuda::augment_exec_env(ensure_path_in_env(env)));
         for (key, value) in &env_with_path {
             c.cmd.arg("--env").arg(format!("{}={}", key, value));
         }
@@ -345,7 +346,8 @@ impl CrunCommand {
             c.cmd.arg("--tty");
         }
         // Ensure PATH is set for command lookup; forward CUDA zero-copy opt-in.
-        let env_with_path = crate::cuda::augment_exec_env(ensure_path_in_env(env));
+        let env_with_path =
+            crate::vulkan::augment_exec_env(crate::cuda::augment_exec_env(ensure_path_in_env(env)));
         for (key, value) in &env_with_path {
             c.cmd.arg("--env").arg(format!("{}={}", key, value));
         }
@@ -380,7 +382,8 @@ impl CrunCommand {
             // report it back (the run-background contract returns a PID).
             c.cmd.arg("--pid-file").arg(pf);
         }
-        let env_with_path = crate::cuda::augment_exec_env(ensure_path_in_env(env));
+        let env_with_path =
+            crate::vulkan::augment_exec_env(crate::cuda::augment_exec_env(ensure_path_in_env(env)));
         for (key, value) in &env_with_path {
             c.cmd.arg("--env").arg(format!("{}={}", key, value));
         }
