@@ -26,12 +26,12 @@ const CUDA_ERROR_INVALID_VALUE: c_int = 1;
 const CUDA_ERROR_INVALID_HANDLE: c_int = 400;
 const CUDA_ERROR_NOT_SUPPORTED: c_int = 801;
 
-/// CUfunction handles are process-local driver objects.  A remoted guest can
-/// accidentally send one of its own code pointers (static libcudart does this
-/// for unavailable fallback kernels), and NVIDIA's driver dereferences rather
-/// than validates some such values.  Record every function minted in this
-/// daemon process so untrusted wire handles fail as INVALID_HANDLE instead of
-/// taking down the shared CUDA daemon.
+/// CUfunction and CUkernel handles are process-local driver objects. A remoted
+/// guest can accidentally send one of its own code pointers (static libcudart
+/// does this for unavailable fallback kernels), and NVIDIA's driver
+/// dereferences rather than validates some such values. Record every
+/// launchable minted in this daemon process so untrusted wire handles fail as
+/// INVALID_HANDLE instead of taking down the shared CUDA daemon.
 fn live_cuda_functions() -> &'static std::sync::Mutex<std::collections::HashSet<u64>> {
     static FUNCTIONS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u64>>> =
         std::sync::OnceLock::new();
@@ -103,6 +103,7 @@ pub struct GpuBackend {
     ctx_destroy: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
     ctx_set_current: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
     ctx_get_current: unsafe extern "C" fn(*mut *mut c_void) -> CuResultCode,
+    ctx_get_stream_priority_range: unsafe extern "C" fn(*mut c_int, *mut c_int) -> CuResultCode,
     primary_ctx_retain: unsafe extern "C" fn(*mut *mut c_void, c_int) -> CuResultCode,
     primary_ctx_release: unsafe extern "C" fn(c_int) -> CuResultCode,
     module_load_data: unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> CuResultCode,
@@ -111,6 +112,7 @@ pub struct GpuBackend {
     module_get_global:
         unsafe extern "C" fn(*mut u64, *mut usize, *mut c_void, *const c_char) -> CuResultCode,
     module_unload: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
+    module_get_loading_mode: Option<unsafe extern "C" fn(*mut c_int) -> CuResultCode>,
     library_load_data: Option<
         unsafe extern "C" fn(
             *mut *mut c_void,
@@ -129,12 +131,20 @@ pub struct GpuBackend {
     library_get_module: Option<unsafe extern "C" fn(*mut *mut c_void, *mut c_void) -> CuResultCode>,
     kernel_get_function:
         Option<unsafe extern "C" fn(*mut *mut c_void, *mut c_void) -> CuResultCode>,
+    kernel_get_attribute:
+        Option<unsafe extern "C" fn(*mut c_int, c_int, *mut c_void, c_int) -> CuResultCode>,
+    kernel_set_attribute:
+        Option<unsafe extern "C" fn(c_int, c_int, *mut c_void, c_int) -> CuResultCode>,
     cuda_library_builds: std::collections::HashMap<u64, (u32, Vec<Vec<u8>>)>,
     next_cuda_library_build: u64,
     live_cuda_libraries: std::collections::HashSet<u64>,
     /// `cuFuncGetParamInfo` — CUDA 12.4+. `None` on older drivers, where
     /// [`Backend::func_get_param_info`] reports `CUDA_ERROR_NOT_SUPPORTED`.
     func_get_param_info:
+        Option<unsafe extern "C" fn(*mut c_void, usize, *mut usize, *mut usize) -> CuResultCode>,
+    /// CUDA 13 Library API kernels are `CUkernel`, not `CUfunction`, and must
+    /// be queried with `cuKernelGetParamInfo` before they can be launched.
+    kernel_get_param_info:
         Option<unsafe extern "C" fn(*mut c_void, usize, *mut usize, *mut usize) -> CuResultCode>,
     func_set_attribute: unsafe extern "C" fn(*mut c_void, c_int, c_int) -> CuResultCode,
     func_get_attribute: unsafe extern "C" fn(*mut c_int, c_int, *mut c_void) -> CuResultCode,
@@ -199,6 +209,11 @@ pub struct GpuBackend {
     graph_instantiate_with_flags:
         unsafe extern "C" fn(*mut *mut c_void, *mut c_void, u64) -> CuResultCode,
     graph_launch: unsafe extern "C" fn(*mut c_void, *mut c_void) -> CuResultCode,
+    graph_exec_update: unsafe extern "C" fn(
+        *mut c_void,
+        *mut c_void,
+        *mut GraphExecUpdateResultInfo,
+    ) -> CuResultCode,
     graph_exec_destroy: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
     graph_destroy: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
     graph_get_nodes:
@@ -528,6 +543,7 @@ impl GpuBackend {
                 ctx_destroy: sym(&lib, b"cuCtxDestroy_v2\0")?,
                 ctx_set_current: sym(&lib, b"cuCtxSetCurrent\0")?,
                 ctx_get_current: sym(&lib, b"cuCtxGetCurrent\0")?,
+                ctx_get_stream_priority_range: sym(&lib, b"cuCtxGetStreamPriorityRange\0")?,
                 primary_ctx_retain: sym(&lib, b"cuDevicePrimaryCtxRetain\0")?,
                 primary_ctx_release: sym2(
                     &lib,
@@ -538,15 +554,19 @@ impl GpuBackend {
                 module_get_function: sym(&lib, b"cuModuleGetFunction\0")?,
                 module_get_global: sym2(&lib, b"cuModuleGetGlobal_v2\0", b"cuModuleGetGlobal\0")?,
                 module_unload: sym(&lib, b"cuModuleUnload\0")?,
+                module_get_loading_mode: sym(&lib, b"cuModuleGetLoadingMode\0").ok(),
                 library_load_data: sym(&lib, b"cuLibraryLoadData\0").ok(),
                 library_unload: sym(&lib, b"cuLibraryUnload\0").ok(),
                 library_get_kernel: sym(&lib, b"cuLibraryGetKernel\0").ok(),
                 library_get_module: sym(&lib, b"cuLibraryGetModule\0").ok(),
                 kernel_get_function: sym(&lib, b"cuKernelGetFunction\0").ok(),
+                kernel_get_attribute: sym(&lib, b"cuKernelGetAttribute\0").ok(),
+                kernel_set_attribute: sym(&lib, b"cuKernelSetAttribute\0").ok(),
                 cuda_library_builds: std::collections::HashMap::new(),
                 next_cuda_library_build: 1,
                 live_cuda_libraries: std::collections::HashSet::new(),
                 func_get_param_info: sym(&lib, b"cuFuncGetParamInfo\0").ok(),
+                kernel_get_param_info: sym(&lib, b"cuKernelGetParamInfo\0").ok(),
                 func_set_attribute: sym(&lib, b"cuFuncSetAttribute\0")?,
                 func_get_attribute: sym(&lib, b"cuFuncGetAttribute\0")?,
                 mem_alloc: sym(&lib, b"cuMemAlloc_v2\0")?,
@@ -590,6 +610,10 @@ impl GpuBackend {
                 )?,
                 graph_instantiate_with_flags: sym(&lib, b"cuGraphInstantiateWithFlags\0")?,
                 graph_launch: sym(&lib, b"cuGraphLaunch\0")?,
+                // The unversioned symbol retains the legacy four-argument ABI
+                // on older drivers; the public CUDA 12+ header maps the modern
+                // result-info API to this explicit v2 symbol.
+                graph_exec_update: sym(&lib, b"cuGraphExecUpdate_v2\0")?,
                 graph_exec_destroy: sym(&lib, b"cuGraphExecDestroy\0")?,
                 graph_destroy: sym(&lib, b"cuGraphDestroy\0")?,
                 graph_get_nodes: sym(&lib, b"cuGraphGetNodes\0")?,
@@ -811,6 +835,9 @@ impl GpuBackend {
                             let status = unsafe {
                                 get_kernel(&mut kernel, library as *mut c_void, name.as_ptr())
                             };
+                            if status == 0 {
+                                register_cuda_function(kernel as u64);
+                            }
                             response(status, kernel)
                         }
                         Err(_) => response(CUDA_ERROR_INVALID_VALUE, std::ptr::null_mut()),
@@ -1010,6 +1037,65 @@ impl GpuBackend {
                     _ => response(CUDA_ERROR_NOT_SUPPORTED, std::ptr::null_mut()),
                 }
             }
+            15 => {
+                let parsed = args.get(..16).and_then(|bytes| {
+                    Some((
+                        u64::from_le_bytes(bytes[..8].try_into().ok()?),
+                        i32::from_le_bytes(bytes[8..12].try_into().ok()?),
+                        i32::from_le_bytes(bytes[12..16].try_into().ok()?),
+                    ))
+                });
+                match (parsed, self.kernel_get_attribute) {
+                    (Some((kernel, attrib, device)), Some(get_attribute)) => {
+                        let mut value = 0;
+                        let status = unsafe {
+                            get_attribute(&mut value, attrib, kernel as *mut c_void, device)
+                        };
+                        Ok((
+                            status,
+                            if status == 0 {
+                                value.to_le_bytes().to_vec()
+                            } else {
+                                Vec::new()
+                            },
+                        ))
+                    }
+                    _ => response(CUDA_ERROR_NOT_SUPPORTED, std::ptr::null_mut()),
+                }
+            }
+            16 => {
+                let parsed = args.get(..20).and_then(|bytes| {
+                    Some((
+                        u64::from_le_bytes(bytes[..8].try_into().ok()?),
+                        i32::from_le_bytes(bytes[8..12].try_into().ok()?),
+                        i32::from_le_bytes(bytes[12..16].try_into().ok()?),
+                        i32::from_le_bytes(bytes[16..20].try_into().ok()?),
+                    ))
+                });
+                match (parsed, self.kernel_set_attribute) {
+                    (Some((kernel, attrib, value, device)), Some(set_attribute)) => {
+                        let status =
+                            unsafe { set_attribute(attrib, value, kernel as *mut c_void, device) };
+                        response(status, std::ptr::null_mut())
+                    }
+                    _ => response(CUDA_ERROR_NOT_SUPPORTED, std::ptr::null_mut()),
+                }
+            }
+            17 => match self.module_get_loading_mode {
+                Some(get_loading_mode) if args.is_empty() => {
+                    let mut mode = 0;
+                    let status = unsafe { get_loading_mode(&mut mode) };
+                    Ok((
+                        status,
+                        if status == 0 {
+                            mode.to_le_bytes().to_vec()
+                        } else {
+                            Vec::new()
+                        },
+                    ))
+                }
+                _ => response(CUDA_ERROR_NOT_SUPPORTED, std::ptr::null_mut()),
+            },
             _ => return None,
         })
     }
@@ -1141,6 +1227,17 @@ impl Backend for GpuBackend {
     fn ctx_destroy(&mut self, ctx: u64) -> CuResult<()> {
         unsafe { chk((self.ctx_destroy)(ctx as *mut c_void)) }
     }
+    fn ctx_get_stream_priority_range(&mut self) -> CuResult<(i32, i32)> {
+        let mut least = 0;
+        let mut greatest = 0;
+        unsafe {
+            chk((self.ctx_get_stream_priority_range)(
+                &mut least,
+                &mut greatest,
+            ))?
+        };
+        Ok((least, greatest))
+    }
     fn primary_ctx_retain(&mut self, device: i32) -> CuResult<u64> {
         let mut ctx: *mut c_void = std::ptr::null_mut();
         unsafe { chk((self.primary_ctx_retain)(&mut ctx, device))? };
@@ -1205,19 +1302,33 @@ impl Backend for GpuBackend {
     }
     fn func_get_param_info(&mut self, function: u64) -> CuResult<Vec<u32>> {
         // CUDA 12.4+. Walk parameter indices until INVALID_VALUE marks the end.
+        // CUDA 13's Library API returns an opaque CUkernel. cuLaunchKernel
+        // accepts that handle, but cuFuncGetParamInfo rejects it with
+        // INVALID_RESOURCE_HANDLE; retry with the matching kernel API.
         const CUDA_ERROR_INVALID_VALUE: i32 = 1;
+        const CUDA_ERROR_INVALID_RESOURCE_HANDLE: i32 = 400;
         const CUDA_ERROR_NOT_SUPPORTED: i32 = 801;
         validate_cuda_function(function)?;
-        let f = self.func_get_param_info.ok_or(CUDA_ERROR_NOT_SUPPORTED)?;
+        let func_info = self.func_get_param_info.ok_or(CUDA_ERROR_NOT_SUPPORTED)?;
+        let mut selected = func_info;
         let mut sizes = Vec::new();
-        for i in 0.. {
+        let mut i = 0;
+        loop {
             let (mut offset, mut size): (usize, usize) = (0, 0);
-            let code = unsafe { f(function as *mut c_void, i, &mut offset, &mut size) };
+            let mut code = unsafe { selected(function as *mut c_void, i, &mut offset, &mut size) };
+            if i == 0 && code == CUDA_ERROR_INVALID_RESOURCE_HANDLE {
+                let kernel_info = self
+                    .kernel_get_param_info
+                    .ok_or(CUDA_ERROR_INVALID_RESOURCE_HANDLE)?;
+                selected = kernel_info;
+                code = unsafe { selected(function as *mut c_void, i, &mut offset, &mut size) };
+            }
             match code {
                 0 => sizes.push(size as u32),
                 CUDA_ERROR_INVALID_VALUE => break,
                 other => return Err(other),
             }
+            i += 1;
         }
         Ok(sizes)
     }
@@ -1831,6 +1942,23 @@ impl Backend for GpuBackend {
                 graph_exec as *mut c_void,
                 stream as *mut c_void,
             ))
+        }
+    }
+    fn graph_exec_update(&mut self, graph_exec: u64, graph: u64) -> CuResult<i32> {
+        let mut info = GraphExecUpdateResultInfo {
+            result: 0,
+            error_node: std::ptr::null_mut(),
+            error_from_node: std::ptr::null_mut(),
+        };
+        let status = unsafe {
+            (self.graph_exec_update)(graph_exec as *mut c_void, graph as *mut c_void, &mut info)
+        };
+        // CUDA_ERROR_GRAPH_EXEC_UPDATE_FAILURE (910) is a compatibility result,
+        // not a transport failure; the specific reason is carried in `result`.
+        if status == 0 || status == 910 {
+            Ok(info.result)
+        } else {
+            Err(status)
         }
     }
     fn graph_exec_patch(
@@ -2577,8 +2705,8 @@ impl CudnnBackend {
                 let count = rd_i64(args, 16);
                 let mut elems = args[24..].to_vec();
                 if handle_bearing(ty) {
-                    for chunk in elems.chunks_exact_mut(8) {
-                        let h = u64::from_le_bytes(chunk.try_into().unwrap());
+                    for chunk in elems.as_chunks_mut::<8>().0 {
+                        let h = u64::from_le_bytes(*chunk);
                         // VOID_PTR(6) = device pointer (fork-translate); HANDLE(0)
                         // / BACKEND_DESCRIPTOR(15) = opaque handle (vh_resolve).
                         let r = if ty == 6 {
@@ -2586,7 +2714,7 @@ impl CudnnBackend {
                         } else {
                             vh_resolve(vh, h)
                         };
-                        chunk.copy_from_slice(&r.to_le_bytes());
+                        *chunk = r.to_le_bytes();
                     }
                 }
                 let st = unsafe { (self.set_attr)(desc, name, ty, count, elems.as_ptr().cast()) };
@@ -2608,14 +2736,14 @@ impl CudnnBackend {
                 let seed = input.len().min(cap);
                 buf[..seed].copy_from_slice(&input[..seed]);
                 if handle_bearing(ty) {
-                    for chunk in buf[..seed].chunks_exact_mut(8) {
-                        let h = u64::from_le_bytes(chunk.try_into().unwrap());
+                    for chunk in buf[..seed].as_chunks_mut::<8>().0 {
+                        let h = u64::from_le_bytes(*chunk);
                         let r = if ty == 6 {
                             dptr_resolve(h)
                         } else {
                             vh_resolve(vh, h)
                         };
-                        chunk.copy_from_slice(&r.to_le_bytes());
+                        *chunk = r.to_le_bytes();
                     }
                 }
                 let mut count: i64 = 0;
@@ -3510,6 +3638,13 @@ pub struct KernelNodeParams {
     extra: *mut *mut c_void,
     kern: *mut c_void, // v2: CUkernel
     ctx: *mut c_void,  // v2: CUcontext
+}
+
+#[repr(C)]
+struct GraphExecUpdateResultInfo {
+    result: c_int,
+    error_node: *mut c_void,
+    error_from_node: *mut c_void,
 }
 
 /// `CUDA_MEMSET_NODE_PARAMS` — a graph memset node's target + fill.

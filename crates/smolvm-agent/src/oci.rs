@@ -598,7 +598,7 @@ impl OciSpec {
                 },
             },
             mounts: default_mounts(unprivileged),
-            hostname: Some("container".to_string()),
+            hostname: Some(container_hostname()),
         }
     }
 
@@ -1164,8 +1164,51 @@ fn proc_filesystems_has(fstype: &str) -> bool {
         .unwrap_or(true)
 }
 
+/// The container's hostname: the machine's name when the host supplied one
+/// out of the box. The name is validated as a lowercase DNS label at machine
+/// creation (see `validate_vm_name`), so it is a valid hostname verbatim — the
+/// name primary key's uniqueness carries straight through to the hostname with
+/// no lossy fold that could collide distinct names. The value is used as-is
+/// when it is a well-formed label (a defensive check, not a transform), and
+/// falls back to "container" only when no name was supplied.
+pub fn container_hostname() -> String {
+    std::env::var(smolvm_protocol::guest_env::MACHINE_NAME)
+        .ok()
+        .map(|name| name.trim().to_string())
+        .filter(|name| is_dns_label(name))
+        .unwrap_or_else(|| "container".to_string())
+}
+
+/// Whether `s` is a lowercase DNS label usable verbatim as a hostname:
+/// non-empty, ≤63 bytes, `[a-z0-9-]`, no edge hyphens.
+fn is_dns_label(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 63
+        && !s.starts_with('-')
+        && !s.ends_with('-')
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dns_label_check_accepts_valid_names_rejects_the_rest() {
+        use super::is_dns_label;
+        // Valid machine names (validate_vm_name guarantees this shape) pass verbatim.
+        assert!(is_dns_label("my-vm"));
+        assert!(is_dns_label("worker-1"));
+        assert!(is_dns_label("vm-1a2b3c4d"));
+        // Anything not already a label is rejected (falls back to "container"),
+        // never transformed — so distinct names never collide.
+        assert!(!is_dns_label(""));
+        assert!(!is_dns_label("My-VM")); // uppercase
+        assert!(!is_dns_label("my_vm")); // underscore
+        assert!(!is_dns_label("-edge"));
+        assert!(!is_dns_label("edge-"));
+        assert!(!is_dns_label(&"a".repeat(64)));
+    }
+
     use super::*;
     use tempfile::tempdir;
 

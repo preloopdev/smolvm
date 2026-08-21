@@ -98,8 +98,10 @@ fn main() {
 
     let out = cu.memcpy_dtoh(dc, bytes, 0).expect("d2h");
     let c: Vec<f32> = out
-        .chunks_exact(4)
-        .map(|p| f32::from_le_bytes(p.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|p| f32::from_le_bytes(*p))
         .collect();
     for i in 0..n {
         let expect = a[i] + b[i]; // i + 3i = 4i
@@ -108,6 +110,86 @@ fn main() {
             std::process::exit(3);
         }
     }
+
+    // Capture the same topology twice with different kernel arguments, update
+    // the first executable in place, and verify that replay uses graph 2's
+    // parameters. This is the dynamic-input path used by piecewise graph runtimes.
+    let stream = cu.stream_create(1).expect("graph stream");
+    let graph_one = (1_u64 << 63) | 0x101;
+    let graph_two = (1_u64 << 63) | 0x102;
+    let graph_exec = (1_u64 << 63) | 0x201;
+    cu.stream_begin_capture(stream, 2)
+        .expect("begin first capture");
+    cu.launch_kernel(
+        func,
+        [grid, 1, 1],
+        [block, 1, 1],
+        0,
+        stream,
+        &[
+            da.to_le_bytes().to_vec(),
+            db.to_le_bytes().to_vec(),
+            dc.to_le_bytes().to_vec(),
+            (n as u32).to_le_bytes().to_vec(),
+        ],
+    )
+    .expect("capture first kernel");
+    assert_eq!(
+        cu.stream_end_capture(stream, graph_one)
+            .expect("end first capture"),
+        1
+    );
+    cu.graph_instantiate(graph_one, graph_exec)
+        .expect("instantiate first graph");
+
+    cu.stream_begin_capture(stream, 2)
+        .expect("begin updated capture");
+    cu.launch_kernel(
+        func,
+        [grid, 1, 1],
+        [block, 1, 1],
+        0,
+        stream,
+        &[
+            da.to_le_bytes().to_vec(),
+            da.to_le_bytes().to_vec(),
+            dc.to_le_bytes().to_vec(),
+            (n as u32).to_le_bytes().to_vec(),
+        ],
+    )
+    .expect("capture updated kernel");
+    assert_eq!(
+        cu.stream_end_capture(stream, graph_two)
+            .expect("end updated capture"),
+        1
+    );
+    assert_eq!(
+        cu.graph_exec_update(graph_exec, graph_two)
+            .expect("update graph exec"),
+        0
+    );
+    cu.graph_launch(graph_exec, stream)
+        .expect("launch updated graph");
+    cu.stream_synchronize(stream)
+        .expect("synchronize updated graph");
+    let updated = cu.memcpy_dtoh(dc, bytes, stream).expect("updated d2h");
+    let updated: Vec<f32> = updated
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|p| f32::from_le_bytes(*p))
+        .collect();
+    for (i, &value) in updated.iter().enumerate() {
+        let expect = (2 * i) as f32;
+        if (value - expect).abs() > 1e-2 {
+            eprintln!("gpu_loopback: graph update mismatch at {i}: got {value} want {expect}");
+            std::process::exit(4);
+        }
+    }
+    cu.graph_exec_destroy(graph_exec).ok();
+    cu.graph_destroy(graph_one).ok();
+    cu.graph_destroy(graph_two).ok();
+    cu.stream_destroy(stream).ok();
     cu.mem_free(da).ok();
     cu.mem_free(db).ok();
     cu.mem_free(dc).ok();
@@ -120,6 +202,7 @@ fn main() {
         c[n - 1]
     );
     println!("GPU-VERIFY-OK: {name}");
+    println!("GRAPH-UPDATE-OK: topology-compatible parameters patched in place");
 }
 
 /// Reinterpret `&[f32]` as bytes (f32 has no invalid bit patterns).

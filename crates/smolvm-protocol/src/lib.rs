@@ -467,6 +467,12 @@ pub enum AgentRequest {
         /// File mode (e.g., 0o644). None = default (0644).
         #[serde(default)]
         mode: Option<u32>,
+        /// Owner uid to apply after the write. None = leave as written (root).
+        #[serde(default)]
+        uid: Option<u32>,
+        /// Owner gid to apply after the write. None = leave as written (root).
+        #[serde(default)]
+        gid: Option<u32>,
     },
 
     /// Open a streaming file upload session on this connection.
@@ -484,6 +490,12 @@ pub enum AgentRequest {
         /// File mode (e.g., 0o644). None = default (0644).
         #[serde(default)]
         mode: Option<u32>,
+        /// Owner uid to apply on finalize. None = leave as written (root).
+        #[serde(default)]
+        uid: Option<u32>,
+        /// Owner gid to apply on finalize. None = leave as written (root).
+        #[serde(default)]
+        gid: Option<u32>,
         /// Expected total size in bytes. Rejected if it exceeds
         /// [`FILE_TRANSFER_MAX_TOTAL`]. The agent uses this for an
         /// early-fail check only; the actual size written is the sum
@@ -1222,6 +1234,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn file_write_without_owner_fields_still_parses() {
+        // Requests from clients predating uid/gid must keep deserializing.
+        let old = r#"{"method":"file_write","path":"/x","data":"aGk=","mode":420}"#;
+        let req: AgentRequest = serde_json::from_str(old).unwrap();
+        match req {
+            AgentRequest::FileWrite { mode, uid, gid, .. } => {
+                assert_eq!(mode, Some(420));
+                assert_eq!(uid, None);
+                assert_eq!(gid, None);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_encode_decode_roundtrip() {
         let req = AgentRequest::Pull {
             image: "alpine:latest".to_string(),
@@ -1370,6 +1397,8 @@ mod tests {
         let req = AgentRequest::FileWriteBegin {
             path: "/tmp/target".into(),
             mode: Some(0o600),
+            uid: Some(1000),
+            gid: Some(1000),
             total_size: 123_456_789,
         };
         let bytes = encode_message(&req).unwrap();
@@ -1378,10 +1407,14 @@ mod tests {
             AgentRequest::FileWriteBegin {
                 path,
                 mode,
+                uid,
+                gid,
                 total_size,
             } => {
                 assert_eq!(path, "/tmp/target");
                 assert_eq!(mode, Some(0o600));
+                assert_eq!(uid, Some(1000));
+                assert_eq!(gid, Some(1000));
                 assert_eq!(total_size, 123_456_789);
             }
             _ => panic!("wrong variant"),

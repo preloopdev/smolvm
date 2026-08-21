@@ -476,6 +476,10 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns: Option<std::net::Ipv4Addr>,
 
+    /// Named inter-VM network this machine joins on start (virtio-net only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_name: Option<String>,
+
     /// OCI image for auto-container creation on start.
     #[serde(default)]
     pub image: Option<String>,
@@ -671,6 +675,7 @@ impl VmRecord {
             allowed_cidrs: None,
             network_backend: None,
             dns: None,
+            network_name: None,
             image: None,
             entrypoint: Vec::new(),
             cmd: Vec::new(),
@@ -735,6 +740,7 @@ impl VmRecord {
             allowed_cidrs: None,
             network_backend: None,
             dns: None,
+            network_name: None,
             image: None,
             entrypoint: Vec::new(),
             cmd: Vec::new(),
@@ -886,6 +892,7 @@ impl VmRecord {
             overlay_gib: self.overlay_gb,
             allowed_cidrs: self.allowed_cidrs.clone(),
             dns: self.dns,
+            network_name: self.network_name.clone(),
         }
     }
 }

@@ -298,6 +298,8 @@ struct VmModeSeed {
     /// template has its trailing zero extent stripped, so the disk must be
     /// ftruncated back to this before boot or it isn't a valid full filesystem.
     overlay_logical_size: Option<u64>,
+    /// Original virtual size of the packed persistent storage disk.
+    storage_logical_size: Option<u64>,
     /// Requested disk sizes (GiB) from the create request, honored as a lower
     /// bound on the seeded disks (the guest grows the inherited fs with resize2fs).
     storage_gb: Option<u64>,
@@ -521,6 +523,7 @@ pub async fn create_machine(
                     .as_ref()
                     .map(|t| t.path.clone()),
                 overlay_logical_size: manifest.assets.overlay_logical_size,
+                storage_logical_size: manifest.assets.storage_logical_size,
                 storage_gb: req.storage_gb,
                 overlay_gb: req.overlay_gb,
             })
@@ -628,31 +631,27 @@ pub async fn create_machine(
                 let footer = smolvm_pack::packer::read_footer_from_sidecar(path)
                     .map_err(|e| ApiError::internal(format!("read sidecar footer: {}", e)))?;
                 if smolvm_pack::extract::shared_extract_enabled() {
-                    // Shared content-addressed store: extract the build-constant
-                    // pack ONCE per node into `_shared/<checksum>` (root-owned,
-                    // read-only) instead of a private per-machine copy, and drop a
-                    // pointer beside this machine. The per-machine `pack` dir is
-                    // left an empty mountpoint that the boot path idmap-binds the
-                    // shared copy onto (mapping on-disk uid 0 -> the VM's dropped
-                    // uid), so a 28.6 MB / 362-file agent-rootfs decodes once per
-                    // node rather than once per machine — the cold-start tax this
-                    // removes — with the per-VM uid isolation (#456) preserved.
-                    let shared_root = crate::agent::shared_pack_cache_root();
-                    let shared_dir = smolvm_pack::extract::extract_sidecar_shared(
-                        path,
-                        &shared_root,
-                        &footer,
-                        false,
-                    )
-                    .map_err(|e| ApiError::internal(format!("extract sidecar (shared): {}", e)))?;
-                    std::fs::create_dir_all(&cache_dir).map_err(|e| {
-                        ApiError::internal(format!("create pack mountpoint: {}", e))
-                    })?;
-                    let pointer = crate::agent::shared_pack_pointer_path(&cache_dir);
-                    std::fs::write(&pointer, shared_dir.to_string_lossy().as_bytes()).map_err(
-                        |e| ApiError::internal(format!("write shared pack pointer: {}", e)),
-                    )?;
-                    Ok(())
+                    #[cfg(target_os = "linux")]
+                    {
+                        // Shared content-addressed store: extract the build-constant
+                        // pack ONCE per node into `_shared/<checksum>` (root-owned,
+                        // read-only) instead of a private per-machine copy, and drop a
+                        // pointer beside this machine. The per-machine `pack` dir is
+                        // left an empty mountpoint that the boot path idmap-binds the
+                        // shared copy onto (mapping on-disk uid 0 -> the VM's dropped
+                        // uid), so a 28.6 MB / 362-file agent-rootfs decodes once per
+                        // node rather than once per machine — the cold-start tax this
+                        // removes — with the per-VM uid isolation (#456) preserved.
+                        crate::artifact_cache::materialize_shared_pack_lease(
+                            path, &footer, &cache_dir, false,
+                        )
+                        .map_err(|e| {
+                            ApiError::internal(format!("extract sidecar (shared): {}", e))
+                        })?;
+                        Ok(())
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    unreachable!("shared pack extraction is Linux-only")
                 } else {
                     // Per-machine extraction: macOS case-sensitive layers volume
                     // (owned 1:1 by the machine), or the `SMOLVM_DISABLE_SHARED_EXTRACT`
@@ -713,16 +712,31 @@ pub async fn create_machine(
             // (the per-machine `pack` dir is an empty mountpoint), so seed the
             // VM-mode disk templates from the shared copy. Falls back to the
             // per-machine dir when no pointer was written (macOS / kill-switch).
-            let pack_content_dir =
-                crate::agent::read_shared_pack_pointer(&cache_dir).unwrap_or(cache_dir);
+            let (pack_content_dir, artifact_sha256) =
+                if let Some(shared_dir) = crate::agent::read_shared_pack_pointer(&cache_dir) {
+                    let digest = smolvm_pack::extract::read_shared_artifact_sha256(&shared_dir)
+                        .map_err(|e| {
+                            ApiError::internal(format!(
+                                "read shared artifact SHA-256 {}: {e}",
+                                shared_dir.display()
+                            ))
+                        })?;
+                    (shared_dir, Some(digest))
+                } else {
+                    (cache_dir, None)
+                };
             crate::storage::seed_vm_mode_disks(
                 &disk_dir,
                 &pack_content_dir,
-                seed.overlay_template.as_deref(),
-                seed.storage_template.as_deref(),
-                seed.overlay_logical_size,
-                seed.overlay_gb,
-                seed.storage_gb,
+                crate::storage::VmModeDiskSeedSpec {
+                    artifact_sha256: artifact_sha256.as_deref(),
+                    overlay_template: seed.overlay_template.as_deref(),
+                    storage_template: seed.storage_template.as_deref(),
+                    overlay_logical_size: seed.overlay_logical_size,
+                    storage_logical_size: seed.storage_logical_size,
+                    overlay_gb: seed.overlay_gb,
+                    storage_gb: seed.storage_gb,
+                },
             )
             .map_err(|e| ApiError::internal(format!("seed VM-mode disks: {}", e)))
         })
@@ -1379,6 +1393,12 @@ pub(crate) async fn fork_machine_inner(
     crate::agent::fork::validate_fork_env(&fork_env)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
+    if clone == golden {
+        return Err(ApiError::Conflict(format!(
+            "clone name '{clone}' is already used by the golden"
+        )));
+    }
+
     // Validate pinned ports as the create path does: fork uses these host ports
     // as-is (no remapping), so port 0 or a duplicated host port would otherwise
     // surface only as a confusing clone-boot bind failure instead of a clean 400.
@@ -1400,6 +1420,23 @@ pub(crate) async fn fork_machine_inner(
         }
     }
 
+    // A failed clone finalization may need to roll back the golden and discard
+    // the retained checkpoint that produced it. Keep that state transition in
+    // one owner-level critical section so another fork/start/stop/delete cannot
+    // observe the golden between failed-clone teardown and rollback.
+    let golden_lifecycle = state.lifecycle_lock(&golden);
+    let _golden_guard = golden_lifecycle.lock().await;
+
+    // Reject an already-registered target before taking its lifecycle lock.
+    // Besides avoiding a pointless forkpoint wait, this prevents two invalid
+    // cross-forks (X -> Y and Y -> X) from each holding one golden while waiting
+    // forever on the other machine's clone lock.
+    if state.lookup_vm(&clone).await?.is_some() {
+        return Err(ApiError::Conflict(format!(
+            "machine '{clone}' already exists"
+        )));
+    }
+
     if wait_ready {
         let golden_b = golden.clone();
         tokio::task::spawn_blocking(move || {
@@ -1411,8 +1448,8 @@ pub(crate) async fn fork_machine_inner(
     }
 
     // Serialize lifecycle on the CLONE name so a concurrent start/stop/delete of
-    // the same clone can't race the fork's register + boot. The golden is only
-    // read + frozen via its control socket, which tolerates concurrent forks.
+    // the same clone can't race the fork's register + boot. Golden is always
+    // acquired before clone, matching the fork-pool lock order.
     let lifecycle = state.lifecycle_lock(&clone);
     let _guard = lifecycle.lock().await;
 
@@ -1444,8 +1481,10 @@ pub(crate) async fn fork_machine_inner(
         .map_err(classify_fork_error)?
     };
 
-    boot_prepared_fork_inner(
-        state,
+    let snapshot_dir = prep.snapshot_dir.clone();
+    let resume_golden_on_rollback = prep.resume_golden_on_rollback;
+    let result = boot_prepared_fork_inner(
+        state.clone(),
         clone,
         prep,
         PreparedForkBoot {
@@ -1457,7 +1496,40 @@ pub(crate) async fn fork_machine_inner(
             boot_permit: None,
         },
     )
+    .await;
+
+    let Err(ApiError::CloneIdentityRejuvenationFailed(message)) = result else {
+        return result;
+    };
+    if !resume_golden_on_rollback {
+        return Err(ApiError::CloneIdentityRejuvenationFailed(message));
+    }
+
+    // `fail_closed_on_rejuvenation` has torn down the only clone prepared from
+    // this new checkpoint. It is therefore safe to restore the initially-running
+    // golden and invalidate the checkpoint before releasing its lifecycle lock.
+    let db = state.db().clone();
+    let golden_for_rollback = golden.clone();
+    let rollback = match tokio::task::spawn_blocking(move || {
+        crate::agent::fork::rollback_retained_fork_snapshot(
+            &db,
+            &golden_for_rollback,
+            &snapshot_dir,
+            true,
+        )
+    })
     .await
+    {
+        Ok(result) => result,
+        Err(error) => Err(SmolvmError::agent(
+            "fork rollback",
+            format!("task error: {error}"),
+        )),
+    };
+    match rollback {
+        Ok(()) => Err(ApiError::CloneIdentityRejuvenationFailed(message)),
+        Err(rollback_error) => Err(ApiError::Internal(format!("{message}; {rollback_error}"))),
+    }
 }
 
 /// Prepare several clean held workers from one golden checkpoint and boot them
@@ -1670,6 +1742,26 @@ struct PreparedForkBoot {
     boot_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
+enum PreparedForkBootError {
+    Launch(String),
+    CloneIdentityRejuvenation(String),
+}
+
+impl From<String> for PreparedForkBootError {
+    fn from(message: String) -> Self {
+        Self::Launch(message)
+    }
+}
+
+fn classify_prepared_fork_boot_error(error: PreparedForkBootError) -> ApiError {
+    match error {
+        PreparedForkBootError::Launch(message) => classify_launch_error(message),
+        PreparedForkBootError::CloneIdentityRejuvenation(message) => {
+            ApiError::CloneIdentityRejuvenationFailed(message)
+        }
+    }
+}
+
 async fn boot_prepared_fork_inner(
     state: Arc<ApiState>,
     clone: String,
@@ -1717,7 +1809,7 @@ async fn boot_prepared_fork_inner(
             // leaves nothing half-created.
             let _ = db.remove_vm(&clone_b);
             let _ = std::fs::remove_dir_all(vm_data_dir(&clone_b));
-            return Err(format!("failed to boot clone: {}", e));
+            return Err(format!("failed to boot clone: {}", e).into());
         }
 
         let pid = manager.child_pid();
@@ -1736,7 +1828,11 @@ async fn boot_prepared_fork_inner(
             crate::agent::fork::rejuvenate_clone(&clone_b, &record),
             teardown,
         )
-        .map_err(|e| format!("clone identity rejuvenation failed: {}", e))?;
+        .map_err(|e| {
+            PreparedForkBootError::CloneIdentityRejuvenation(format!(
+                "clone identity rejuvenation failed: {e}"
+            ))
+        })?;
         // Per-fork parameters: same fail-closed contract — a clone that asked
         // for parameters but can't receive them must not be vended.
         crate::agent::fork::fail_closed_on_rejuvenation(
@@ -1769,7 +1865,7 @@ async fn boot_prepared_fork_inner(
                 });
             if let Err(error) = worker_ready {
                 teardown();
-                return Err(format!("CUDA clone worker readiness failed: {error}"));
+                return Err(format!("CUDA clone worker readiness failed: {error}").into());
             }
         }
         #[cfg(not(unix))]
@@ -1782,11 +1878,11 @@ async fn boot_prepared_fork_inner(
             .map_err(|e| format!("forkpoint release failed: {e}"))?;
         }
 
-        Ok::<_, String>((manager, pid, record))
+        Ok::<_, PreparedForkBootError>((manager, pid, record))
     })
     .await
     .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
-    .map_err(classify_launch_error)?;
+    .map_err(classify_prepared_fork_boot_error)?;
 
     // Register the clone so exec/run endpoints can reach it.
     state.insert_machine(&clone, machine_entry_from_record(&clone_record, manager));
@@ -2267,13 +2363,13 @@ pub(crate) async fn delete_one(
     }
 
     // Re-check for dependent clones now that the golden's process (and its fork
-    // control socket) is down. `fork_machine` locks only the CLONE name, not the
-    // golden, so a fork could have snapshotted + registered a clone between the
-    // initial check above and here. With the golden killed no NEW fork can
-    // snapshot, so this catches that race window. Abort BEFORE removing the DB
-    // record or the data dir — the clones' copy-on-write disks are backed by this
-    // golden's disks, so removing them would be silent data loss. The golden is
-    // left stopped with its disks intact; delete the clones and retry.
+    // control socket) is down. API forks share the lifecycle lock held here, but
+    // a separate CLI/embedded process has no access to that in-process lock and
+    // could have registered a clone after the initial check. Abort BEFORE
+    // removing the DB record or data dir — the clones' copy-on-write disks are
+    // backed by this golden's disks, so removing them would be silent data loss.
+    // The golden is left stopped with its disks intact; delete the clones and
+    // retry.
     {
         let db = state.db().clone();
         let golden = name.clone();
@@ -3090,6 +3186,17 @@ mod tests {
         assert!(matches!(
             classify_launch_error(e),
             ApiError::PortConflict(_)
+        ));
+    }
+
+    #[test]
+    fn prepared_fork_boot_error_preserves_clone_rejuvenation_identity() {
+        let error = PreparedForkBootError::CloneIdentityRejuvenation(
+            "clone identity rejuvenation failed: identity reset could not be confirmed".to_string(),
+        );
+        assert!(matches!(
+            classify_prepared_fork_boot_error(error),
+            ApiError::CloneIdentityRejuvenationFailed(_)
         ));
     }
 

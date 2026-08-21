@@ -4,6 +4,8 @@
 //! (sidecar mode via `runpack`) and the standalone stub executable.
 
 use crate::format::{PackFooter, SIDECAR_EXTENSION};
+use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -756,6 +758,35 @@ pub fn is_extracted(cache_dir: &Path) -> bool {
     cache_dir.join(EXTRACTION_MARKER).exists()
 }
 
+/// Whether an extraction's `layers/` cache is structurally usable: every id in
+/// its `layer-order` index resolves to a layer dir or staged tar, or (with no
+/// index) at least one layer entry exists. The extraction MARKER only proves an
+/// extraction once finished — a cache cleaner that deletes the large layer
+/// files but leaves the tiny marker produces a cache that passes `is_extracted`
+/// yet can neither boot nor export, and the marker then blocks the re-extract
+/// that would repair it. Callers that need the layers should require BOTH.
+pub fn cached_layers_usable(cache_dir: &Path) -> bool {
+    let layers_dir = cache_dir.join("layers");
+    let has_form =
+        |id: &str| layers_dir.join(id).is_dir() || layers_dir.join(format!("{id}.tar")).is_file();
+    if let Ok(contents) = fs::read_to_string(layers_dir.join("layer-order")) {
+        let ids: Vec<&str> = contents
+            .lines()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .collect();
+        return !ids.is_empty() && ids.iter().all(|id| has_form(id));
+    }
+    fs::read_dir(&layers_dir)
+        .map(|rd| {
+            rd.flatten().any(|e| {
+                let path = e.path();
+                path.is_dir() || path.extension().is_some_and(|x| x == "tar")
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// Maximum total size of the pack extraction cache before LRU eviction kicks in.
 /// Override with `SMOLVM_PACK_CACHE_MAX_BYTES` (in bytes); default 5 GiB.
 pub fn pack_cache_max_bytes() -> u64 {
@@ -950,12 +981,12 @@ pub fn extract_sidecar(
 /// `cache_dir.parent()` after a successful extraction.
 ///
 /// It MUST be `false` for the node-shared store (`_shared`): those entries are
-/// reference-shared across many VMs via `.pack-shared` pointers and hold NO
-/// per-VM lease, so capping the shared root would LRU-evict a pack still mounted
-/// by live pool VMs — their `/packed_layers` then reads empty and the guest
-/// fails with "no layer directories found in /packed_layers" (exit 255 on
-/// connect/exec). Only the private per-machine cache (`smolvm-pack/<checksum>`),
-/// whose running entries DO hold leases, is safe to cap. See
+/// reference-shared across many VMs via durable `.pack-shared` pointer leases,
+/// but this generic size cap does not inspect those pointers. Blindly capping
+/// the shared root could therefore evict a pack still mounted by live pool VMs —
+/// their `/packed_layers` then reads empty and the guest fails with "no layer
+/// directories found in /packed_layers" (exit 255 on connect/exec). Explicit
+/// `smolvm pack prune` performs the reference-aware cleanup instead. See
 /// `extract_sidecar_shared`, which passes `false`.
 fn extract_sidecar_capped(
     sidecar_path: &Path,
@@ -1084,17 +1115,175 @@ pub fn extract_sidecar_shared(
     debug: bool,
 ) -> std::io::Result<PathBuf> {
     let shared_dir = shared_pack_dir(shared_root, footer.checksum);
-    // cap_cache=false: NEVER LRU-evict the shared store. Its entries are
-    // reference-shared across every VM via `.pack-shared` pointers and take no
-    // per-VM lease, so an oldest-first size-cap here would delete a pack still
-    // mounted by live pool VMs. See `extract_sidecar_capped`.
+    // cap_cache=false: never perform blind automatic LRU eviction here. Shared
+    // entries are maintained explicitly by `smolvm pack prune`, which treats
+    // each machine's `.pack-shared` pointer as a durable lease and therefore
+    // cannot delete a pack mounted by a running or stopped VM.
     extract_sidecar_capped(sidecar_path, &shared_dir, footer, false, debug, false)?;
+    ensure_shared_artifact_sha256(sidecar_path, &shared_dir)?;
     // Lock down the store so a dropped per-VM uid can't read the shared copy
     // directly (it must go through its idmapped mount). Best-effort: traversal
     // by root (the VMM before it drops privileges) is unaffected by 0700.
     restrict_to_owner(shared_root);
     restrict_to_owner(&shared_dir);
     Ok(shared_dir)
+}
+
+/// Path of the cached SHA-256 identity for one shared artifact extraction.
+///
+/// The digest sits beside (rather than inside) the extracted tree so the tree
+/// remains byte-for-byte identical to a private extraction and can continue to
+/// be mounted read-only into guests.
+pub fn shared_artifact_sha256_path(shared_dir: &Path) -> PathBuf {
+    shared_dir.with_extension("artifact-sha256")
+}
+
+/// Read and validate the full-artifact SHA-256 cached for a shared extraction.
+/// Returns the lowercase 64-character hex digest without an algorithm prefix.
+pub fn read_shared_artifact_sha256(shared_dir: &Path) -> std::io::Result<String> {
+    let path = shared_artifact_sha256_path(shared_dir);
+    let digest = fs::read_to_string(&path)?.trim().to_string();
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid artifact SHA-256 marker: {}", path.display()),
+        ));
+    }
+    Ok(digest)
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct ArtifactSourceIdentity {
+    canonical_path: String,
+    len: u64,
+    modified_secs: Option<u64>,
+    modified_nanos: Option<u32>,
+}
+
+fn artifact_source_identity(sidecar_path: &Path) -> std::io::Result<ArtifactSourceIdentity> {
+    let canonical = sidecar_path.canonicalize()?;
+    let metadata = fs::metadata(&canonical)?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok());
+    Ok(ArtifactSourceIdentity {
+        canonical_path: canonical.to_string_lossy().into_owned(),
+        len: metadata.len(),
+        modified_secs: modified.map(|duration| duration.as_secs()),
+        modified_nanos: modified.map(|duration| duration.subsec_nanos()),
+    })
+}
+
+fn shared_artifact_source_path(shared_dir: &Path) -> PathBuf {
+    shared_dir.with_extension("artifact-source.json")
+}
+
+fn hash_artifact_sha256(sidecar_path: &Path) -> std::io::Result<String> {
+    let mut source = File::open(sidecar_path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 4 * 1024 * 1024];
+    loop {
+        let read = source.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let mut digest = String::with_capacity(64);
+    for byte in hasher.finalize() {
+        write!(&mut digest, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(digest)
+}
+
+fn write_atomic_marker(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let tmp_path = path.with_extension(format!("tmp-{}", std::process::id()));
+    // A process may have died after creating its PID-scoped temp file. The
+    // caller's flock proves no live writer owns it now.
+    if tmp_path.exists() {
+        fs::remove_file(&tmp_path)?;
+    }
+    let write_result = (|| {
+        let mut tmp = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp_path)?;
+        tmp.write_all(contents)?;
+        tmp.sync_all()?;
+        fs::rename(&tmp_path, path)?;
+        Ok::<(), std::io::Error>(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    write_result
+}
+
+/// Compute a shared artifact's full SHA-256 once, atomically, under a lock.
+///
+/// The pack footer uses CRC32 for compatibility. Disk COW bases need a
+/// collision-resistant identity, so the first shared extraction pays one
+/// streaming hash pass and every later machine only reads this tiny marker.
+fn ensure_shared_artifact_sha256(
+    sidecar_path: &Path,
+    shared_dir: &Path,
+) -> std::io::Result<String> {
+    let digest_path = shared_artifact_sha256_path(shared_dir);
+    let lock_path = digest_path.with_extension("artifact-sha256.lock");
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    lock_file_exclusive(&lock_file)?;
+
+    let source_path = shared_artifact_source_path(shared_dir);
+    let source_identity = artifact_source_identity(sidecar_path)?;
+    if digest_path.exists() {
+        let cached_digest = read_shared_artifact_sha256(shared_dir)?;
+        let cached_source = fs::read(&source_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<ArtifactSourceIdentity>(&bytes).ok());
+        if cached_source.as_ref() == Some(&source_identity) {
+            return Ok(cached_digest);
+        }
+
+        // The shared extraction directory is historically keyed by the pack's
+        // CRC32 footer. If a different artifact ever collides with that key,
+        // fail instead of associating its SHA-256 with the already-extracted
+        // bytes. A second path to identical content is safe and refreshes the
+        // cheap source fingerprint for later warm creates.
+        let actual_digest = hash_artifact_sha256(sidecar_path)?;
+        if actual_digest != cached_digest {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "shared pack checksum collision at {}: artifact SHA-256 differs",
+                    shared_dir.display()
+                ),
+            ));
+        }
+        write_atomic_marker(
+            &source_path,
+            &serde_json::to_vec(&source_identity)
+                .map_err(|error| std::io::Error::other(error.to_string()))?,
+        )?;
+        return Ok(cached_digest);
+    }
+
+    let digest = hash_artifact_sha256(sidecar_path)?;
+    write_atomic_marker(&digest_path, format!("{digest}\n").as_bytes())?;
+    write_atomic_marker(
+        &source_path,
+        &serde_json::to_vec(&source_identity)
+            .map_err(|error| std::io::Error::other(error.to_string()))?,
+    )?;
+    Ok(digest)
 }
 
 /// Set a directory to `0700` (owner-only) if possible. Best-effort; errors are
@@ -2289,6 +2478,7 @@ pub fn create_or_copy_storage_disk(
     cache_dir: &Path,
     template_path: Option<&str>,
     storage_path: &Path,
+    storage_logical_size: Option<u64>,
     size_gb_override: Option<u64>,
 ) -> std::io::Result<()> {
     if let Some(template) = template_path {
@@ -2299,35 +2489,85 @@ pub fn create_or_copy_storage_disk(
             // turning ~25 MiB of real data into its full logical size of zeros on
             // disk and risking ENOSPC when several extractions run.
             sparse_copy(&template_path, storage_path)?;
-            // If a custom size was requested and it's larger than the template,
-            // extend the sparse file (resize2fs in the agent will expand the FS).
-            if let Some(gb) = size_gb_override {
-                let desired = gb * 1024 * 1024 * 1024;
-                let current = fs::metadata(storage_path)?.len();
-                if desired > current {
-                    let file = fs::OpenOptions::new().write(true).open(storage_path)?;
-                    // On Windows/NTFS, extending with set_len would allocate the
-                    // whole gap unless the file is sparse. Mark sparse first
-                    // (idempotent).
-                    #[cfg(windows)]
-                    mark_file_sparse(&file)?;
-                    file.set_len(desired)?;
-                }
+            // Restore a VM-mode disk's original trailing sparse extent and/or
+            // honor a larger requested size. resize2fs in the guest grows only
+            // when the requested block device is larger than the inherited FS.
+            let current = fs::metadata(storage_path)?.len();
+            let desired = [
+                Some(current),
+                storage_logical_size,
+                size_gb_override.map(|gb| gb * 1024 * 1024 * 1024),
+            ]
+            .into_iter()
+            .flatten()
+            .max()
+            .unwrap_or(current);
+            if desired > current {
+                let file = fs::OpenOptions::new().write(true).open(storage_path)?;
+                // On Windows/NTFS, extending with set_len would allocate the
+                // whole gap unless the file is sparse. Mark sparse first
+                // (idempotent).
+                #[cfg(windows)]
+                mark_file_sparse(&file)?;
+                file.set_len(desired)?;
             }
             return Ok(());
         }
     }
     // Fallback: create empty sparse file (agent will format on first boot)
-    let size = match size_gb_override {
-        Some(gb) => gb * 1024 * 1024 * 1024,
-        None => 512 * 1024 * 1024,
-    };
+    let size = [
+        storage_logical_size,
+        size_gb_override.map(|gb| gb * 1024 * 1024 * 1024),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .unwrap_or(512 * 1024 * 1024);
     create_storage_disk(storage_path, size)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_layers_usable_requires_the_layers_not_just_the_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path();
+        // Marker alone (a cache cleaner deleted the layer files): unusable.
+        fs::write(cache.join(EXTRACTION_MARKER), "").unwrap();
+        assert!(!cached_layers_usable(cache));
+        // Order file whose ids all resolve (dir or staged tar): usable.
+        let layers = cache.join("layers");
+        fs::create_dir_all(layers.join("aaa")).unwrap();
+        fs::write(layers.join("bbb.tar"), "x").unwrap();
+        fs::write(layers.join("layer-order"), "aaa\nbbb\n").unwrap();
+        assert!(cached_layers_usable(cache));
+        // An id in the order with no backing form: unusable again.
+        fs::write(layers.join("layer-order"), "aaa\nbbb\nccc\n").unwrap();
+        assert!(!cached_layers_usable(cache));
+        // No order file, at least one layer entry: usable (legacy caches).
+        fs::remove_file(layers.join("layer-order")).unwrap();
+        assert!(cached_layers_usable(cache));
+    }
+
+    #[test]
+    fn shared_artifact_digest_rejects_a_different_artifact_for_the_same_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+        let first = temp.path().join("first.smolmachine");
+        let second = temp.path().join("second.smolmachine");
+        fs::write(&first, b"first artifact").unwrap();
+        fs::write(&second, b"different artifact").unwrap();
+
+        let first_digest = ensure_shared_artifact_sha256(&first, &shared).unwrap();
+        let error = ensure_shared_artifact_sha256(&second, &shared).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("checksum collision"));
+        assert_eq!(read_shared_artifact_sha256(&shared).unwrap(), first_digest);
+    }
 
     /// Build a single-file tar archive in memory with the given name and data.
     fn make_tar(name: &str, data: &[u8]) -> Vec<u8> {
@@ -2967,6 +3207,7 @@ mod tests {
             Some("symlink-out/storage-template.ext4"),
             &storage_path,
             None,
+            None,
         );
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
@@ -2990,8 +3231,14 @@ mod tests {
         }
 
         let dest = cache_dir.path().join("storage.ext4");
-        create_or_copy_storage_disk(cache_dir.path(), Some("storage-template.ext4"), &dest, None)
-            .unwrap();
+        create_or_copy_storage_disk(
+            cache_dir.path(),
+            Some("storage-template.ext4"),
+            &dest,
+            None,
+            None,
+        )
+        .unwrap();
 
         let meta = fs::metadata(&dest).unwrap();
         // Logical size is preserved...

@@ -124,6 +124,7 @@ pub trait Backend: Send {
     fn device_get_by_pci_bus_id(&mut self, pci_bus_id: &str) -> CuResult<i32>;
     fn ctx_create(&mut self, device: i32) -> CuResult<u64>;
     fn ctx_destroy(&mut self, ctx: u64) -> CuResult<()>;
+    fn ctx_get_stream_priority_range(&mut self) -> CuResult<(i32, i32)>;
     fn primary_ctx_retain(&mut self, device: i32) -> CuResult<u64>;
     fn primary_ctx_release(&mut self, device: i32) -> CuResult<()>;
     fn module_load_data(&mut self, image: &[u8]) -> CuResult<u64>;
@@ -211,6 +212,10 @@ pub trait Backend: Send {
     fn graph_instantiate(&mut self, graph: u64) -> CuResult<u64>;
     /// Replay an instantiated graph on `stream`.
     fn graph_launch(&mut self, graph_exec: u64, stream: u64) -> CuResult<()>;
+    /// Update an instantiated graph from a topology-compatible graph. Returns
+    /// `CUgraphExecUpdateResult`; update incompatibility is reported through
+    /// that value while transport/driver failures remain `Err`.
+    fn graph_exec_update(&mut self, graph_exec: u64, graph: u64) -> CuResult<i32>;
     /// Rewrite `exec`'s node params so device pointers baked in at capture are
     /// translated through `trans` to a fork clone's private copies (Path 2).
     /// Default: no-op (a backend without graph support has nothing to patch).
@@ -561,9 +566,9 @@ struct Session {
     mem_pools: HashMap<u64, u64>,
     owned_mem_pools: std::collections::HashSet<u64>,
     cublas_handles: HashMap<u64, u64>,
-    /// Guest-minted virtual graph/exec handles → real (bit-63 tagged). Lets
-    /// EndCapture / GraphInstantiate be fire-and-forget: the guest invents the
-    /// handle, the host maps it when it materializes the real one. Shared via
+    /// Guest-minted virtual graph/exec handles → real (bit-63 tagged). The guest
+    /// invents stable handles and the host maps them after successful capture /
+    /// instantiation. Shared via
     /// [`GRAPH_HANDOFF`] so a fork clone inherits a snapshot of its parent's
     /// captured graphs (the reals are context-scoped, valid across connections).
     graph_vhandles: std::sync::Arc<std::sync::Mutex<HashMap<u64, u64>>>,
@@ -632,6 +637,13 @@ struct Session {
     /// alternative to node-by-node graph rebuild, which can't reconstruct
     /// library-API (cuBLAS) kernels or non-kernel nodes.
     capture_rec: Option<(u64, Vec<Vec<u8>>)>,
+    /// Capture roots currently active while recording clone replay logs. A single log
+    /// can safely absorb opaque library calls only while this set has one item.
+    capture_rec_roots: std::collections::HashSet<u64>,
+    /// Concurrent captures make opaque library-call attribution ambiguous.
+    /// Disable replay-log publication until all of them end rather than hand a
+    /// clone a silently mixed graph.
+    capture_rec_ambiguous: bool,
     /// Worker-side (clone) inherited capture-replay logs, keyed by the golden's
     /// exec vhandle: the ordered op payloads to re-capture on first launch.
     /// Drained from the layout at clone resume.
@@ -3157,8 +3169,22 @@ fn serve_rings<S: Read + Write>(
         exec: u128,
         resp: u128,
         ops: u64,
+        op_counts: [u64; 256],
+        op_exec_us: [u128; 256],
     }
     impl Prof {
+        fn note(&mut self, op: u8) {
+            if self.on {
+                self.op_counts[op as usize] += 1;
+            }
+        }
+
+        fn note_exec(&mut self, op: u8, elapsed_us: u128) {
+            if self.on {
+                self.op_exec_us[op as usize] += elapsed_us;
+            }
+        }
+
         fn dump_maybe(&mut self) {
             if self.on && self.ops.is_multiple_of(8192) && self.ops > 0 {
                 eprintln!(
@@ -3169,6 +3195,46 @@ fn serve_rings<S: Read + Write>(
                     self.exec / 1000,
                     self.resp / 1000
                 );
+                let mut top: Vec<(u8, u64)> = self
+                    .op_counts
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(op, &count)| (count > 0).then_some((op as u8, count)))
+                    .collect();
+                top.sort_unstable_by_key(|&(_, count)| std::cmp::Reverse(count));
+                let summary = top
+                    .into_iter()
+                    .take(12)
+                    .map(|(op, count)| match crate::proto::Op::from_u8(op) {
+                        Some(name) => format!("{name:?}={count}"),
+                        None => format!("0x{op:02x}={count}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                eprintln!("[serve-prof-ops] {summary}");
+                let mut by_time: Vec<(u8, u128)> = self
+                    .op_exec_us
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(op, &elapsed)| (elapsed > 0).then_some((op as u8, elapsed)))
+                    .collect();
+                by_time.sort_unstable_by_key(|&(_, elapsed)| std::cmp::Reverse(elapsed));
+                let summary = by_time
+                    .into_iter()
+                    .take(12)
+                    .map(|(op, elapsed)| {
+                        let count = self.op_counts[op as usize].max(1);
+                        let name = crate::proto::Op::from_u8(op)
+                            .map_or_else(|| format!("0x{op:02x}"), |name| format!("{name:?}"));
+                        format!(
+                            "{name}={}ms/{:.1}us",
+                            elapsed / 1000,
+                            elapsed as f64 / count as f64
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                eprintln!("[serve-prof-exec] {summary}");
             }
         }
     }
@@ -3179,6 +3245,8 @@ fn serve_rings<S: Read + Write>(
         exec: 0,
         resp: 0,
         ops: 0,
+        op_counts: [0; 256],
+        op_exec_us: [0; 256],
     };
     // Reassembly buffer for oversized frames arriving as bounce chunks.
     let mut pending: Vec<u8> = Vec::new();
@@ -3332,11 +3400,14 @@ fn serve_rings<S: Read + Write>(
                 }
                 if prof.on {
                     prof.decode += t_dec.elapsed().as_micros();
+                    prof.note(frame[1]);
                 }
                 let t_exec = std::time::Instant::now();
                 let (status, _) = dispatch_quiet(sess, backend, req, &mut quiet_sticky);
                 if prof.on {
-                    prof.exec += t_exec.elapsed().as_micros();
+                    let elapsed = t_exec.elapsed().as_micros();
+                    prof.exec += elapsed;
+                    prof.note_exec(frame[1], elapsed);
                     prof.ops += 1;
                     prof.dump_maybe();
                 }
@@ -3371,11 +3442,14 @@ fn serve_rings<S: Read + Write>(
                 }
                 if prof.on {
                     prof.decode += t_dec.elapsed().as_micros();
+                    prof.note(frame[0]);
                 }
                 let t_exec = std::time::Instant::now();
                 let (status, resp) = dispatch(sess, backend, req);
                 if prof.on {
-                    prof.exec += t_exec.elapsed().as_micros();
+                    let elapsed = t_exec.elapsed().as_micros();
+                    prof.exec += elapsed;
+                    prof.note_exec(frame[0], elapsed);
                 }
                 if status != 0 && oplog {
                     eprintln!("[op!] status={status}");
@@ -4080,6 +4154,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             sess.contexts.remove(&ctx);
             Ok(Response::Ok)
         }
+        Request::CtxGetStreamPriorityRange => b
+            .ctx_get_stream_priority_range()
+            .map(|(least, greatest)| Response::Pair(least as i64 as u64, greatest as i64 as u64)),
         Request::PrimaryCtxRetain { device } => {
             let device = dev(sess, device);
             let raw = b.primary_ctx_retain(device)?;
@@ -4256,8 +4333,8 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                     let (mut found, mut sample) = (0u64, Vec::new());
                     for (cptr, size) in copies {
                         if let Ok(bytes) = b.memcpy_dtoh(cptr, size, 0) {
-                            for ch in bytes.chunks_exact(8) {
-                                let v = u64::from_ne_bytes(ch.try_into().unwrap());
+                            for ch in bytes.as_chunks::<8>().0 {
+                                let v = u64::from_ne_bytes(*ch);
                                 if ranges.iter().any(|&(lo, hi)| v >= lo && v < hi) {
                                     found += 1;
                                     if sample.len() < 6 {
@@ -4590,27 +4667,67 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         }),
         Request::StreamBeginCapture { stream, mode } => {
             let raw = raw_stream(sess, stream)?;
-            // P3b: start recording capturable ops for clone re-capture. Only the
+            b.stream_begin_capture(raw, mode)?;
+            // Start recording capturable ops for clone re-capture. Only the
             // golden records (path3 enabled, not itself a clone); a clone that
             // captures its own graph needs no replay log.
             if clone_graph_replay_enabled() && path3_enabled() && sess.dptr_trans.is_empty() {
-                sess.capture_rec = Some((stream, Vec::new()));
+                sess.capture_rec_roots.insert(stream);
+                if sess.capture_rec_roots.len() == 1 && !sess.capture_rec_ambiguous {
+                    sess.capture_rec = Some((stream, Vec::new()));
+                } else {
+                    // A LibCall carries an opaque library handle rather than a
+                    // directly attributable stream. Never publish a mixed log
+                    // for concurrent captures: kernel-only node rebuild remains
+                    // available, and library graphs fail loudly in a clone.
+                    sess.capture_rec = None;
+                    sess.capture_rec_ambiguous = true;
+                    eprintln!(
+                        "[cuda-graph] concurrent captures detected; disabling ambiguous clone replay logs"
+                    );
+                }
             }
-            b.stream_begin_capture(raw, mode).map(|_| Response::Ok)
+            Ok(Response::Ok)
         }
         Request::ThreadExchangeCaptureMode { mode } => {
             b.thread_exchange_capture_mode(mode).map(Response::Count)
         }
         Request::StreamEndCapture { stream, graph_vh } => {
             let raw = raw_stream(sess, stream)?;
-            let g = b.stream_end_capture(raw)?;
+            let ended = b.stream_end_capture(raw);
+            let was_recording = sess.capture_rec_roots.remove(&stream);
+            if sess.capture_rec_roots.is_empty() {
+                sess.capture_rec_ambiguous = false;
+            }
+            let g = match ended {
+                Ok(graph) => graph,
+                Err(error) => {
+                    if was_recording {
+                        sess.capture_rec = None;
+                    }
+                    return Err(error);
+                }
+            };
+            let node_count = match b.graph_get_node_count(g) {
+                Ok(count) => count,
+                Err(error) => {
+                    let _ = b.graph_destroy(g);
+                    sess.capture_rec = None;
+                    return Err(error);
+                }
+            };
             if graph_vh & VHANDLE_TAG != 0 {
                 sess.graph_vhandles.lock().unwrap().insert(graph_vh, g);
                 sess.owned_graph_reals.insert(g);
             }
-            // P3b: park the recorded op-log under graph_vh until GraphInstantiate
+            // Park the recorded op-log under graph_vh until GraphInstantiate
             // associates it with an exec_vh (what the clone launches).
-            if let Some((_, log)) = sess.capture_rec.take() {
+            if let Some((recorded_stream, log)) = sess.capture_rec.take() {
+                if recorded_stream != stream {
+                    // An unmatched end must not publish another capture's log.
+                    sess.capture_rec = Some((recorded_stream, log));
+                    return Ok(Response::Pair(g, node_count));
+                }
                 if !log.is_empty() {
                     eprintln!(
                         "[p3b] golden recorded {} ops for graph {graph_vh:#x}",
@@ -4621,7 +4738,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                     layout.handoff_revision = layout.handoff_revision.wrapping_add(1);
                 }
             }
-            Ok(Response::Handle(g))
+            Ok(Response::Pair(g, node_count))
         }
         Request::StreamCaptureInfo { stream } => {
             let raw = raw_stream(sess, stream)?;
@@ -4806,6 +4923,15 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             let raw = raw_stream(sess, stream)?;
             b.graph_launch(launch, raw).map(|_| Response::Ok)
         }
+        Request::GraphExecUpdate { graph_exec, graph } => {
+            let real_exec = raw_graph(sess, graph_exec);
+            let real_graph = raw_graph(sess, graph);
+            if real_exec == 0 || real_graph == 0 {
+                return Err(CUDA_ERROR_INVALID_HANDLE);
+            }
+            b.graph_exec_update(real_exec, real_graph)
+                .map(Response::Count)
+        }
         Request::GraphExecDestroy { graph_exec } => {
             let real = raw_graph(sess, graph_exec);
             sess.graph_vhandles.lock().unwrap().remove(&graph_exec);
@@ -4894,6 +5020,44 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             }
             Response::Handle(e)
         }),
+        Request::EventCreateBatch { flags, count } => {
+            // Bound one request even though the wire frame is already bounded:
+            // this is control-plane amortization, not an unbounded allocation
+            // API. A partial driver failure must leave no hidden live events.
+            if count == 0 || count > 256 {
+                return Err(CUDA_ERROR_INVALID_VALUE);
+            }
+            let mut events = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                match b.event_create(flags) {
+                    Ok(event) => events.push(event),
+                    Err(code) => {
+                        for event in events {
+                            let _ = b.event_destroy(event);
+                        }
+                        return Err(code);
+                    }
+                }
+            }
+
+            for &event in &events {
+                sess.owned_events.insert(event);
+                worker_handle_register(&WORKER_EVENTS, event);
+            }
+            if path3_enabled() {
+                let mut layout = sess.golden_layout.lock().unwrap();
+                for &event in &events {
+                    layout.events.insert(event, flags);
+                }
+                layout.handoff_revision = layout.handoff_revision.wrapping_add(1);
+            }
+
+            let mut encoded = Vec::with_capacity(events.len() * 8);
+            for event in events {
+                encoded.extend_from_slice(&event.to_le_bytes());
+            }
+            Ok(Response::Data(encoded))
+        }
         Request::EventDestroy { event } => {
             let raw = raw_event(sess, event)?;
             if worker_handle_take(&WORKER_EVENTS, raw) {
@@ -5449,6 +5613,9 @@ impl Backend for CpuBackend {
     fn ctx_destroy(&mut self, _ctx: u64) -> CuResult<()> {
         Ok(())
     }
+    fn ctx_get_stream_priority_range(&mut self) -> CuResult<(i32, i32)> {
+        Ok((0, 0))
+    }
     fn primary_ctx_retain(&mut self, _device: i32) -> CuResult<u64> {
         Ok(self.handle())
     }
@@ -5664,6 +5831,9 @@ impl Backend for CpuBackend {
         Err(CUDA_ERROR_NOT_SUPPORTED)
     }
     fn graph_launch(&mut self, _graph_exec: u64, _stream: u64) -> CuResult<()> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn graph_exec_update(&mut self, _graph_exec: u64, _graph: u64) -> CuResult<i32> {
         Err(CUDA_ERROR_NOT_SUPPORTED)
     }
     fn graph_exec_destroy(&mut self, _graph_exec: u64) -> CuResult<()> {

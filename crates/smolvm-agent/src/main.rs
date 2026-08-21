@@ -80,6 +80,7 @@ fn boot_log(level: &str, msg: &str) {
     }
 }
 mod cuda;
+mod disk_trim;
 mod dns_proxy;
 mod docker_bridge;
 mod forkpoint;
@@ -99,6 +100,7 @@ mod storage;
 #[cfg(target_os = "linux")]
 mod timesync;
 mod vsock;
+mod vulkan;
 
 // ============================================================================
 // Configuration Constants
@@ -253,6 +255,9 @@ fn main() {
         "INFO",
         &format!("boot mounts_done uptime_ms={}", uptime_ms()),
     );
+
+    #[cfg(target_os = "linux")]
+    delegate_root_cgroup_controllers();
 
     // Create /dev/dri device nodes only when GPU is enabled. The setup
     // function polls up to 500ms for the virtio-gpu driver to finish probing —
@@ -486,6 +491,10 @@ fn main() {
     // ensure_storage_mounted() also guards any concurrent call from a request
     // that races in the brief window on very fast hosts.
     ensure_storage_mounted();
+
+    // With the disks mounted, start reclaiming freed blocks back to the host
+    // sparse files so disk footprint tracks live data (see disk_trim).
+    disk_trim::spawn();
 
     // Start accepting connections (listener already bound)
     if let Err(e) = run_server_with_listener(listener) {
@@ -728,6 +737,65 @@ fn mount_essential_filesystems() {
             // The networking will be set up by TSI anyway
             libc::close(fd);
         }
+    }
+}
+
+/// Enable every available cgroup2 controller for child cgroups, once, at boot.
+///
+/// libkrun mounts `/sys/fs/cgroup` read-only with nothing in
+/// `cgroup.subtree_control`, so software that manages its own sub-cgroups —
+/// kubelet, dockerd, systemd — finds an undelegated hierarchy and either
+/// fails or runs unbounded, and users had to hand-write the delegation
+/// before starting it. The root cgroup is exempt from cgroup2's
+/// no-internal-processes rule, so enabling controllers here while the agent
+/// and its containers stay in the root is valid; the cost is one extra level
+/// of hierarchical accounting. Best-effort: on any failure workloads behave
+/// exactly as before.
+#[cfg(target_os = "linux")]
+fn delegate_root_cgroup_controllers() {
+    use std::ffi::CString;
+    let Ok(target) = CString::new("/sys/fs/cgroup") else {
+        return;
+    };
+    // Remount read-write; MS_REMOUNT preserves the mount and omitting
+    // MS_RDONLY clears the read-only flag.
+    let flags = libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
+    // SAFETY: `target` is a valid NUL-terminated path; the agent is PID-1 and
+    // holds CAP_SYS_ADMIN. Null source/type/data is valid for a remount.
+    let rc = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            target.as_ptr(),
+            std::ptr::null(),
+            flags,
+            std::ptr::null(),
+        )
+    };
+    if rc != 0 {
+        boot_log(
+            "WARN",
+            "cgroup2 remount rw failed; controllers not delegated",
+        );
+        return;
+    }
+    let controllers =
+        std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers").unwrap_or_default();
+    let enable: Vec<String> = controllers
+        .split_whitespace()
+        .map(|c| format!("+{c}"))
+        .collect();
+    if enable.is_empty() {
+        return;
+    }
+    match std::fs::write("/sys/fs/cgroup/cgroup.subtree_control", enable.join(" ")) {
+        Ok(()) => boot_log(
+            "INFO",
+            &format!("cgroup2 controllers delegated: {}", controllers.trim()),
+        ),
+        Err(e) => boot_log(
+            "WARN",
+            &format!("cgroup2 controller delegation failed: {e}"),
+        ),
     }
 }
 
@@ -2027,6 +2095,8 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         if let AgentRequest::FileWriteBegin {
             path,
             mode,
+            uid,
+            gid,
             total_size,
         } = request
         {
@@ -2034,7 +2104,7 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             // starting a new one. `take()` makes the drop explicit and keeps the
             // value from looking like a dead store.
             let _ = write_session.take();
-            let (new_session, response) = handle_file_write_begin(path, mode, total_size);
+            let (new_session, response) = handle_file_write_begin(path, mode, uid, gid, total_size);
             write_session = new_session;
             send_response(stream, &response)?;
             continue;
@@ -2313,7 +2383,13 @@ fn handle_request(
             AgentResponse::error("export layer not handled here", error_codes::INTERNAL_ERROR)
         }
 
-        AgentRequest::FileWrite { path, data, mode } => handle_file_write(&path, &data, mode),
+        AgentRequest::FileWrite {
+            path,
+            data,
+            mode,
+            uid,
+            gid,
+        } => handle_file_write(&path, &data, mode, uid, gid),
 
         // Streaming uploads go through `handle_connection`'s
         // per-connection session state so they can't land here.
@@ -2616,7 +2692,13 @@ fn resolve_guest_io_path(
 /// finalize step. The atomic-rename pattern is the thing both paths
 /// need to guarantee: partial contents never appear at `path` under
 /// any error or kill scenario.
-fn install_file_atomic(path: &str, data: &[u8], mode: Option<u32>) -> AgentResponse {
+fn install_file_atomic(
+    path: &str,
+    data: &[u8],
+    mode: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> AgentResponse {
     let resolved = match resolve_guest_io_path(path, FilePathAccess::Write) {
         Ok(p) => p,
         Err(resp) => return resp,
@@ -2659,6 +2741,17 @@ fn install_file_atomic(path: &str, data: &[u8], mode: Option<u32>) -> AgentRespo
     if let Some(m) = mode {
         apply_mode_best_effort(target, m);
     }
+    // Ownership was requested explicitly, so a failure is an error, not a
+    // best-effort shrug — a non-root workload silently unable to read its own
+    // upload is exactly the bug this exists to prevent.
+    if uid.is_some() || gid.is_some() {
+        if let Err(e) = std::os::unix::fs::chown(target, uid, gid) {
+            return AgentResponse::error(
+                format!("failed to chown {}: {}", path, e),
+                error_codes::FILE_IO_FAILED,
+            );
+        }
+    }
     info!(path = %path, size = data.len(), "file written");
     AgentResponse::Ok { data: None }
 }
@@ -2674,17 +2767,26 @@ fn install_file_atomic(path: &str, data: &[u8], mode: Option<u32>) -> AgentRespo
 /// With no running workload the local write is correct and is kept: overlayfs
 /// reads `upper` at mount time, so seeding it before the container starts is
 /// exactly how the file becomes visible once it does.
-fn handle_file_write(path: &str, data: &[u8], mode: Option<u32>) -> AgentResponse {
-    if let Some(result) = nsfile::write_to_container(path, data, mode) {
-        return match result {
+fn handle_file_write(
+    path: &str,
+    data: &[u8],
+    mode: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> AgentResponse {
+    match nsfile::GuestNs::for_workload() {
+        nsfile::GuestNs::Container(ns) => match ns.write(path, data, mode, uid, gid) {
             Ok(()) => AgentResponse::Ok { data: None },
             Err(e) => AgentResponse::error(
                 format!("failed to write {} in the workload container: {}", path, e),
                 error_codes::FILE_IO_FAILED,
             ),
-        };
+        },
+        // Seeding the VM's own namespace, which `install_file_atomic` maps into
+        // the machine's overlay. Correct with no workload running, and a
+        // deliberate branch rather than a fallthrough.
+        nsfile::GuestNs::Root(_) => install_file_atomic(path, data, mode, uid, gid),
     }
-    install_file_atomic(path, data, mode)
 }
 
 /// State for an in-progress streaming file upload on one connection.
@@ -2703,6 +2805,10 @@ struct WriteSession {
     tmp_file: std::fs::File,
     /// Permissions to apply after rename.
     mode: Option<u32>,
+    /// Owner uid to apply after rename.
+    uid: Option<u32>,
+    /// Owner gid to apply after rename.
+    gid: Option<u32>,
     /// Running total — compared against `total_size` as a DoS guard.
     bytes_written: u64,
     /// Caller-declared total; the agent refuses chunks that would
@@ -2715,6 +2821,8 @@ impl WriteSession {
     fn open(
         target: std::path::PathBuf,
         mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
         total_size: u64,
     ) -> std::io::Result<Self> {
         if let Some(parent) = target.parent() {
@@ -2746,6 +2854,8 @@ impl WriteSession {
             tmp_path,
             tmp_file,
             mode,
+            uid,
+            gid,
             bytes_written: 0,
             total_size,
         })
@@ -2800,6 +2910,48 @@ impl WriteSession {
                 error_codes::FILE_IO_FAILED,
             );
         }
+        // A running workload reads the CONTAINER filesystem, not the agent's
+        // namespace — finalize through the ns helper there, mirroring the
+        // single-shot path (writing here would land in the overlay's upper
+        // beneath a live overlayfs, invisible to the workload: BUG-240's
+        // streaming twin). The staged bytes are piped, never re-buffered.
+        match std::fs::File::open(&self.tmp_path) {
+            Ok(mut staged) => {
+                if let nsfile::GuestNs::Container(ns) = nsfile::GuestNs::for_workload() {
+                    // Session Drop still cleans the staging file.
+                    return match ns.write_reader(
+                        &self.target.to_string_lossy(),
+                        &mut staged,
+                        self.mode,
+                        self.uid,
+                        self.gid,
+                    ) {
+                        Ok(()) => {
+                            info!(
+                                path = %self.target.display(),
+                                size = self.bytes_written,
+                                "file written into workload container"
+                            );
+                            AgentResponse::Ok { data: None }
+                        }
+                        Err(e) => AgentResponse::error(
+                            format!(
+                                "failed to write {} in the workload container: {}",
+                                self.target.display(),
+                                e
+                            ),
+                            error_codes::FILE_IO_FAILED,
+                        ),
+                    };
+                }
+            }
+            Err(e) => {
+                return AgentResponse::error(
+                    format!("failed to reopen staging file: {}", e),
+                    error_codes::FILE_IO_FAILED,
+                );
+            }
+        }
         // Disarm Drop before rename; if the rename fails we'll
         // re-arm below by restoring the path.
         let tmp = std::mem::take(&mut self.tmp_path);
@@ -2814,6 +2966,14 @@ impl WriteSession {
         }
         if let Some(m) = self.mode {
             apply_mode_best_effort(&self.target, m);
+        }
+        if self.uid.is_some() || self.gid.is_some() {
+            if let Err(e) = std::os::unix::fs::chown(&self.target, self.uid, self.gid) {
+                return AgentResponse::error(
+                    format!("failed to chown {}: {}", self.target.display(), e),
+                    error_codes::FILE_IO_FAILED,
+                );
+            }
         }
         info!(
             path = %self.target.display(),
@@ -2840,6 +3000,8 @@ impl Drop for WriteSession {
 fn handle_file_write_begin(
     path: String,
     mode: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
     total_size: u64,
 ) -> (Option<WriteSession>, AgentResponse) {
     if total_size > smolvm_protocol::FILE_TRANSFER_MAX_TOTAL {
@@ -2859,7 +3021,7 @@ fn handle_file_write_begin(
         Ok(p) => p,
         Err(resp) => return (None, resp),
     };
-    match WriteSession::open(resolved, mode, total_size) {
+    match WriteSession::open(resolved, mode, uid, gid, total_size) {
         Ok(session) => (Some(session), AgentResponse::Ok { data: None }),
         Err(e) => (
             None,
@@ -2982,8 +3144,8 @@ fn handle_streaming_file_read(
     // layer, so a file the container itself created came back 404 (BUG-240).
     // Both directions must move together: fixing only writes would break the
     // upload-then-download round trip, which is self-consistent today.
-    if let Some(opened) = nsfile::open_in_container(path) {
-        match opened {
+    if let nsfile::GuestNs::Container(ns) = nsfile::GuestNs::for_workload() {
+        match ns.open(path) {
             Ok(mut cf) => {
                 info!(path = %path, size = cf.size, "streaming file read (container)");
                 return send_data_chunks(
@@ -3262,6 +3424,10 @@ impl ResolvedLaunch {
             let mut resolved = info.entrypoint;
             resolved.extend(info.cmd);
             if resolved.is_empty() {
+                // The host's workload launcher matches on this exact phrase to
+                // downgrade a metadata-less image (e.g. a bare rootfs
+                // directory) to a bare-agent boot instead of failing the
+                // machine start — keep the wording stable.
                 return Err(format!(
                     "no command given and image '{image}' defines no entrypoint or cmd"
                 )
@@ -3367,6 +3533,7 @@ fn write_oci_bundle(
     rosetta::inject_into_container(&mut spec);
     forkpoint::inject_into_container(&mut spec);
     cuda::inject_into_container(&mut spec, rootfs_path);
+    vulkan::inject_into_container(&mut spec, rootfs_path);
     spec.write_to(bundle_path)
         .map_err(|e| format!("failed to write OCI spec: {}", e))?;
 
@@ -4328,6 +4495,7 @@ fn spawn_interactive_command(
     rosetta::inject_into_container(&mut spec);
     forkpoint::inject_into_container(&mut spec);
     cuda::inject_into_container(&mut spec, rootfs_path);
+    vulkan::inject_into_container(&mut spec, rootfs_path);
 
     spec.write_to(&bundle_path)
         .map_err(|e| format!("failed to write OCI spec: {}", e))?;
@@ -6633,6 +6801,8 @@ mod tests {
         let (session, resp) = handle_file_write_begin(
             target.to_string_lossy().into(),
             None,
+            None,
+            None,
             smolvm_protocol::FILE_TRANSFER_MAX_TOTAL + 1,
         );
         assert!(session.is_none(), "session must not be created");
@@ -6688,6 +6858,8 @@ mod tests {
         let (session, resp) = handle_file_write_begin(
             target.to_string_lossy().into(),
             Some(0o600),
+            None,
+            None,
             payload.len() as u64,
         );
         assert!(matches!(resp, AgentResponse::Ok { .. }));
@@ -6725,8 +6897,13 @@ mod tests {
         let target = tmp_target(&tmp, "multi.bin");
         let total = 1024usize;
 
-        let (mut session, resp) =
-            handle_file_write_begin(target.to_string_lossy().into(), None, total as u64);
+        let (mut session, resp) = handle_file_write_begin(
+            target.to_string_lossy().into(),
+            None,
+            None,
+            None,
+            total as u64,
+        );
         assert!(matches!(resp, AgentResponse::Ok { .. }));
 
         // Three chunks: 400 + 400 + 224 bytes, each a distinct fill byte.
@@ -6760,7 +6937,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp_target(&tmp, "overflow.bin");
 
-        let (session, _resp) = handle_file_write_begin(target.to_string_lossy().into(), None, 10);
+        let (session, _resp) =
+            handle_file_write_begin(target.to_string_lossy().into(), None, None, None, 10);
         assert!(session.is_some());
 
         // First chunk fits.
@@ -6789,7 +6967,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp_target(&tmp, "dropped.bin");
 
-        let (session, _) = handle_file_write_begin(target.to_string_lossy().into(), None, 100);
+        let (session, _) =
+            handle_file_write_begin(target.to_string_lossy().into(), None, None, None, 100);
         let (session, _) = handle_file_write_chunk(session, &[0u8; 50], false);
         assert!(session.is_some());
         // Staging file exists mid-stream.
@@ -6817,7 +6996,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp_target(&tmp, "empty.bin");
 
-        let (session, _) = handle_file_write_begin(target.to_string_lossy().into(), None, 0);
+        let (session, _) =
+            handle_file_write_begin(target.to_string_lossy().into(), None, None, None, 0);
         let (session, resp) = handle_file_write_chunk(session, &[], true);
         assert!(matches!(resp, AgentResponse::Ok { .. }));
         assert!(session.is_none());
@@ -6840,7 +7020,7 @@ mod tests {
         let target = tmp_target(&tmp, "single.bin");
         let payload = b"small file contents".to_vec();
 
-        let resp = handle_file_write(&target.to_string_lossy(), &payload, Some(0o644));
+        let resp = handle_file_write(&target.to_string_lossy(), &payload, Some(0o644), None, None);
         assert!(
             matches!(resp, AgentResponse::Ok { .. }),
             "write failed: {:?}",

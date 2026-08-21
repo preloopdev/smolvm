@@ -522,6 +522,11 @@ pub struct RunCmd {
     #[arg(long, value_name = "IP", help_heading = "Network")]
     pub dns: Option<std::net::Ipv4Addr>,
 
+    /// Join a named inter-VM network (implies --net, virtio-net only): members
+    /// get distinct addresses and can reach each other directly
+    #[arg(long = "network", value_name = "NAME", help_heading = "Network")]
+    pub network_name: Option<String>,
+
     /// Allow egress to specific CIDR range (can be used multiple times, implies --net)
     #[arg(long = "allow-cidr", value_parser = parse_cidr, value_name = "CIDR", help_heading = "Network")]
     pub allow_cidr: Vec<String>,
@@ -790,6 +795,27 @@ fn image_bakeable(image: Option<&str>) -> bool {
     )
 }
 
+/// Build the bake's `machine start` argv, forwarding the run's `--proxy` /
+/// `--no-proxy` so the one-time init pull reaches the registry through the same
+/// proxy the outer run uses. Without this, a Smolfile with `init` steps pulls
+/// direct in the bake and times out on a proxy-only network.
+fn bake_start_args<'a>(
+    tmp: &'a str,
+    proxy: Option<&'a str>,
+    no_proxy: Option<&'a str>,
+) -> Vec<&'a str> {
+    let mut start = vec!["machine", "start", "--name", tmp];
+    if let Some(p) = proxy {
+        start.push("--proxy");
+        start.push(p);
+    }
+    if let Some(n) = no_proxy {
+        start.push("--no-proxy");
+        start.push(n);
+    }
+    start
+}
+
 /// Bake `image + init` into a cached `.smolmachine` (or reuse an existing one) and
 /// return its path. Runs the well-tested `machine create/start/stop` + `pack create
 /// --from-vm` flow as subprocesses of this same binary: create a temp machine from
@@ -801,6 +827,8 @@ fn ensure_init_layer(
     smolfile: Option<&Path>,
     rebuild: bool,
     digest: Option<&str>,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
 ) -> smolvm::Result<PathBuf> {
     // The bake here only ever receives a registry image: `ensure_init_layer` is
     // gated on `image_bakeable()` (local archives/dirs take the direct path),
@@ -915,7 +943,12 @@ fn ensure_init_layer(
 
         println!("  · pulling image and running init...");
         run_smolvm(&exe, &create)?;
-        run_smolvm(&exe, &["machine", "start", "--name", &tmp])?;
+        // The image pull happens at `start`; forward the run's proxy so the
+        // bake reaches the registry through a corporate/loopback proxy too —
+        // otherwise a Smolfile with `init` steps pulls direct and times out
+        // even when the outer run was given --proxy.
+        let start = bake_start_args(&tmp, proxy, no_proxy);
+        run_smolvm(&exe, &start)?;
         run_smolvm(&exe, &["machine", "stop", "--name", &tmp])?;
         println!("  · snapshotting...");
         run_smolvm(
@@ -1024,6 +1057,9 @@ impl RunCmd {
                 debug: false,
                 cuda: self.cuda,
                 auto_graph: self.auto_graph,
+                // `--from` rejects the egress flags at parse time
+                // (`conflicts_with_all`), so there is no policy to carry.
+                egress: None,
             }
             .run();
         }
@@ -1067,6 +1103,7 @@ impl RunCmd {
             net,
             self.net_backend,
             self.dns,
+            self.network_name.clone(),
             vec![],
             self.env,
             self.workdir,
@@ -1147,6 +1184,14 @@ impl RunCmd {
                     debug: false,
                     cuda: self.cuda || params.cuda,
                     auto_graph: self.auto_graph,
+                    // A user-supplied artifact's manifest keeps deciding the
+                    // network default (no override), but any allow-list / DNS
+                    // filter from the flags or Smolfile must still be enforced.
+                    egress: Some(crate::cli::pack_run::ResolvedEgressPolicy {
+                        network_override: None,
+                        allowed_cidrs: params.allowed_cidrs.clone(),
+                        dns_filter_hosts: params.dns_filter_hosts.clone(),
+                    }),
                 }
                 .run();
             }
@@ -1217,6 +1262,8 @@ impl RunCmd {
                 self.smolfile.as_deref(),
                 self.rebuild_init_cache,
                 resolved_digest.as_deref(),
+                self.proxy_opts.proxy().as_deref(),
+                self.proxy_opts.no_proxy().as_deref(),
             )?;
             // The real workload: CLI trailing args win, else the Smolfile's
             // entrypoint+cmd (the baked artifact's own command is a `/bin/true` no-op).
@@ -1248,6 +1295,16 @@ impl RunCmd {
                 debug: false,
                 cuda: self.cuda || params.cuda,
                 auto_graph: self.auto_graph,
+                // The workload's network policy, resolved above from the flags
+                // and Smolfile. The override is absolute: the baked artifact's
+                // manifest records the BAKE VM's networking (enabled, for the
+                // pull), so without it a cache hit would run the workload with
+                // unrestricted egress no matter what the caller asked for.
+                egress: Some(crate::cli::pack_run::ResolvedEgressPolicy {
+                    network_override: Some(params.net),
+                    allowed_cidrs: params.allowed_cidrs.clone(),
+                    dns_filter_hosts: params.dns_filter_hosts.clone(),
+                }),
             }
             .run();
         }
@@ -1340,6 +1397,7 @@ impl RunCmd {
             network: params.net,
             network_backend: params.network_backend,
             dns: params.dns,
+            network_name: params.network_name.clone(),
             // CLI --gpu wins; Smolfile gpu = true also enables it.
             gpu: self.gpu || params.gpu,
             gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
@@ -1514,8 +1572,8 @@ impl RunCmd {
                 &mut client,
                 img,
                 effective_platform.as_deref(),
-                self.proxy_opts.proxy(),
-                self.proxy_opts.no_proxy(),
+                self.proxy_opts.proxy().as_deref(),
+                self.proxy_opts.no_proxy().as_deref(),
             ) {
                 Ok(info) => Some(info),
                 Err(e) if !params.net => {
@@ -1680,6 +1738,7 @@ impl RunCmd {
                                 network: params.net,
                                 network_backend: params.network_backend,
                                 dns: params.dns,
+                                network_name: params.network_name.clone(),
                                 storage_gb: params.storage_gb,
                                 overlay_gb: params.overlay_gb,
                                 allowed_cidrs: params.allowed_cidrs.clone(),
@@ -1842,6 +1901,7 @@ impl RunCmd {
                             network: params.net,
                             network_backend: params.network_backend,
                             dns: params.dns,
+                            network_name: params.network_name.clone(),
                             storage_gb: params.storage_gb,
                             overlay_gb: params.overlay_gb,
                             allowed_cidrs: params.allowed_cidrs.clone(),
@@ -1951,6 +2011,49 @@ impl RunCmd {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bake_start_forwards_proxy_when_set() {
+        // No proxy: plain start.
+        assert_eq!(
+            super::bake_start_args("t", None, None),
+            ["machine", "start", "--name", "t"]
+        );
+        // Proxy only.
+        assert_eq!(
+            super::bake_start_args("t", Some("http://host.smolvm.internal:8118"), None),
+            [
+                "machine",
+                "start",
+                "--name",
+                "t",
+                "--proxy",
+                "http://host.smolvm.internal:8118"
+            ]
+        );
+        // Proxy + no_proxy.
+        assert_eq!(
+            super::bake_start_args("t", Some("http://p:3128"), Some("localhost,.internal")),
+            [
+                "machine",
+                "start",
+                "--name",
+                "t",
+                "--proxy",
+                "http://p:3128",
+                "--no-proxy",
+                "localhost,.internal"
+            ]
+        );
+    }
+
+    #[test]
+    fn cp_mode_parses_common_octal_forms_and_rejects_garbage() {
+        assert_eq!(super::parse_octal_mode("644").unwrap(), 0o644);
+        assert_eq!(super::parse_octal_mode("0755").unwrap(), 0o755);
+        assert_eq!(super::parse_octal_mode("0o600").unwrap(), 0o600);
+        assert!(super::parse_octal_mode("8x").is_err());
+        assert!(super::parse_octal_mode("77777").is_err());
+    }
 
     use super::*;
     use clap::Parser;
@@ -2812,6 +2915,11 @@ pub struct CreateCmd {
     #[arg(long, value_name = "IP")]
     pub dns: Option<std::net::Ipv4Addr>,
 
+    /// Join a named inter-VM network (implies --net, virtio-net only): members
+    /// get distinct addresses and can reach each other directly
+    #[arg(long = "network", value_name = "NAME")]
+    pub network_name: Option<String>,
+
     /// Allow egress to specific CIDR range (can be used multiple times, implies --net)
     #[arg(long = "allow-cidr", value_parser = parse_cidr, value_name = "CIDR")]
     pub allow_cidr: Vec<String>,
@@ -2903,8 +3011,10 @@ pub struct CreateCmd {
 
     /// Command to run as the machine's persistent workload (image machines).
     /// Launched as a detached container on every `start`, so it stays running
-    /// (e.g. a pre-warmed browser to be forked). Without this, an image machine
-    /// boots to a bare agent and the image's CMD is not run.
+    /// (e.g. a pre-warmed browser to be forked). Without this, the image's own
+    /// ENTRYPOINT/CMD is launched instead; if the image defines neither (e.g.
+    /// a bare rootfs directory), the machine boots to just the agent and
+    /// commands come from `exec`/`shell`.
     ///
     /// `last = true` requires the `--` separator. With the machine name now a
     /// flag, a bare positional (an old-style `machine create myvm`) must fail
@@ -2976,6 +3086,7 @@ impl CreateCmd {
             net,
             self.net_backend,
             self.dns,
+            self.network_name.clone(),
             self.init,
             self.env,
             self.workdir,
@@ -3011,6 +3122,7 @@ impl CreateCmd {
             network: params.net,
             network_backend: params.network_backend,
             dns: params.dns,
+            network_name: params.network_name.clone(),
             gpu: params.gpu,
             gpu_vram_mib: params.gpu_vram_mib,
             cuda: params.cuda,
@@ -3083,24 +3195,30 @@ impl CreateCmd {
         // `manifest` is moved into `params`; the disks are seeded from them after
         // extraction below, or the machine boots the bare agent-rootfs with no
         // /bin/sh (mirrors pack_run + the serve API create path).
-        let vm_seed: Option<(Option<String>, Option<String>, Option<u64>)> =
-            if manifest.mode == smolvm_pack::format::PackMode::Vm {
-                Some((
-                    manifest
-                        .assets
-                        .overlay_template
-                        .as_ref()
-                        .map(|t| t.path.clone()),
-                    manifest
-                        .assets
-                        .storage_template
-                        .as_ref()
-                        .map(|t| t.path.clone()),
-                    manifest.assets.overlay_logical_size,
-                ))
-            } else {
-                None
-            };
+        struct VmModeSeed {
+            overlay_template: Option<String>,
+            storage_template: Option<String>,
+            overlay_logical_size: Option<u64>,
+            storage_logical_size: Option<u64>,
+        }
+        let vm_seed = if manifest.mode == smolvm_pack::format::PackMode::Vm {
+            Some(VmModeSeed {
+                overlay_template: manifest
+                    .assets
+                    .overlay_template
+                    .as_ref()
+                    .map(|t| t.path.clone()),
+                storage_template: manifest
+                    .assets
+                    .storage_template
+                    .as_ref()
+                    .map(|t| t.path.clone()),
+                overlay_logical_size: manifest.assets.overlay_logical_size,
+                storage_logical_size: manifest.assets.storage_logical_size,
+            })
+        } else {
+            None
+        };
 
         // Resolve the canonical path for storage in VmRecord.
         let canonical_path = sidecar_path
@@ -3190,6 +3308,7 @@ impl CreateCmd {
             net: network,
             network_backend: self.net_backend,
             dns: self.dns,
+            network_name: self.network_name.clone(),
             init: self.init.clone(),
             env: {
                 let mut env = manifest.env;
@@ -3232,6 +3351,7 @@ impl CreateCmd {
             network: params.net,
             network_backend: params.network_backend,
             dns: params.dns,
+            network_name: params.network_name.clone(),
             gpu: params.gpu,
             gpu_vram_mib: params.gpu_vram_mib,
             cuda: params.cuda,
@@ -3274,19 +3394,36 @@ impl CreateCmd {
             }
 
             println!("Extracting .smolmachine assets...");
-            let result = smolvm_pack::extract::extract_sidecar(
-                sidecar_path,
-                &cache_dir,
-                &footer,
-                false,
-                false,
-            )
-            .map_err(|e| smolvm::Error::agent("extract sidecar", e.to_string()));
+            let result = if smolvm_pack::extract::shared_extract_enabled() {
+                #[cfg(target_os = "linux")]
+                {
+                    let lease = smolvm::artifact_cache::materialize_shared_pack_lease(
+                        sidecar_path,
+                        &footer,
+                        &cache_dir,
+                        false,
+                    )
+                    .map_err(|e| smolvm::Error::agent("extract sidecar (shared)", e.to_string()))?;
+                    Ok((lease.shared_dir, Some(lease.artifact_sha256)))
+                }
+                #[cfg(not(target_os = "linux"))]
+                unreachable!("shared pack extraction is Linux-only")
+            } else {
+                smolvm_pack::extract::extract_sidecar(
+                    sidecar_path,
+                    &cache_dir,
+                    &footer,
+                    false,
+                    false,
+                )
+                .map(|()| (cache_dir.clone(), None::<String>))
+                .map_err(|e| smolvm::Error::agent("extract sidecar", e.to_string()))
+            };
             // Detach unconditionally: extraction mounts the case-sensitive volume on
             // macOS even when it later fails, so the detach must run on both success
             // and failure paths to honor the "mounted iff running" invariant.
             smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
-            result?;
+            let (pack_content_dir, artifact_sha256) = result?;
 
             // VM-mode pack: seed this machine's overlay+storage disks from the
             // packed templates so a start boots the source VM's rootfs rather than
@@ -3296,7 +3433,7 @@ impl CreateCmd {
             // (Writing the resized copy onto `manager.overlay_path()` — the default
             // `.qcow2` — handed the guest raw bytes named `.qcow2`, the /bin/sh-missing
             // bug's disk counterpart.)
-            if let Some((overlay_template, storage_template, overlay_logical_size)) = &vm_seed {
+            if let Some(seed) = &vm_seed {
                 let disk_dir = manager
                     .storage_path()
                     .parent()
@@ -3304,12 +3441,16 @@ impl CreateCmd {
                     .unwrap_or_else(|| smolvm::agent::vm_data_dir(&name_for_layers));
                 smolvm::storage::seed_vm_mode_disks(
                     &disk_dir,
-                    &cache_dir,
-                    overlay_template.as_deref(),
-                    storage_template.as_deref(),
-                    *overlay_logical_size,
-                    params.overlay_gb,
-                    params.storage_gb,
+                    &pack_content_dir,
+                    smolvm::storage::VmModeDiskSeedSpec {
+                        artifact_sha256: artifact_sha256.as_deref(),
+                        overlay_template: seed.overlay_template.as_deref(),
+                        storage_template: seed.storage_template.as_deref(),
+                        overlay_logical_size: seed.overlay_logical_size,
+                        storage_logical_size: seed.storage_logical_size,
+                        overlay_gb: params.overlay_gb,
+                        storage_gb: params.storage_gb,
+                    },
                 )
                 .map_err(|e| smolvm::Error::agent("seed VM-mode disks", e.to_string()))?;
             }
@@ -3392,13 +3533,17 @@ impl StartCmd {
             vm_common::ForkLaunch::default()
         };
         match vm_common::start_vm_named(
-            &name, proxy, no_proxy, /* from_snapshot */ false, fork,
+            &name,
+            proxy.as_deref(),
+            no_proxy.as_deref(),
+            /* from_snapshot */ false,
+            fork,
         ) {
             Ok(()) => Ok(()),
             Err(smolvm::Error::VmNotFound { .. }) if !explicit_name => {
                 // Only fall back to creating a default VM when no --name was given.
                 // With an explicit --name, VmNotFound is a real error.
-                vm_common::start_vm_default(proxy, no_proxy)
+                vm_common::start_vm_default(proxy.as_deref(), no_proxy.as_deref())
             }
             Err(e) => Err(e),
         }
@@ -3820,22 +3965,36 @@ impl EgressEventsCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let name = self.name.as_deref().unwrap_or("default");
         let events = smolvm::agent::read_egress_denials(name, self.limit);
-        if self.json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&events).unwrap_or_default()
-            );
-            return Ok(());
+        // Write through the io API instead of println!: piping into a pager
+        // that exits early (`| head`) closes stdout, and println! turns that
+        // EPIPE into a panic. A closed pipe just means the reader is done.
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        let result = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            if self.json {
+                writeln!(
+                    out,
+                    "{}",
+                    serde_json::to_string_pretty(&events).unwrap_or_default()
+                )?;
+                return Ok(());
+            }
+            if events.is_empty() {
+                writeln!(out, "No egress denials recorded for '{name}'.")?;
+                return Ok(());
+            }
+            writeln!(out, "{:<30} {:<9} DESTINATION", "TIMESTAMP", "OP")?;
+            for e in &events {
+                writeln!(out, "{:<30} {:<9} {}", e.timestamp, e.operation, e.dest)?;
+            }
+            Ok(())
+        })();
+        match result {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            Err(e) => Err(smolvm::Error::config("egress-events", e.to_string())),
+            Ok(()) => Ok(()),
         }
-        if events.is_empty() {
-            println!("No egress denials recorded for '{name}'.");
-            return Ok(());
-        }
-        println!("{:<30} {:<9} DESTINATION", "TIMESTAMP", "OP");
-        for e in &events {
-            println!("{:<30} {:<9} {}", e.timestamp, e.operation, e.dest);
-        }
-        Ok(())
     }
 }
 
@@ -4635,6 +4794,32 @@ pub struct CpCmd {
     /// Destination path (local file or machine:path)
     #[arg(value_name = "DST")]
     pub dst: String,
+
+    /// Set the file's mode on upload (octal, e.g. 644)
+    #[arg(long, value_name = "OCTAL")]
+    pub mode: Option<String>,
+
+    /// Set the file's owner uid on upload (default: root)
+    #[arg(long, value_name = "UID")]
+    pub uid: Option<u32>,
+
+    /// Set the file's owner gid on upload (default: root)
+    #[arg(long, value_name = "GID")]
+    pub gid: Option<u32>,
+}
+
+/// Parse a chmod-style octal mode ("644", "0755", "0o600").
+fn parse_octal_mode(s: &str) -> smolvm::Result<u32> {
+    let digits = s.trim_start_matches("0o");
+    u32::from_str_radix(digits, 8)
+        .ok()
+        .filter(|m| *m <= 0o7777)
+        .ok_or_else(|| {
+            smolvm::Error::config(
+                "cp",
+                format!("invalid octal mode '{s}' (expected e.g. 644)"),
+            )
+        })
 }
 
 impl CpCmd {
@@ -4653,6 +4838,13 @@ impl CpCmd {
                     "one of SRC or DST must use machine:path syntax (e.g., myvm:/workspace/file)",
                 ));
             };
+
+        if !is_upload && (self.mode.is_some() || self.uid.is_some() || self.gid.is_some()) {
+            return Err(smolvm::Error::config(
+                "cp",
+                "--mode/--uid/--gid apply to uploads only (host -> machine)",
+            ));
+        }
 
         let (manager, mut client) =
             vm_common::ensure_running_and_connect(&Some(machine_name.clone()))?;
@@ -4675,6 +4867,11 @@ impl CpCmd {
         }
 
         if is_upload {
+            let meta = smolvm::agent::FileWriteMeta {
+                mode: self.mode.as_deref().map(parse_octal_mode).transpose()?,
+                uid: self.uid,
+                gid: self.gid,
+            };
             // Stream from file — only one chunk (~1 MiB) in memory at a time.
             let file = std::fs::File::open(&local_path).map_err(|e| {
                 smolvm::Error::agent("read local file", format!("{}: {}", local_path, e))
@@ -4686,7 +4883,7 @@ impl CpCmd {
                 format!("Uploading {} -> {}", local_path, guest_path),
                 Some(size),
             );
-            client.write_file_from_reader_with_progress(&guest_path, file, size, None, |sent| {
+            client.write_file_from_reader_with_progress(&guest_path, file, size, meta, |sent| {
                 bar.update(sent)
             })?;
             bar.finish(size);

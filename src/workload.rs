@@ -44,8 +44,12 @@ pub fn persistent_overlay_owner(name: &str, golden: Option<&str>) -> String {
 /// [`persistent_overlay_owner`] (the machine name, or the golden's for a fork
 /// clone) so filesystem state survives restarts and forks.
 ///
-/// Returns `Ok(false)` (no launch) for machines without an image; callers
-/// handle bare-VM entrypoints themselves.
+/// Returns `Ok(false)` (no launch) for machines without an image, and for
+/// image machines where neither the record nor the image supplies a command —
+/// a bare rootfs directory has no OCI config at all, so failing the whole
+/// start over a missing ENTRYPOINT would make such images unusable as
+/// machines. They boot to the bare agent instead; `exec`/`shell` provide the
+/// commands.
 pub fn launch_image_workload(
     client: &mut AgentClient,
     machine_name: &str,
@@ -57,19 +61,36 @@ pub fn launch_image_workload(
     };
     let mut command = record.entrypoint.clone();
     command.extend(record.cmd.clone());
-    let config = RunConfig::new(image, command)
-        .with_env(exec_env)
-        .with_workdir(record.workdir.clone())
-        .with_user(record.user.clone())
-        .with_mounts(record_mounts_to_bindings(&record.mounts))
-        .with_persistent_overlay(Some(persistent_overlay_owner(
-            machine_name,
-            record.golden.as_deref(),
-        )));
-    client
-        .run_container_detached(config)
-        .map(|_| true)
-        .map_err(|e| crate::Error::agent("start background CMD", format!("{e}")))
+    match client.run_container_detached(
+        RunConfig::new(image, command)
+            .with_env(exec_env)
+            .with_workdir(record.workdir.clone())
+            .with_user(record.user.clone())
+            .with_mounts(record_mounts_to_bindings(&record.mounts))
+            .with_persistent_overlay(Some(persistent_overlay_owner(
+                machine_name,
+                record.golden.as_deref(),
+            ))),
+    ) {
+        Ok(_) => Ok(true),
+        Err(e) if is_missing_launch_metadata(&e.to_string()) => {
+            tracing::info!(
+                machine = machine_name,
+                image = %image,
+                "image defines no entrypoint or cmd and none was given; booting bare agent without a workload"
+            );
+            Ok(false)
+        }
+        Err(e) => Err(crate::Error::agent("start background CMD", format!("{e}"))),
+    }
+}
+
+/// Whether a detached-run failure means "nothing to launch" rather than a
+/// real error. The image is only known inside the guest (it may be imported
+/// during the run request itself), so the agent's error message — kept stable
+/// on its side for this match — is the reliable signal.
+fn is_missing_launch_metadata(message: &str) -> bool {
+    message.contains("defines no entrypoint or cmd")
 }
 
 #[cfg(test)]
@@ -86,5 +107,19 @@ mod tests {
             persistent_overlay_owner("clone-a", Some("golden-a")),
             "golden-a"
         );
+    }
+
+    // Only the agent's metadata-less-image failure downgrades a machine start
+    // to a bare-agent boot; every other launch failure must stay fatal.
+    #[test]
+    fn only_the_missing_metadata_error_is_downgraded() {
+        assert!(is_missing_launch_metadata(
+            "agent operation failed: run container detached: no command given \
+             and image 'local-dir:/images/ubuntu' defines no entrypoint or cmd"
+        ));
+        assert!(!is_missing_launch_metadata("image not found: whatever"));
+        assert!(!is_missing_launch_metadata(
+            "run container detached: crun exited with status 1"
+        ));
     }
 }
