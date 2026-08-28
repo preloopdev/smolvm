@@ -918,7 +918,16 @@ const REJUVENATE_ATTEMPTS: usize = 3;
 /// fork must fail rather than vend a clone that impersonates the golden. Steps
 /// that are legitimately absent on minimal/library images (no sshd, no dbus,
 /// no cloud-init) are guarded so they no-op instead of failing.
-fn build_rejuvenation_script(clone: &str, seed: &str, record: &VmRecord) -> String {
+/// The wall-clock re-stamp is the one deliberate fail-*soft* step: a skewed
+/// clock breaks apt/TLS validity but is recoverable and is not an isolation
+/// breach, so it must not tear the clone down, it only leaves a `clock-failed`
+/// stage marker.
+fn build_rejuvenation_script(
+    clone: &str,
+    seed: &str,
+    host_epoch: u64,
+    record: &VmRecord,
+) -> String {
     // An image machine's identity files live in the workload container's
     // rootfs, NOT the VM rootfs the agent execs in — writing them unprefixed
     // strands them where no workload will ever read them, leaving the clone on
@@ -995,9 +1004,33 @@ fn build_rejuvenation_script(clone: &str, seed: &str, record: &VmRecord) -> Stri
              fi"
         )
     };
+    // Re-stamp the wall clock to the host's time at fork. A CoW fork restores
+    // the golden's guest RAM, which carries the golden's CLOCK_REALTIME frozen
+    // at forkpoint-bake time; on Linux/KVM nothing re-seeds it (the boot-time
+    // seeder ran only in the golden's now-past `main()`, and libkrun pushes no
+    // timesync on KVM), so the clone reads `forkpoint_bake + clone_uptime` and
+    // stays that far behind real time forever — breaking apt's `Release`
+    // "not valid yet" check and TLS `notBefore` inside the clone. kvmclock keeps
+    // the *rate* correct, so a one-shot offset fix is sufficient (no continuous
+    // pusher needed). `date` here is the VM-rootfs busybox, which accepts
+    // `-s @<epoch>`; the set targets the (non-namespaced) kernel CLOCK_REALTIME,
+    // so the workload container sees it too.
+    //
+    // FAIL-SOFT (unlike the identity scrub above): it must not abort `set -e`
+    // and tear the clone down over a `date` hiccup, but it stays observable via
+    // the `clock-failed` marker rather than a silent `|| true`, so a failure is
+    // diagnosable instead of reproducing the very silent-skew bug this fixes.
+    let clock_block = if host_epoch > 0 {
+        format!(
+            "date -u -s @{host_epoch} >/dev/null 2>&1 || echo 'rejuvenate-stage=clock-failed' >&2"
+        )
+    } else {
+        "echo 'rejuvenate-stage=clock-skipped' >&2".to_string()
+    };
     format!(
         "set -e; \
          {require_root}\
+         {clock_block}; \
          hostname '{c}' 2>/dev/null || true; \
          printf '%s\\n' '{c}' > {root}/etc/hostname; \
          tr -d '-' < /proc/sys/kernel/random/uuid > {root}/etc/machine-id; \
@@ -1013,6 +1046,7 @@ fn build_rejuvenation_script(clone: &str, seed: &str, record: &VmRecord) -> Stri
          true",
         c = clone,
         s = seed,
+        clock_block = clock_block,
         state_dir = smolvm_protocol::forkpoint::STATE_DIR,
         restored = smolvm_protocol::forkpoint::RESTORED_PATH,
     )
@@ -1046,11 +1080,10 @@ fn build_rejuvenation_script(clone: &str, seed: &str, record: &VmRecord) -> Stri
 pub fn rejuvenate_clone(clone: &str, record: &VmRecord) -> Result<()> {
     let sock = vm_data_dir(clone).join("agent.sock");
     let seed = host_random_hex(64);
-    let script = build_rejuvenation_script(clone, &seed, record);
 
     let mut last_err = String::from("unknown error");
     for attempt in 1..=REJUVENATE_ATTEMPTS {
-        match rejuvenate_once(&sock, &script) {
+        match rejuvenate_once(&sock, clone, &seed, record) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 tracing::warn!(
@@ -1076,23 +1109,66 @@ pub fn rejuvenate_clone(clone: &str, record: &VmRecord) -> Result<()> {
 
 /// One attempt: connect to the clone's agent and run the re-mint script. Any
 /// connect error, exec error, or non-zero exit is a failure (fail-closed).
-fn rejuvenate_once(sock: &Path, script: &str) -> std::result::Result<(), String> {
+fn rejuvenate_once(
+    sock: &Path,
+    clone: &str,
+    seed: &str,
+    record: &VmRecord,
+) -> std::result::Result<(), String> {
     let mut client =
         AgentClient::connect_with_retry(sock).map_err(|e| format!("agent connect: {e}"))?;
+    // Capture after connection backoff and rebuild on every outer attempt. This
+    // keeps the Linux/KVM correction within the exec round-trip of host time
+    // instead of reusing an epoch made stale by retries. Other hosts pass zero:
+    // their libkrun time-sync pusher already owns CLOCK_REALTIME correction.
+    let script = build_rejuvenation_script(clone, seed, rejuvenation_host_epoch(), record);
     match client.vm_exec(
-        vec!["/bin/sh".into(), "-c".into(), script.to_string()],
+        vec!["/bin/sh".into(), "-c".into(), script],
         vec![],
         None,
         Some(std::time::Duration::from_secs(10)),
         None,
     ) {
-        Ok((0, _, _)) => Ok(()),
+        Ok((0, _, stderr)) => {
+            if clock_reset_failed(&stderr) {
+                tracing::warn!(
+                    clone,
+                    "clone rejuvenation succeeded but the Linux/KVM wall-clock reset failed"
+                );
+            }
+            Ok(())
+        }
         Ok((code, _, stderr)) => Err(format!(
             "re-mint script exited {code}: {}",
             String::from_utf8_lossy(&stderr).trim()
         )),
         Err(e) => Err(format!("exec: {e}")),
     }
+}
+
+/// Host wall clock at fork, or `0` where libkrun's time-sync pusher already
+/// owns guest `CLOCK_REALTIME` (macOS/HVF, Windows/WHP). Stepping the guest
+/// from two sources would fight that pusher.
+fn rejuvenation_host_epoch() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
+}
+
+/// Whether the fail-soft clock re-stamp reported failure on an otherwise
+/// successful rejuvenation.
+fn clock_reset_failed(stderr: &[u8]) -> bool {
+    stderr
+        .split(|byte| *byte == b'\n')
+        .any(|line| line == b"rejuvenate-stage=clock-failed")
 }
 
 /// Guest path of the per-fork parameter file, dotenv format (`KEY=VALUE`
@@ -1927,7 +2003,8 @@ mod tests {
 
     #[test]
     fn rejuvenation_script_regenerates_per_machine_secrets() {
-        let script = build_rejuvenation_script("clone-a", "deadbeef", &bare_vm_record());
+        let script =
+            build_rejuvenation_script("clone-a", "deadbeef", 1_700_000_000, &bare_vm_record());
 
         // SSH host keys: delete the golden's, then regenerate fresh ones.
         assert!(
@@ -1969,7 +2046,8 @@ mod tests {
     // (ESTALE). Overlay adoption is a host-side lookup alias instead.
     #[test]
     fn rejuvenation_script_leaves_the_inherited_overlay_alone() {
-        let script = build_rejuvenation_script("clone-a", "deadbeef", &image_record());
+        let script =
+            build_rejuvenation_script("clone-a", "deadbeef", 1_700_000_000, &image_record());
         // Writing files THROUGH the merged mount is how the workload's rootfs is
         // reached (same as `write_fork_env`); what breaks a live overlayfs is
         // renaming or removing its backing dirs.
@@ -1994,7 +2072,8 @@ mod tests {
     // machine kept the golden's SSH host keys.
     #[test]
     fn image_clones_rejuvenate_identity_inside_the_workload_rootfs() {
-        let script = build_rejuvenation_script("clone-a", "deadbeef", &image_record());
+        let script =
+            build_rejuvenation_script("clone-a", "deadbeef", 1_700_000_000, &image_record());
         let merged = "/storage/overlays/persistent-clone-a/merged";
         assert!(
             script.contains(&format!("{merged}/etc/hostname")),
@@ -2029,12 +2108,64 @@ mod tests {
     // A bare VM has no workload container, so paths stay VM-rootfs relative.
     #[test]
     fn bare_vm_clones_keep_plain_vm_paths() {
-        let script = build_rejuvenation_script("clone-a", "deadbeef", &bare_vm_record());
+        let script =
+            build_rejuvenation_script("clone-a", "deadbeef", 1_700_000_000, &bare_vm_record());
         assert!(script.contains("> /etc/hostname"));
         assert!(!script.contains("/storage/overlays"));
         assert!(script.contains(r#""$KG" -A"#));
         // No chroot on the bare-VM path: the VM rootfs is the workload's rootfs.
         assert!(!script.contains("chroot"));
+    }
+
+    // A fork restores the golden's guest RAM, so the clone inherits the golden's
+    // CLOCK_REALTIME frozen at forkpoint-bake time and — on Linux/KVM, where
+    // nothing re-seeds it — reads `forkpoint_bake + uptime` forever behind real
+    // time. The rejuvenation script must re-stamp the wall clock to the host
+    // time captured at vend, or apt's `Release` "not valid yet" check and TLS
+    // `notBefore` validation break inside every clone.
+    #[test]
+    fn rejuvenation_script_restamps_the_wall_clock() {
+        let script =
+            build_rejuvenation_script("clone-a", "deadbeef", 1_700_000_000, &bare_vm_record());
+        assert!(
+            script.contains("date -u -s @1700000000"),
+            "script must re-stamp the wall clock from the host epoch: {script}"
+        );
+        // FAIL-SOFT: unlike the identity scrub, a `date` failure must not abort
+        // `set -e` (which tears the clone down), but must stay observable — not a
+        // silent `|| true` that would reproduce the very silent-skew bug.
+        assert!(
+            script.contains("|| echo 'rejuvenate-stage=clock-failed' >&2"),
+            "clock re-stamp must be fail-soft with an observable marker: {script}"
+        );
+        // Corrected before the identity writes so the RESTORED marker and the
+        // rewritten identity files carry the corrected time.
+        assert!(
+            script.find("date -u -s @").unwrap() < script.find("/etc/machine-id").unwrap(),
+            "clock must be re-stamped before identity files are written: {script}"
+        );
+        // A zero / unavailable host epoch skips rather than setting the guest to
+        // 1970 (which would be worse than a stale-but-plausible inherited clock).
+        let skip = build_rejuvenation_script("clone-a", "deadbeef", 0, &bare_vm_record());
+        assert!(skip.contains("rejuvenate-stage=clock-skipped"));
+        assert!(!skip.contains("date -u -s @"));
+    }
+
+    #[test]
+    fn rejuvenation_clock_reset_is_limited_to_linux_kvm_hosts() {
+        let epoch = rejuvenation_host_epoch();
+        #[cfg(target_os = "linux")]
+        assert!(epoch >= 1_577_836_800, "Linux must provide a current epoch");
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(epoch, 0, "non-KVM hosts use libkrun time synchronization");
+    }
+
+    #[test]
+    fn clock_reset_failure_marker_is_detected_on_successful_exec() {
+        assert!(clock_reset_failed(
+            b"rejuvenate-stage=clock-failed\nother\n"
+        ));
+        assert!(!clock_reset_failed(b"hostname\nidentity\n"));
     }
 
     // Fix 2 (fail-closed): an Err rejuvenation must tear the clone down and
