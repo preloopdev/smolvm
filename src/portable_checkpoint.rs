@@ -1,8 +1,8 @@
 //! Portable live-checkpoint compatibility and installation.
 //!
 //! A `.smolcheckpoint` uses the ordinary pack container for files and disks,
-//! plus an eager libkrun memory/device snapshot. The container can be copied
-//! anywhere; live state is restored only under an exact, fail-closed runtime
+//! plus a durable libkrun memory/device snapshot. The container can be copied
+//! anywhere; live state is restored only under a versioned, fail-closed runtime
 //! compatibility contract.
 
 use crate::config::{RecordState, SmolvmConfig, VmRecord};
@@ -13,17 +13,15 @@ use imago::{FormatDriverBuilder, PermissiveImplicitOpenGate};
 use sha2::{Digest, Sha256};
 use smolvm_pack::assets::AssetCollector;
 use smolvm_pack::format::{
-    CheckpointAsset, CheckpointDisk, CheckpointDiskFile, CheckpointNetwork, CheckpointPort,
-    CheckpointWorkload, PackManifest, PackMode, PortableCheckpointManifest,
+    CheckpointAsset, CheckpointCpuContract, CheckpointDisk, CheckpointDiskFile, CheckpointNetwork,
+    CheckpointPort, CheckpointWorkload, PackManifest, PackMode, PortableCheckpointManifest,
 };
 use smolvm_pack::packer::Packer;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// Current portable-checkpoint metadata version.
-pub const FORMAT_VERSION: u32 = 2;
-/// Oldest metadata version this runtime can restore.
-pub const MIN_FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 3;
 /// libkrun VM/vCPU/device-state compatibility identifier.
 pub const RUNTIME_ABI: &str = "libkrun-portable-snapshot-v1";
 /// Device topology supported by the initial portable checkpoint profile.
@@ -33,6 +31,7 @@ pub const ASSET_DIR: &str = "checkpoint";
 
 const INSTALLED_DIR: &str = "portable-checkpoint";
 const PENDING_MARKER: &str = "pending";
+const RETAINED_MEMORY_BACKING: &str = ".portable-checkpoint-memory.bin";
 
 /// Optional host paths used while building a portable checkpoint artifact.
 #[derive(Debug, Clone, Default)]
@@ -259,7 +258,7 @@ pub fn capture_to_path(
         version: FORMAT_VERSION,
         runtime_abi: RUNTIME_ABI.to_string(),
         host_platform,
-        cpu_fingerprint: cpu_fingerprint()?,
+        cpu_contract: checkpoint_cpu_contract()?,
         cpus: vm.cpus,
         memory_mib: vm.mem,
         // Persist the effective sizes, not the optional user overrides. This
@@ -278,7 +277,11 @@ pub fn capture_to_path(
             &snapshot_dir.join("checkpoint.bin"),
             "checkpoint/checkpoint.bin",
         )?,
-        memory: describe_asset(&snapshot_dir.join("memory.bin"), "checkpoint/memory.bin")?,
+        // Guest RAM is a sparse logical image and may be many GiB even when
+        // very little is resident. The pack container verifies its compressed
+        // bytes; hashing the expanded holes again makes import scale with the
+        // configured RAM limit instead of the checkpoint's physical size.
+        memory: describe_sparse_asset(&snapshot_dir.join("memory.bin"), "checkpoint/memory.bin")?,
         layout: describe_asset(
             &snapshot_dir.join("manifest.bin"),
             "checkpoint/manifest.bin",
@@ -379,6 +382,75 @@ pub fn cpu_fingerprint() -> Result<String> {
         identity.push_str(&std::env::var("PROCESSOR_ARCHITECTURE").unwrap_or_default());
     }
     Ok(hex::encode(Sha256::digest(identity.as_bytes())))
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn linux_cpu_vendor(cpuinfo: &str) -> Option<String> {
+    cpuinfo
+        .lines()
+        .take_while(|line| !line.trim().is_empty())
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            (key.trim() == "vendor_id")
+                .then(|| value.trim().to_string())
+                .filter(|vendor| !vendor.is_empty() && vendor.len() <= 64)
+        })
+}
+
+fn cpu_vendor() -> Result<Option<String>> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        let cpuinfo = std::fs::read_to_string("/proc/cpuinfo")
+            .map_err(|error| Error::agent("identify CPU vendor", error.to_string()))?;
+        Ok(linux_cpu_vendor(&cpuinfo))
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        Ok(None)
+    }
+}
+
+fn checkpoint_cpu_contract() -> Result<CheckpointCpuContract> {
+    if cpu_vendor()?.as_deref() == Some("GenuineIntel") {
+        return Ok(CheckpointCpuContract::LinuxKvmIntelPortableV1);
+    }
+    Ok(CheckpointCpuContract::ExactV1 {
+        fingerprint: cpu_fingerprint()?,
+    })
+}
+
+fn validate_cpu_compatibility(checkpoint: &PortableCheckpointManifest) -> Result<()> {
+    match &checkpoint.cpu_contract {
+        CheckpointCpuContract::ExactV1 { fingerprint } => {
+            if fingerprint == &cpu_fingerprint()? {
+                return Ok(());
+            }
+            return Err(Error::agent(
+                "restore checkpoint",
+                "checkpoint CPU feature contract does not match this host",
+            ));
+        }
+        CheckpointCpuContract::LinuxKvmIntelPortableV1 => {
+            let current_vendor = cpu_vendor()?.ok_or_else(|| {
+                Error::agent(
+                    "restore checkpoint",
+                    "checkpoint CPU contract requires Linux KVM on x86_64",
+                )
+            })?;
+            if current_vendor != "GenuineIntel" {
+                return Err(Error::agent(
+                    "restore checkpoint",
+                    format!("checkpoint requires an Intel KVM host, found '{current_vendor}'"),
+                ));
+            }
+        }
+    }
+
+    // The durable vCPU state contains the exact guest CPUID and MSR contract.
+    // KVM validates those values when libkrun applies the checkpoint, so a
+    // destination missing any required architectural feature still fails
+    // closed even though host model/stepping differences are accepted here.
+    Ok(())
 }
 
 /// Reject host-bound device state that cannot yet be resumed from an artifact.
@@ -775,14 +847,30 @@ pub fn describe_asset(path: &Path, relative_path: &str) -> Result<CheckpointAsse
     })
 }
 
+fn describe_sparse_asset(path: &Path, relative_path: &str) -> Result<CheckpointAsset> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| Error::agent("inspect checkpoint payload", error.to_string()))?;
+    if !metadata.file_type().is_file() {
+        return Err(Error::agent(
+            "inspect checkpoint payload",
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    Ok(CheckpointAsset {
+        path: relative_path.to_string(),
+        size: metadata.len(),
+        sha256: String::new(),
+    })
+}
+
 /// Validate that a checkpoint may be restored by this host and runtime.
 pub fn validate_compatibility(checkpoint: &PortableCheckpointManifest) -> Result<()> {
-    if !(MIN_FORMAT_VERSION..=FORMAT_VERSION).contains(&checkpoint.version) {
+    if checkpoint.version != FORMAT_VERSION {
         return Err(Error::agent(
             "restore checkpoint",
             format!(
-                "unsupported checkpoint version {} (runtime supports {} through {})",
-                checkpoint.version, MIN_FORMAT_VERSION, FORMAT_VERSION
+                "unsupported checkpoint version {} (runtime requires {})",
+                checkpoint.version, FORMAT_VERSION
             ),
         ));
     }
@@ -876,10 +964,10 @@ pub fn validate_compatibility(checkpoint: &PortableCheckpointManifest) -> Result
             "checkpoint has invalid zero CPU or memory resources",
         ));
     }
-    // Reject resource-exhaustion artifacts before extracting or allocating
-    // their eager memory image. The current device profile maps configured RAM
-    // plus rootfs DAX and small fixed regions; 2 GiB is a deliberately generous
-    // ceiling for those non-configured mappings.
+    // Reject resource-exhaustion artifacts before extracting or mapping their
+    // memory image. The current device profile maps configured RAM plus rootfs
+    // DAX and small fixed regions; 2 GiB is a deliberately generous ceiling
+    // for those non-configured mappings.
     const MAX_STATE_BYTES: u64 = 64 * 1024 * 1024;
     const MAX_LAYOUT_BYTES: u64 = 1024 * 1024;
     const FIXED_MEMORY_OVERHEAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -901,14 +989,7 @@ pub fn validate_compatibility(checkpoint: &PortableCheckpointManifest) -> Result
             "checkpoint payload sizes are inconsistent with the captured machine",
         ));
     }
-    let current_cpu = cpu_fingerprint()?;
-    if checkpoint.cpu_fingerprint != current_cpu {
-        return Err(Error::agent(
-            "restore checkpoint",
-            "checkpoint CPU feature contract does not match this host",
-        ));
-    }
-    Ok(())
+    validate_cpu_compatibility(checkpoint)
 }
 
 fn expected_assets(
@@ -964,7 +1045,12 @@ fn validate_disk_manifest(disks: &[CheckpointDisk]) -> Result<()> {
     Ok(())
 }
 
-fn copy_verified(source: &Path, destination: &Path, asset: &CheckpointAsset) -> Result<()> {
+fn copy_verified(
+    source: &Path,
+    destination: &Path,
+    asset: &CheckpointAsset,
+    writable: bool,
+) -> Result<()> {
     let metadata = std::fs::symlink_metadata(source)
         .map_err(|error| Error::agent("inspect checkpoint payload", error.to_string()))?;
     if !metadata.file_type().is_file() || metadata.len() != asset.size {
@@ -973,35 +1059,55 @@ fn copy_verified(source: &Path, destination: &Path, asset: &CheckpointAsset) -> 
             format!("{} has an unexpected type or size", source.display()),
         ));
     }
-    let mut input = std::fs::File::open(source)
-        .map_err(|error| Error::agent("open checkpoint payload", error.to_string()))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; 1024 * 1024];
-    loop {
-        let read = input
-            .read(&mut buffer)
-            .map_err(|error| Error::agent("read checkpoint payload", error.to_string()))?;
-        if read == 0 {
-            break;
+    if asset.sha256.is_empty() {
+        if !writable {
+            return Err(Error::agent(
+                "verify checkpoint payload",
+                format!("{} is missing its SHA-256 digest", source.display()),
+            ));
         }
-        hasher.update(&buffer[..read]);
-    }
-    if hex::encode(hasher.finalize()) != asset.sha256 {
-        return Err(Error::agent(
-            "verify checkpoint payload",
-            format!("SHA-256 mismatch for {}", source.display()),
-        ));
+    } else {
+        let mut input = std::fs::File::open(source)
+            .map_err(|error| Error::agent("open checkpoint payload", error.to_string()))?;
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        loop {
+            let read = input
+                .read(&mut buffer)
+                .map_err(|error| Error::agent("read checkpoint payload", error.to_string()))?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        if hex::encode(hasher.finalize()) != asset.sha256 {
+            return Err(Error::agent(
+                "verify checkpoint payload",
+                format!("SHA-256 mismatch for {}", source.display()),
+            ));
+        }
     }
 
-    // The portable restore path only reads these files. Keep an owned hard
-    // link when the extraction cache shares this filesystem instead of writing
-    // another full RAM image per machine; cache eviction unlinks only its name.
+    if writable {
+        // Restored guest RAM is mapped writable and becomes backing for future
+        // forks. It must never alias the immutable extraction cache. Prefer a
+        // filesystem reflink so even a multi-GiB sparse image stays cheap; the
+        // fallback preserves holes while copying only allocated extents.
+        crate::disk_utils::clone_or_copy_file(source, destination)?;
+        std::fs::File::open(destination)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| Error::agent("sync checkpoint payload", error.to_string()))?;
+        return Ok(());
+    }
+
+    // VM/device state and the memory-layout manifest stay read-only. Keep an
+    // owned hard link when the extraction cache shares this filesystem; cache
+    // eviction unlinks only its name.
     match std::fs::hard_link(source, destination) {
         Ok(()) => Ok(()),
         Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {
-            input
-                .seek(SeekFrom::Start(0))
-                .map_err(|error| Error::agent("rewind checkpoint payload", error.to_string()))?;
+            let mut input = std::fs::File::open(source)
+                .map_err(|error| Error::agent("open checkpoint payload", error.to_string()))?;
             let mut output = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -1109,7 +1215,12 @@ pub fn install(
             let filename = Path::new(expected)
                 .file_name()
                 .expect("fixed checkpoint asset path");
-            copy_verified(&extracted.join(expected), &partial.join(filename), asset)?;
+            copy_verified(
+                &extracted.join(expected),
+                &partial.join(filename),
+                asset,
+                expected == "checkpoint/memory.bin",
+            )?;
         }
 
         let staged_disks = partial.join("disks");
@@ -1191,6 +1302,27 @@ pub fn install(
     result
 }
 
+/// Remove the extracted pack used only to transport a portable checkpoint.
+///
+/// All checkpoint state and disk chains have their own links or private copies
+/// in the machine data directory after [`install`] succeeds. Leaving the pack
+/// marker behind is not harmless: the generic restart path interprets any
+/// extracted pack as OCI layers and attaches an extra virtio-fs device. That
+/// changes the captured device/IRQ topology and makes the restored guest unable
+/// to receive its vsock interrupt.
+pub fn discard_transport_pack(vm_data_dir: &Path) -> Result<()> {
+    let pack_dir = vm_data_dir.join("pack");
+    smolvm_pack::extract::force_detach_layers_volume(&pack_dir);
+    match std::fs::remove_dir_all(&pack_dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Error::agent(
+            "discard checkpoint transport pack",
+            error.to_string(),
+        )),
+    }
+}
+
 /// Finish a portable live restore before exposing the machine to callers.
 ///
 /// The restored guest still contains the source machine's live container and
@@ -1220,11 +1352,43 @@ pub fn pending_dir(vm_data_dir: &Path) -> Option<PathBuf> {
 /// Consume a successfully restored checkpoint so later starts cold-boot from
 /// the machine's current disks rather than replaying stale live state.
 pub fn consume(vm_data_dir: &Path) -> Result<()> {
+    consume_with_retained_backing(vm_data_dir, cfg!(target_os = "macos"))
+}
+
+fn consume_with_retained_backing(vm_data_dir: &Path, retain_memory: bool) -> Result<()> {
     let Some(dir) = pending_dir(vm_data_dir) else {
         return Ok(());
     };
-    std::fs::remove_file(dir.join(PENDING_MARKER))
-        .map_err(|error| Error::agent("consume checkpoint", error.to_string()))?;
+    let mut retained_memory = None;
+    if retain_memory {
+        let source = dir.join("memory.bin");
+        let destination = vm_data_dir.join(RETAINED_MEMORY_BACKING);
+        if destination.exists() {
+            return Err(Error::agent(
+                "consume checkpoint",
+                format!(
+                    "retained memory backing already exists: {}",
+                    destination.display()
+                ),
+            ));
+        }
+        std::fs::rename(&source, &destination)
+            .map_err(|error| Error::agent("retain checkpoint memory", error.to_string()))?;
+        retained_memory = Some((source, destination));
+    }
+    std::fs::remove_file(dir.join(PENDING_MARKER)).map_err(|error| {
+        if let Some((source, destination)) = retained_memory.as_ref() {
+            if let Err(rollback_error) = std::fs::rename(destination, source) {
+                tracing::warn!(
+                    source = %source.display(),
+                    destination = %destination.display(),
+                    %rollback_error,
+                    "failed to roll back retained checkpoint memory"
+                );
+            }
+        }
+        Error::agent("consume checkpoint", error.to_string())
+    })?;
     if let Err(error) = std::fs::remove_dir_all(&dir) {
         tracing::warn!(path = %dir.display(), %error, "checkpoint consumed but payload cleanup failed");
     }
@@ -1268,7 +1432,7 @@ mod tests {
             host_platform: crate::platform::Platform::current()
                 .host_oci_platform()
                 .to_string(),
-            cpu_fingerprint: cpu_fingerprint().unwrap(),
+            cpu_contract: checkpoint_cpu_contract().unwrap(),
             cpus: 2,
             memory_mib: 512,
             storage_gib: None,
@@ -1276,7 +1440,8 @@ mod tests {
             device_profile: DEVICE_PROFILE.to_string(),
             state: describe_asset(&source.join("checkpoint.bin"), "checkpoint/checkpoint.bin")
                 .unwrap(),
-            memory: describe_asset(&source.join("memory.bin"), "checkpoint/memory.bin").unwrap(),
+            memory: describe_sparse_asset(&source.join("memory.bin"), "checkpoint/memory.bin")
+                .unwrap(),
             layout: describe_asset(&source.join("manifest.bin"), "checkpoint/manifest.bin")
                 .unwrap(),
             disks: vec![
@@ -1288,6 +1453,7 @@ mod tests {
         };
         let machine = tempfile::tempdir().unwrap();
         install(extracted.path(), machine.path(), &metadata).unwrap();
+        assert!(metadata.memory.sha256.is_empty());
         assert!(pending_dir(machine.path()).is_some());
         assert_eq!(
             std::fs::read(machine.path().join("storage.raw")).unwrap(),
@@ -1302,15 +1468,25 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            assert_eq!(
+            assert_ne!(
                 std::fs::metadata(source.join("memory.bin")).unwrap().ino(),
                 std::fs::metadata(machine.path().join(INSTALLED_DIR).join("memory.bin"))
                     .unwrap()
                     .ino()
             );
         }
+        std::fs::write(
+            machine.path().join(INSTALLED_DIR).join("memory.bin"),
+            b"private",
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(source.join("memory.bin")).unwrap(), b"memory");
         consume(machine.path()).unwrap();
         assert!(pending_dir(machine.path()).is_none());
+        assert_eq!(
+            machine.path().join(RETAINED_MEMORY_BACKING).exists(),
+            cfg!(target_os = "macos")
+        );
         assert_eq!(
             std::fs::read(machine.path().join("storage.raw")).unwrap(),
             b"storage-disk"
@@ -1321,9 +1497,83 @@ mod tests {
             u64::from(oversized.memory_mib) * 1024 * 1024 + 2 * 1024 * 1024 * 1024 + 1;
         assert!(validate_compatibility(&oversized).is_err());
 
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            validate_compatibility(&metadata).expect("capturing host satisfies its CPU contract");
+            match cpu_vendor().unwrap().as_deref() {
+                Some("GenuineIntel") => assert_eq!(
+                    metadata.cpu_contract,
+                    CheckpointCpuContract::LinuxKvmIntelPortableV1
+                ),
+                _ => assert_eq!(
+                    metadata.cpu_contract,
+                    CheckpointCpuContract::ExactV1 {
+                        fingerprint: cpu_fingerprint().unwrap(),
+                    }
+                ),
+            }
+        }
+
+        let mut exact_mismatch = metadata.clone();
+        exact_mismatch.cpu_contract = CheckpointCpuContract::ExactV1 {
+            fingerprint: "different-host".to_string(),
+        };
+        assert!(validate_compatibility(&exact_mismatch).is_err());
+
         let mut incompatible = metadata;
         incompatible.runtime_abi.push_str("-other");
         assert!(validate_compatibility(&incompatible).is_err());
+    }
+
+    #[test]
+    fn immutable_checkpoint_payload_requires_digest() {
+        let source = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(source.path(), b"state").unwrap();
+        let destination_dir = tempfile::tempdir().unwrap();
+        let destination = destination_dir.path().join("state-copy");
+        let asset = CheckpointAsset {
+            path: "checkpoint/checkpoint.bin".to_string(),
+            size: 5,
+            sha256: String::new(),
+        };
+
+        let error = copy_verified(source.path(), &destination, &asset, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("missing its SHA-256 digest"), "{error}");
+    }
+
+    #[test]
+    fn checkpoint_transport_pack_is_removed_after_install() {
+        let machine = tempfile::tempdir().unwrap();
+        let pack = machine.path().join("pack");
+        std::fs::create_dir(&pack).unwrap();
+        std::fs::write(pack.join(".smolvm-extracted"), b"").unwrap();
+        std::fs::write(pack.join("transport-only"), b"payload").unwrap();
+
+        discard_transport_pack(machine.path()).unwrap();
+
+        assert!(!pack.exists());
+    }
+
+    #[test]
+    fn consume_can_retain_a_live_memory_backing() {
+        let machine = tempfile::tempdir().unwrap();
+        let pending = machine.path().join(INSTALLED_DIR);
+        std::fs::create_dir(&pending).unwrap();
+        std::fs::write(pending.join(PENDING_MARKER), b"1\n").unwrap();
+        std::fs::write(pending.join("checkpoint.bin"), b"state").unwrap();
+        std::fs::write(pending.join("manifest.bin"), b"layout").unwrap();
+        std::fs::write(pending.join("memory.bin"), b"live-memory").unwrap();
+
+        consume_with_retained_backing(machine.path(), true).unwrap();
+
+        assert!(pending_dir(machine.path()).is_none());
+        assert!(!pending.exists());
+        assert_eq!(
+            std::fs::read(machine.path().join(RETAINED_MEMORY_BACKING)).unwrap(),
+            b"live-memory"
+        );
     }
 
     #[test]
@@ -1382,14 +1632,14 @@ mod tests {
     }
 
     #[test]
-    fn version_one_bare_checkpoint_remains_compatible() {
+    fn unreleased_checkpoint_versions_are_rejected() {
         let mut metadata = PortableCheckpointManifest {
-            version: 1,
+            version: FORMAT_VERSION,
             runtime_abi: RUNTIME_ABI.to_string(),
             host_platform: crate::platform::Platform::current()
                 .host_oci_platform()
                 .to_string(),
-            cpu_fingerprint: cpu_fingerprint().unwrap(),
+            cpu_contract: checkpoint_cpu_contract().unwrap(),
             cpus: 1,
             memory_mib: 1,
             storage_gib: None,
@@ -1412,10 +1662,27 @@ mod tests {
             },
             disks: Vec::new(),
             workload: None,
-            network: None,
+            network: Some(CheckpointNetwork::default()),
         };
         validate_compatibility(&metadata).unwrap();
-        metadata.version = 0;
+        metadata.version = FORMAT_VERSION - 1;
         assert!(validate_compatibility(&metadata).is_err());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn linux_cpu_vendor_parser_is_bounded_and_first_processor_only() {
+        assert_eq!(
+            linux_cpu_vendor(
+                "processor: 0\nvendor_id: GenuineIntel\n\nprocessor: 1\nvendor_id: Other\n"
+            ),
+            Some("GenuineIntel".to_string())
+        );
+        assert_eq!(linux_cpu_vendor("processor: 0\nmodel: 1\n\n"), None);
+        let oversized = "x".repeat(65);
+        assert_eq!(
+            linux_cpu_vendor(&format!("vendor_id: {oversized}\n\n")),
+            None
+        );
     }
 }
