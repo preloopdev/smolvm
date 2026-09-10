@@ -33,6 +33,15 @@ pub enum ImageSource {
     /// An already-unpacked root filesystem directory (apptainer-style). Used
     /// as-is — no extraction.
     Directory(PathBuf),
+    /// A value that is recognisably meant as a local source but in a form
+    /// smolvm does not read. Carries the exact syntax to use instead, so the
+    /// error names the fix rather than a registry-parser failure.
+    Unsupported {
+        /// The value exactly as the user wrote it.
+        given: String,
+        /// The syntax to use instead.
+        hint: String,
+    },
 }
 
 /// Where an [`ImageSource::Archive`]'s bytes come from.
@@ -57,6 +66,18 @@ pub fn classify(image: &str) -> ImageSource {
     if image == "-" {
         return ImageSource::Archive(ArchiveInput::Stdin);
     }
+    // `file://` is not a scheme smolvm reads; left alone it either fell through
+    // to the registry parser or was handed to the filesystem with the prefix
+    // still attached. Name it so the caller can reject it with the real syntax.
+    if let Some(rest) = image.strip_prefix("file://") {
+        return ImageSource::Unsupported {
+            given: image.to_string(),
+            hint: format!(
+                "`file://` is not a supported prefix; give the path directly: `{}`",
+                rest
+            ),
+        };
+    }
     if looks_local(image) {
         let path = Path::new(image);
         // Only an existing directory is treated as a ready-made rootfs; a
@@ -76,9 +97,21 @@ fn looks_local(image: &str) -> bool {
     image.starts_with('/')
         || image.starts_with("./")
         || image.starts_with("../")
+        || has_windows_drive_prefix(image)
         || ARCHIVE_SUFFIXES
             .iter()
             .any(|suffix| image.ends_with(suffix))
+}
+
+/// `C:\…` or `C:/…` — a Windows absolute path. A registry reference can carry
+/// a `:` (`repo:tag`, `host:port/repo`) but never a single letter followed by
+/// `:` and a path separator, so this cannot mistake a reference for a path.
+fn has_windows_drive_prefix(image: &str) -> bool {
+    let bytes = image.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'/' || bytes[2] == b'\\')
 }
 
 /// Whether a local path is a Dockerfile rather than an image archive — so we can
@@ -171,6 +204,10 @@ pub fn resolve(source: ImageSource) -> Result<ResolvedImage> {
         ImageSource::Registry(reference) => Ok(ResolvedImage::Registry(reference)),
         ImageSource::Directory(path) => resolve_directory(&path),
         ImageSource::Archive(input) => resolve_archive(input),
+        ImageSource::Unsupported { given, hint } => Err(Error::config(
+            "image source",
+            format!("unsupported image reference '{given}': {hint}"),
+        )),
     }
 }
 
@@ -566,6 +603,68 @@ mod tests {
                 assert_eq!(packed_layers_dir, dir.path().canonicalize().unwrap());
             }
             other => panic!("expected Local, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+
+    /// `file://` is not a scheme smolvm reads. It used to fall through to the
+    /// registry parser, which appended `:latest` to a `.tar` path and failed
+    /// with an unparseable-reference error that named neither the cause nor
+    /// the fix.
+    #[test]
+    fn a_file_scheme_is_rejected_with_the_real_syntax() {
+        match classify("file://D:/images/debian.tar") {
+            ImageSource::Unsupported { given, hint } => {
+                assert_eq!(given, "file://D:/images/debian.tar");
+                assert!(
+                    hint.contains("D:/images/debian.tar"),
+                    "hint names the bare path: {hint}"
+                );
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+
+        let err = resolve(classify("file:///srv/x.tar")).expect_err("must not resolve");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("file://") && msg.contains("/srv/x.tar"),
+            "{msg}"
+        );
+    }
+
+    /// A Windows absolute path is a local source whether or not it carries an
+    /// archive suffix; a registry reference never has a one-letter drive
+    /// prefix, so `repo:tag` and `host:5000/repo` are untouched.
+    #[test]
+    fn windows_drive_paths_are_local_and_references_are_not() {
+        for local in [
+            "D:/images/rootfs",
+            "C:\\Users\\me\\rootfs",
+            "D:/images/debian.tar",
+        ] {
+            assert!(
+                !matches!(classify(local), ImageSource::Registry(_)),
+                "{local} must be local"
+            );
+        }
+
+        // `ab:/x` has a two-letter "drive", `a:x` has no separator: neither is
+        // a Windows path, and both fall through as references as before.
+        for reference in [
+            "alpine",
+            "python:3.12",
+            "localhost:5000/repo:tag",
+            "ab:/x",
+            "a:x",
+        ] {
+            assert!(
+                matches!(classify(reference), ImageSource::Registry(_)),
+                "{reference} must be a registry reference"
+            );
         }
     }
 }

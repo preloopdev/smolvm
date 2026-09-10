@@ -41,16 +41,74 @@ impl EmbeddedRuntime {
         self.with_name_lock(&spec.name, || control::create_vm(&self.db, &spec))
     }
 
-    /// Create a persisted image machine with its launch-time environment and
-    /// working directory.
+    /// Create a persisted image machine with its launch-time environment,
+    /// working directory and user.
     pub fn create_machine_with_workload(
         &self,
         spec: MachineSpec,
         env: Vec<(String, String)>,
         workdir: Option<String>,
+        user: Option<String>,
     ) -> Result<()> {
         self.with_name_lock(&spec.name, || {
-            control::create_vm_with_workload(&self.db, &spec, env, workdir)
+            control::create_vm_with_workload(&self.db, &spec, env, workdir, user)
+        })
+    }
+
+    /// Capture a running checkpointable machine into a portable artifact.
+    ///
+    /// The source resumes as soon as its consistent RAM/disk boundary is
+    /// staged; compression continues without holding the source pause.
+    pub fn checkpoint_machine(
+        &self,
+        name: &str,
+        output: &std::path::Path,
+        options: &crate::portable_checkpoint::CaptureOptions,
+    ) -> Result<crate::portable_checkpoint::CaptureResult> {
+        self.with_name_lock(name, || {
+            crate::portable_checkpoint::capture_to_path(name, output, options)
+        })
+    }
+
+    /// Create a stopped machine from a portable live checkpoint artifact.
+    ///
+    /// Its first start resumes the captured execution state. The restored
+    /// machine is also a fork/checkpoint source, which makes it suitable as a
+    /// durable rollback root.
+    pub fn restore_checkpoint_machine(&self, name: &str, artifact: &std::path::Path) -> Result<()> {
+        self.with_name_lock(name, || {
+            crate::portable_checkpoint::restore_from_path(&self.db, name, artifact)
+        })
+    }
+
+    /// Restore and start a checkpoint for a detached CLI operation.
+    ///
+    /// The VMM outlives the caller, unlike the process-owned SDK handle.
+    pub fn restore_checkpoint_machine_detached(
+        &self,
+        name: &str,
+        artifact: &std::path::Path,
+    ) -> Result<()> {
+        self.with_name_lock(name, || {
+            crate::portable_checkpoint::restore_from_path(&self.db, name, artifact)?;
+            let start = (|| -> Result<VmHandle> {
+                let started = control::start_vm(&self.db, name)?;
+                let mut handle = started.handle;
+                if started.freshly_started {
+                    self.launch_image_workload(name, &mut handle)?;
+                }
+                Ok(handle)
+            })();
+            match start {
+                Ok(handle) => {
+                    handle.detach();
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = control::delete_vm(&self.db, name);
+                    Err(error)
+                }
+            }
         })
     }
 
@@ -180,8 +238,8 @@ impl EmbeddedRuntime {
     /// Fork a running, forkable `golden` into a new `clone` (copy-on-write guest
     /// RAM + disks, same host) and cache the clone's handle so it can be exec'd
     /// by name. `ports` are `(host, guest)` inbound forwards for the clone; empty
-    /// remaps the golden's forwards to fresh host ports. The golden freezes as the
-    /// shared base and must not be started again while clones exist.
+    /// remaps the golden's forwards to fresh host ports. Supported hosts resume
+    /// the source after publishing a consistent fork generation.
     pub fn fork_machine(&self, golden: &str, clone: &str, ports: &[(u16, u16)]) -> Result<()> {
         self.with_name_locks(&[golden, clone], || {
             let handle = control::fork_vm(&self.db, golden, clone, ports)?;
@@ -238,6 +296,31 @@ impl EmbeddedRuntime {
             };
             for (name, handle) in started {
                 registry.insert(name, Arc::new(Mutex::new(handle)));
+            }
+            Ok(())
+        })
+    }
+
+    /// Fork several machines for a detached CLI operation. The group is
+    /// prepared transactionally from one generation and every successful clone
+    /// outlives this process.
+    pub fn fork_machines_detached(
+        &self,
+        golden: &str,
+        clones: &[String],
+        ports: &[(u16, u16)],
+        parallel: usize,
+    ) -> Result<()> {
+        let mut lock_names = Vec::with_capacity(clones.len() + 1);
+        lock_names.push(golden);
+        lock_names.extend(clones.iter().map(String::as_str));
+        self.with_name_locks(&lock_names, || {
+            let requests: Vec<_> = clones
+                .iter()
+                .map(|name| (name.clone(), ports.to_vec()))
+                .collect();
+            for (_, handle) in control::fork_vm_batch(&self.db, golden, &requests, parallel)? {
+                handle.detach();
             }
             Ok(())
         })
@@ -311,6 +394,7 @@ impl EmbeddedRuntime {
     pub fn stop_machine(&self, name: &str) -> Result<()> {
         self.with_name_lock(name, || {
             let _source_lock = crate::agent::fork::lock_fork_source(name)?;
+            let record = control::get_record(&self.db, name)?;
             let dependents = self.db.dependent_clones(name)?;
             if !dependents.is_empty() {
                 return Err(Error::agent(
@@ -322,7 +406,11 @@ impl EmbeddedRuntime {
                 ));
             }
             if let Some(handle) = self.remove_cached_handle(name)? {
-                lock_handle(&handle)?.stop()?;
+                let mut handle = lock_handle(&handle)?;
+                if !record.staged_mounts.is_empty() {
+                    handle.sync_staged_mounts(&record)?;
+                }
+                handle.stop()?;
                 control::mark_stopped(&self.db, name)?;
                 return Ok(());
             }
@@ -364,10 +452,21 @@ impl EmbeddedRuntime {
                 // response that cannot arrive.
                 self.remove_cached_handle(name)?;
                 crate::agent::state_probe::recover_unreachable_machine_in_db(&record, &self.db)?;
+            } else if matches!(
+                state,
+                crate::config::RecordState::Stopped | crate::config::RecordState::Created
+            ) {
+                // A graceful stop already synchronized staged mounts. Do not
+                // reconnect to the now-absent agent and fail a subsequent delete.
+                self.remove_cached_handle(name)?;
             } else if let Some(handle) = self.remove_cached_handle(name)? {
-                let _ = lock_handle(&handle)?.stop();
+                let mut handle = lock_handle(&handle)?;
+                if !record.staged_mounts.is_empty() {
+                    handle.sync_staged_mounts(&record)?;
+                }
+                handle.stop()?;
             } else {
-                let _ = control::stop_vm(&self.db, name);
+                control::stop_vm(&self.db, name)?;
             }
 
             // Idempotent: deleting an already-deleted machine is a no-op success
@@ -379,6 +478,21 @@ impl EmbeddedRuntime {
             }
             self.remove_name_lock(name)?;
             Ok(())
+        })
+    }
+
+    /// Copy guest-local staged mounts back to their host sources without
+    /// stopping the machine.
+    pub fn sync_machine(&self, name: &str) -> Result<()> {
+        self.with_name_lock(name, || {
+            let _source_lock = crate::agent::fork::lock_fork_source(name)?;
+            let record = control::get_record(&self.db, name)?;
+            if record.staged_mounts.is_empty() {
+                return Ok(());
+            }
+            let handle = self.started_handle(name)?;
+            let result = lock_handle(&handle)?.sync_staged_mounts(&record);
+            result
         })
     }
 
@@ -405,6 +519,7 @@ impl EmbeddedRuntime {
                     .with_env(env)
                     .with_workdir(workdir)
                     .with_timeout(timeout)
+                    .with_mounts(self.mount_bindings_for(name)?)
                     .with_s3_volumes(self.s3_volumes_for(name)?)
                     .with_persistent_overlay(Some(overlay_owner));
                 handle.run_config(config)
@@ -424,9 +539,24 @@ impl EmbeddedRuntime {
         workdir: Option<String>,
         timeout: Option<Duration>,
     ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
+        let (_, overlay_owner) = self.image_and_overlay_owner(name)?;
+        let mount_bindings = self.mount_bindings_for(name)?;
+        let s3_volumes = self.s3_volumes_for(name)?;
         let handle = self.started_handle(name)?;
         let mut handle = lock_handle(&handle)?;
-        handle.run(image, command, env, workdir, timeout)
+        if mount_bindings.is_empty() && s3_volumes.is_empty() {
+            return handle.run(image, command, env, workdir, timeout);
+        }
+        handle.pull_image(image)?;
+        handle.run_config(
+            RunConfig::new(image, command)
+                .with_env(env)
+                .with_workdir(workdir)
+                .with_timeout(timeout)
+                .with_mounts(mount_bindings)
+                .with_s3_volumes(s3_volumes)
+                .with_persistent_overlay(Some(overlay_owner)),
+        )
     }
 
     /// Pull an OCI image into the machine's storage.
@@ -452,18 +582,20 @@ impl EmbeddedRuntime {
         mode: Option<u32>,
     ) -> Result<()> {
         let (image, overlay_owner) = self.image_and_overlay_owner(name)?;
+        let mount_bindings = self.mount_bindings_for(name)?;
         let handle = self.started_handle(name)?;
         let mut handle = lock_handle(&handle)?;
-        Self::activate_image_overlay(&mut handle, image, overlay_owner)?;
+        Self::activate_image_overlay(&mut handle, image, overlay_owner, mount_bindings)?;
         handle.write_file(path, &data, mode)
     }
 
     /// Read a file from the machine.
     pub fn read_file(&self, name: &str, path: &str) -> Result<Vec<u8>> {
         let (image, overlay_owner) = self.image_and_overlay_owner(name)?;
+        let mount_bindings = self.mount_bindings_for(name)?;
         let handle = self.started_handle(name)?;
         let mut handle = lock_handle(&handle)?;
-        Self::activate_image_overlay(&mut handle, image, overlay_owner)?;
+        Self::activate_image_overlay(&mut handle, image, overlay_owner, mount_bindings)?;
         handle.read_file(path)
     }
 
@@ -474,12 +606,14 @@ impl EmbeddedRuntime {
         handle: &mut VmHandle,
         image: Option<String>,
         overlay_owner: String,
+        mount_bindings: Vec<(String, String, bool)>,
     ) -> Result<()> {
         let Some(image) = image else {
             return Ok(());
         };
         let (code, _, stderr) = handle.run_config(
             RunConfig::new(image, vec!["/bin/true".to_string()])
+                .with_mounts(mount_bindings)
                 .with_persistent_overlay(Some(overlay_owner)),
         )?;
         if code == 0 {
@@ -535,6 +669,11 @@ impl EmbeddedRuntime {
         ))
     }
 
+    fn mount_bindings_for(&self, name: &str) -> Result<Vec<(String, String, bool)>> {
+        let record = control::get_record(&self.db, name)?;
+        Ok(crate::workload::record_mounts_to_bindings(&record))
+    }
+
     /// The machine's image, if it is an image (container-workload) machine.
     /// Streamed execs on such a machine must run inside its persistent container
     /// overlay so their writes survive — matching non-streaming exec.
@@ -586,6 +725,7 @@ impl EmbeddedRuntime {
                     .with_env(env)
                     .with_workdir(workdir)
                     .with_timeout(timeout)
+                    .with_mounts(self.mount_bindings_for(name)?)
                     .with_s3_volumes(self.s3_volumes_for(name)?)
                     .with_persistent_overlay(Some(overlay_owner));
                 handle.run_streaming_with(config, on_event)
@@ -941,6 +1081,19 @@ mod tests {
             .read()
             .expect("name locks should not be poisoned")
             .contains_key("runtime-delete-lock"));
+    }
+
+    #[test]
+    fn delete_already_stopped_staged_machine_does_not_reconnect() {
+        let db = test_db();
+        let runtime = EmbeddedRuntime::with_db(db.clone());
+        let mut record = test_spec("delete-stopped-staged", true).to_record();
+        record.state = crate::config::RecordState::Stopped;
+        record.staged_mounts = vec![(0, "/host/work".into(), "/work".into())];
+        db.insert_vm("delete-stopped-staged", &record).unwrap();
+
+        runtime.delete_machine("delete-stopped-staged").unwrap();
+        assert!(db.get_vm("delete-stopped-staged").unwrap().is_none());
     }
 
     #[test]

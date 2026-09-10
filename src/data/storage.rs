@@ -1,5 +1,6 @@
 use crate::data::error::{Error, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 /// Default size for the rootfs overlay disk (10 GiB sparse).
@@ -18,6 +19,12 @@ pub const OVERLAY_DISK_FILENAME: &str = "overlay.raw";
 /// Storage disk filename.
 pub const STORAGE_DISK_FILENAME: &str = "storage.raw";
 
+/// Persisted live-mount tuple: host source, guest target, read-only flag.
+pub type StoredHostMount = (String, String, bool);
+
+/// Persisted staged-mount tuple: original position, host source, guest target.
+pub type StoredStagedMount = (usize, String, String);
+
 /// Host directory mount.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HostMount {
@@ -29,6 +36,13 @@ pub struct HostMount {
 
     /// Read-only mount (default: true per DESIGN.md).
     pub read_only: bool,
+
+    /// Keep the working copy on the guest storage disk and synchronize it in
+    /// batches instead of forwarding every filesystem operation over
+    /// virtiofs. Staged mounts are writable and deliberately trade live
+    /// host/guest coherence for metadata-heavy workload performance.
+    #[serde(default)]
+    pub staged: bool,
 }
 
 impl HostMount {
@@ -83,10 +97,26 @@ impl HostMount {
         target: impl Into<PathBuf>,
         read_only: bool,
     ) -> Result<Self> {
+        Self::new_with_system_mounts(source, target, read_only, false)
+    }
+
+    /// Create a host mount, optionally permitting selected host system trees.
+    ///
+    /// The opt-in is deliberately narrow: only configuration and log trees may
+    /// be exposed, they must be read-only, and they must appear below `/host`
+    /// in the guest. Virtual kernel filesystems and executable system trees
+    /// remain blocked even for trusted callers.
+    pub fn new_with_system_mounts(
+        source: impl Into<PathBuf>,
+        target: impl Into<PathBuf>,
+        read_only: bool,
+        allow_system_mounts: bool,
+    ) -> Result<Self> {
         let mut mount = Self {
             source: source.into(),
             target: target.into(),
             read_only,
+            staged: false,
         };
 
         if !mount.source.exists() {
@@ -111,7 +141,11 @@ impl HostMount {
                 format!("'{}': {}", mount.source.display(), e),
             )
         })?;
-        Self::validate(&mount)?;
+        if allow_system_mounts {
+            Self::validate_with_system_mounts(&mount, true)?;
+        } else {
+            Self::validate(&mount)?;
+        }
         Ok(mount)
     }
 
@@ -119,22 +153,26 @@ impl HostMount {
     ///
     /// If no mode is provided, the mount defaults to writable.
     /// The source path is validated, required to be a directory, and canonicalized.
-    fn _parse(spec: &str) -> Result<Self> {
+    fn _parse(spec: &str, allow_system_mounts: bool) -> Result<Self> {
         // Parse from the right so a Windows host path keeps its drive-letter
         // colon (e.g. `C:\data:/data:ro`). The guest path is a Unix path with no
         // colon, and the optional trailing mode is `ro`/`rw`; everything before
         // the guest path is the host source.
-        let (rest, read_only) = match spec.rsplit_once(':') {
-            Some((head, "ro")) => (head, true),
-            Some((head, "rw")) => (head, false),
-            _ => (spec, false),
+        let (rest, read_only, staged) = match spec.rsplit_once(':') {
+            Some((head, "ro")) => (head, true, false),
+            Some((head, "rw")) => (head, false, false),
+            Some((head, "staged")) => (head, false, true),
+            _ => (spec, false, false),
         };
         match rest.rsplit_once(':') {
             Some((source, target)) if !source.is_empty() && !target.is_empty() => {
-                Self::new(source, target, read_only)
+                let mut mount =
+                    Self::new_with_system_mounts(source, target, read_only, allow_system_mounts)?;
+                mount.staged = staged;
+                Ok(mount)
             }
             _ => Err(Error::invalid_mount_path(format!(
-                "invalid format '{}' (expected host:guest[:ro|:rw])",
+                "invalid format '{}' (expected host:guest[:ro|:rw|:staged])",
                 spec
             ))),
         }
@@ -142,9 +180,18 @@ impl HostMount {
 
     /// Parse multiple mount specifications.
     pub fn parse(specs: &[String]) -> Result<Vec<Self>> {
+        Self::parse_with_system_mounts(specs, false)
+    }
+
+    /// Parse mounts for a trusted local caller that explicitly opted into
+    /// read-only host system configuration/log mounts.
+    pub fn parse_with_system_mounts(
+        specs: &[String],
+        allow_system_mounts: bool,
+    ) -> Result<Vec<Self>> {
         let mounts: Vec<Self> = specs
             .iter()
-            .map(|spec| Self::_parse(spec))
+            .map(|spec| Self::_parse(spec, allow_system_mounts))
             .collect::<Result<_>>()?;
         Self::ensure_unique_targets(&mounts)?;
         Ok(mounts)
@@ -171,11 +218,36 @@ impl HostMount {
     }
 
     fn validate(mount: &Self) -> Result<()> {
+        Self::validate_with_system_mounts(mount, false)
+    }
+
+    fn validate_with_system_mounts(mount: &Self, allow_system_mounts: bool) -> Result<()> {
         for (illegal_path, block_subtree) in Self::ILLEGAL_SOURCE_MOUNT_PATH {
             let illegal_path = Path::new(illegal_path);
             if mount.source == illegal_path
                 || (*block_subtree && mount.source.starts_with(illegal_path))
             {
+                if allow_system_mounts && Self::trusted_system_source(&mount.source) {
+                    if !mount.read_only {
+                        return Err(Error::mount(
+                            "validate host path",
+                            format!(
+                                "system mount must be read-only; add ':ro' to the volume: {}",
+                                mount.source.display()
+                            ),
+                        ));
+                    }
+                    if !Self::target_is_below_host(&mount.target) {
+                        return Err(Error::mount(
+                            "validate guest path",
+                            format!(
+                                "system mount target must be /host or below it (for example /host/etc): {}",
+                                mount.target.display()
+                            ),
+                        ));
+                    }
+                    continue;
+                }
                 return Err(Error::mount(
                     "validate host path",
                     format!(
@@ -203,12 +275,66 @@ impl HostMount {
         Ok(())
     }
 
+    fn target_is_below_host(target: &Path) -> bool {
+        use std::path::Component;
+
+        let mut components = target.components();
+        if components.next() != Some(Component::RootDir)
+            || components.next() != Some(Component::Normal("host".as_ref()))
+        {
+            return false;
+        }
+
+        components.all(|component| matches!(component, Component::Normal(_)))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn trusted_system_source(source: &Path) -> bool {
+        source == Path::new("/etc")
+            || source.starts_with("/etc")
+            || source == Path::new("/var/log")
+            || source.starts_with("/var/log")
+    }
+
+    #[cfg(target_os = "macos")]
+    fn trusted_system_source(source: &Path) -> bool {
+        // `/etc` and `/var/log` canonicalize below `/private` on macOS.
+        source == Path::new("/private/etc")
+            || source.starts_with("/private/etc")
+            || source == Path::new("/private/var/log")
+            || source.starts_with("/private/var/log")
+    }
+
+    #[cfg(target_os = "windows")]
+    fn trusted_system_source(_source: &Path) -> bool {
+        // The initial capability is intentionally scoped to Unix `/etc` and
+        // `/var/log` semantics. Add Windows trees only with equivalent QA.
+        false
+    }
+
     /// Generate a virtiofs mount tag for a given index.
     ///
     /// Mount tags follow the format "smolvm0", "smolvm1", etc. and are used
     /// consistently across the host launcher, API handlers, and guest agent.
     pub fn mount_tag(index: usize) -> String {
         format!("smolvm{}", index)
+    }
+
+    /// Tag carried in agent/container mount metadata. Live mounts use their
+    /// virtiofs device tag directly; staged mounts add a stable identity so a
+    /// reordered or replaced mount can never reuse another source's guest-local
+    /// working copy.
+    pub fn runtime_mount_tag(&self, index: usize) -> String {
+        let device_tag = Self::mount_tag(index);
+        if !self.staged {
+            return device_tag;
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(self.source.as_os_str().as_encoded_bytes());
+        hasher.update([0]);
+        hasher.update(self.target.as_os_str().as_encoded_bytes());
+        let digest = hex::encode(hasher.finalize());
+        format!("staged+{}+{}", &digest[..16], device_tag)
     }
 
     /// Create without validation (for loading from database).
@@ -219,6 +345,17 @@ impl HostMount {
             source: PathBuf::from(source),
             target: PathBuf::from(target),
             read_only,
+            staged: false,
+        }
+    }
+
+    /// Create a staged mount from its persisted representation.
+    pub fn from_staged_storage_tuple(source: String, target: String) -> Self {
+        Self {
+            source: PathBuf::from(source),
+            target: PathBuf::from(target),
+            read_only: false,
+            staged: true,
         }
     }
 
@@ -229,6 +366,30 @@ impl HostMount {
             self.target.to_string_lossy().to_string(),
             self.read_only,
         )
+    }
+
+    /// Convert this staged mount to its compact persistence representation.
+    pub fn to_staged_storage_tuple(&self) -> (String, String) {
+        (
+            self.source.to_string_lossy().to_string(),
+            self.target.to_string_lossy().to_string(),
+        )
+    }
+
+    /// Split validated mounts into their backward-compatible live-mount tuples
+    /// and staged-mount tuples for [`crate::config::VmRecord`].
+    pub fn split_storage_tuples(mounts: &[Self]) -> (Vec<StoredHostMount>, Vec<StoredStagedMount>) {
+        let mut live = Vec::new();
+        let mut staged = Vec::new();
+        for (index, mount) in mounts.iter().enumerate() {
+            if mount.staged {
+                let (source, target) = mount.to_staged_storage_tuple();
+                staged.push((index, source, target));
+            } else {
+                live.push(mount.to_storage_tuple());
+            }
+        }
+        (live, staged)
     }
 }
 
@@ -255,6 +416,28 @@ mod tests {
         );
         // Distinct targets are fine.
         assert!(HostMount::parse(&[format!("{a}:/app"), format!("{b}:/data")]).is_ok());
+    }
+
+    #[test]
+    fn parse_staged_mount_is_writable_and_persists_separately() {
+        let source = std::env::temp_dir().join("smolvm_staged_parse");
+        std::fs::create_dir_all(&source).unwrap();
+        let mounts =
+            HostMount::parse(&[format!("{}:/workspace:staged", source.display())]).unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert!(mounts[0].staged);
+        assert!(!mounts[0].read_only);
+
+        let (live, staged) = HostMount::split_storage_tuples(&mounts);
+        assert!(live.is_empty());
+        assert_eq!(
+            staged,
+            vec![(
+                0,
+                source.canonicalize().unwrap().display().to_string(),
+                "/workspace".into()
+            )]
+        );
     }
 
     #[test]
@@ -309,6 +492,68 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn trusted_system_mounts_require_all_three_guards() {
+        let etc = vec!["/etc:/host/etc:ro".to_string()];
+
+        let default_err = HostMount::parse(&etc).unwrap_err().to_string();
+        assert!(default_err.contains("protected system path"));
+
+        let mounts = HostMount::parse_with_system_mounts(&etc, true).unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert!(mounts[0].read_only);
+        assert_eq!(mounts[0].target, PathBuf::from("/host/etc"));
+
+        let writable =
+            HostMount::parse_with_system_mounts(&["/etc:/host/etc:rw".to_string()], true)
+                .unwrap_err()
+                .to_string();
+        assert!(writable.contains("must be read-only"));
+
+        let wrong_target = HostMount::parse_with_system_mounts(&["/etc:/etc:ro".to_string()], true)
+            .unwrap_err()
+            .to_string();
+        assert!(wrong_target.contains("must be /host or below"));
+
+        let traversal_target =
+            HostMount::parse_with_system_mounts(&["/etc:/host/../etc:ro".to_string()], true)
+                .unwrap_err()
+                .to_string();
+        assert!(traversal_target.contains("must be /host or below"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn trusted_system_mounts_accept_canonical_macos_etc() {
+        let mounts =
+            HostMount::parse_with_system_mounts(&["/etc:/host/etc:ro".to_string()], true).unwrap();
+        assert_eq!(mounts[0].source, PathBuf::from("/private/etc"));
+        assert_eq!(mounts[0].target, PathBuf::from("/host/etc"));
+        assert!(mounts[0].read_only);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn trusted_system_mounts_allow_logs_but_not_kernel_or_executable_trees() {
+        assert!(HostMount::parse_with_system_mounts(
+            &["/var/log:/host/var/log:ro".to_string()],
+            true,
+        )
+        .is_ok());
+
+        for source in ["/proc", "/sys", "/dev", "/usr"] {
+            let spec = format!("{source}:/host{source}:ro");
+            let err = HostMount::parse_with_system_mounts(&[spec], true)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("protected system path"),
+                "{source} should remain protected, got: {err}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn test_validate_rejects_boot_subtree() {
         // `/boot` holds the kernel and bootloader config; mounting it read-write
         // into a guest that scribbles on it can leave the host unbootable, so it
@@ -321,6 +566,7 @@ mod tests {
                 source: PathBuf::from(path),
                 target: PathBuf::from("/guest/path"),
                 read_only: true,
+                staged: false,
             };
             let err = HostMount::validate(&mount).unwrap_err().to_string();
             assert!(
@@ -351,6 +597,25 @@ mod tests {
         assert_eq!(mount.source, PathBuf::from("/tmp").canonicalize().unwrap());
         assert_eq!(mount.target, PathBuf::from("/guest/path"));
         assert!(!mount.read_only);
+    }
+
+    #[test]
+    fn staged_runtime_tag_is_stable_across_device_reordering_and_unique_by_source() {
+        let first = HostMount::from_staged_storage_tuple("/tmp/a".into(), "/workspace".into());
+        let second = HostMount::from_staged_storage_tuple("/tmp/b".into(), "/workspace".into());
+        let first_at_zero = first.runtime_mount_tag(0);
+        let first_at_three = first.runtime_mount_tag(3);
+        assert!(first_at_zero.starts_with("staged+"));
+        assert_eq!(
+            first_at_zero.split('+').nth(1),
+            first_at_three.split('+').nth(1)
+        );
+        assert_ne!(
+            first_at_zero.split('+').nth(1),
+            second.runtime_mount_tag(0).split('+').nth(1)
+        );
+        assert!(first_at_zero.ends_with("+smolvm0"));
+        assert!(first_at_three.ends_with("+smolvm3"));
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //! to recreate the unit (`status=219/CGROUP`) → serve crash-loops. Adopting the
 //! VM into its own `smolvm-vm-<id>.scope` (a sibling unit owned by PID1) moves it
 //! out of the service cgroup, so serve can restart and reconnect to the still-
-//! running VM. See `docs/lossless-serve-restart.md`.
+//! running VM.
 //!
 //! Implemented by shelling out to `busctl` (ships with systemd — no D-Bus crate
 //! dependency, and absent exactly where scopes wouldn't work anyway). The caller
@@ -225,6 +225,49 @@ pub fn adopt_into_scope(machine_id: &str, pid: i32, caps: &ScopeCaps) -> Result<
         ));
     }
     tracing::info!(scope = %name, pid, "adopted VM into systemd transient scope");
+    Ok(())
+}
+
+/// Change the hard memory ceiling of an existing VM scope.
+///
+/// A live branch source retains immutable RAM generations in the same memory
+/// cgroup that originally faulted those pages.  Linux does not migrate those
+/// page charges when a raw-forked guardian moves between cgroups, so the scope
+/// ceiling must grow with the number of retained generations and shrink again
+/// when they are collected.
+pub fn set_scope_memory_max(machine_id: &str, memory_max_bytes: u64) -> Result<()> {
+    let busctl = busctl_path()
+        .ok_or_else(|| Error::agent("vm scope", "busctl not found; cannot update scope"))?;
+    let name = scope_name(machine_id);
+
+    // SetUnitProperties(name: s, runtime: b, properties: a(sv)).  Runtime=true
+    // keeps the transient scope transient while making the new limit effective
+    // immediately in memory.max.
+    let args = [
+        "call".to_string(),
+        "org.freedesktop.systemd1".to_string(),
+        "/org/freedesktop/systemd1".to_string(),
+        "org.freedesktop.systemd1.Manager".to_string(),
+        "SetUnitProperties".to_string(),
+        "sba(sv)".to_string(),
+        name.clone(),
+        "true".to_string(),
+        "1".to_string(),
+        "MemoryMax".to_string(),
+        "t".to_string(),
+        memory_max_bytes.to_string(),
+    ];
+    let mut cmd = Command::new(&busctl);
+    cmd.args(args);
+    let out = busctl_bounded(cmd, BUSCTL_TIMEOUT)?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(Error::agent(
+            "vm scope",
+            format!("SetUnitProperties {name} failed: {}", stderr.trim()),
+        ));
+    }
+    tracing::debug!(scope = %name, memory_max_bytes, "updated VM scope memory ceiling");
     Ok(())
 }
 

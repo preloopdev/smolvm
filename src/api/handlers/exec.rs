@@ -82,6 +82,7 @@ pub async fn exec_command(
     if req.background {
         let command = req.command.clone();
         let workdir = req.workdir.clone();
+        let user = req.user.clone();
         let machine_rec = state.lookup_vm(&id).await?;
         // An exec may be what establishes the workload container — the machine's
         // command exited, or the image's own default was short-lived — and that
@@ -108,6 +109,7 @@ pub async fn exec_command(
                 let config = crate::agent::RunConfig::new(image, command)
                     .with_env(env)
                     .with_workdir(workdir)
+                    .with_user(user)
                     .with_mounts(mounts_config)
                     .in_machine_opt(machine_for_run.as_ref(), &id, &env_for_volumes);
                 c.run_background(config)
@@ -133,6 +135,7 @@ pub async fn exec_command(
     // path); env precedence is req.env < record.secret_refs < req.secrets.
     let command = req.command.clone();
     let workdir = req.workdir.clone();
+    let user = req.user.clone();
     let timeout = req.timeout_secs.map(Duration::from_secs);
     let stdin_data = req.stdin.clone();
 
@@ -172,6 +175,7 @@ pub async fn exec_command(
             let config = crate::agent::RunConfig::new(image, command)
                 .with_env(env)
                 .with_workdir(workdir)
+                .with_user(user)
                 .with_mounts(mounts_config)
                 .with_timeout(timeout)
                 .in_machine_opt(machine_for_run.as_ref(), &id, &env_for_volumes)
@@ -238,6 +242,7 @@ pub async fn exec_stream(
     env.extend(crate::secrets::expose_into_env(record_env));
     env.extend(crate::secrets::expose_into_env(req_env));
     let workdir = req.workdir.clone();
+    let user = req.user.clone();
     let timeout = req.timeout_secs.map(Duration::from_secs);
 
     // Image-based machines stream from a container in their image (persistent
@@ -285,6 +290,7 @@ pub async fn exec_stream(
                 let config = crate::agent::RunConfig::new(image, command)
                     .with_env(env)
                     .with_workdir(workdir)
+                    .with_user(user)
                     .with_mounts(mounts_config)
                     .with_timeout(timeout)
                     .in_machine_opt(machine_for_run.as_ref(), &id, &env_for_volumes);
@@ -379,6 +385,7 @@ pub async fn run_command(
     env.extend(crate::secrets::expose_into_env(record_env));
     env.extend(crate::secrets::expose_into_env(req_env));
     let workdir = req.workdir.clone();
+    let user = req.user.clone();
     let timeout = req.timeout_secs.map(Duration::from_secs);
 
     // Get mounts from machine config (converted to protocol format)
@@ -400,6 +407,7 @@ pub async fn run_command(
         let config = crate::agent::RunConfig::new(image, command)
             .with_env(env)
             .with_workdir(workdir)
+            .with_user(user)
             .with_mounts(mounts_config)
             .with_timeout(timeout);
         c.run_non_interactive(config)

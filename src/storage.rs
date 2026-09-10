@@ -584,6 +584,24 @@ impl<K: DiskType> VmDisk<K> {
         }
     }
 
+    /// A handle to a disk that does not exist yet. Observational code paths
+    /// (status, list, stop, reconnecting exec) open a machine's disks this way
+    /// when the machine has never been started: the paths are known, nothing
+    /// is created, and a launch is what turns the handle into a real disk.
+    pub fn absent_at(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            size_bytes: 0,
+            format: DiskFormat::Raw,
+            _kind: PhantomData,
+        }
+    }
+
+    /// Whether the disk image exists on disk.
+    pub fn exists(&self) -> bool {
+        self.path.exists()
+    }
+
     /// Open an existing disk image with an explicit on-disk format, without
     /// creating or formatting it. Used for fork-clone qcow2 overlays, which are
     /// created up front by the fork path and inherit the backing disk's

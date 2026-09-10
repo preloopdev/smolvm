@@ -39,6 +39,18 @@ pub struct KrunFunctions {
     pub set_port_map: unsafe extern "C" fn(u32, *const *const libc::c_char) -> i32,
     pub add_disk2:
         unsafe extern "C" fn(u32, *const libc::c_char, *const libc::c_char, u32, bool) -> i32,
+    pub add_disk4: Option<
+        unsafe extern "C" fn(
+            u32,
+            *const libc::c_char,
+            *const libc::c_char,
+            u32,
+            bool,
+            bool,
+            u32,
+            u32,
+        ) -> i32,
+    >,
     pub add_vsock_port2: unsafe extern "C" fn(u32, u32, *const libc::c_char, bool) -> i32,
     pub add_virtiofs: unsafe extern "C" fn(u32, *const libc::c_char, *const libc::c_char) -> i32,
     pub add_virtiofs3: Option<
@@ -49,8 +61,17 @@ pub struct KrunFunctions {
     pub add_vsock: unsafe extern "C" fn(u32, u32) -> i32,
     /// Add a virtio-console device (the upstream replacement for the removed
     /// `krun_set_console_output`). Unix: input/output/err file descriptors.
+    #[cfg(unix)]
     pub add_virtio_console_default:
         unsafe extern "C" fn(u32, libc::c_int, libc::c_int, libc::c_int) -> i32,
+    /// Windows takes the same three streams as handles rather than descriptors.
+    #[cfg(windows)]
+    pub add_virtio_console_default: unsafe extern "C" fn(
+        u32,
+        *mut std::ffi::c_void,
+        *mut std::ffi::c_void,
+        *mut std::ffi::c_void,
+    ) -> i32,
     pub set_egress_policy: Option<
         unsafe extern "C" fn(
             u32,
@@ -167,6 +188,7 @@ impl KrunFunctions {
         let set_exec = load_sym!(krun_set_exec);
         let set_port_map = load_sym!(krun_set_port_map);
         let add_disk2 = load_sym!(krun_add_disk2);
+        let add_disk4 = load_optional_sym!("krun_add_disk4");
         let add_vsock_port2 = load_sym!(krun_add_vsock_port2);
         let add_virtiofs = load_sym!(krun_add_virtiofs);
         let add_virtiofs3 = load_optional_sym!("krun_add_virtiofs3");
@@ -199,6 +221,7 @@ impl KrunFunctions {
             set_exec,
             set_port_map,
             add_disk2,
+            add_disk4,
             add_vsock_port2,
             add_virtiofs,
             add_virtiofs3,
@@ -287,16 +310,39 @@ impl KrunFunctions {
         unsafe { (self.add_virtio_console_default)(ctx, null_fd, out_fd, out_fd) }
     }
 
-    /// Windows stub: the virtio-console redirection relies on POSIX file
-    /// descriptors passed to libkrun. The Windows libkrun ABI/console wiring is
-    /// not implemented here, so this is a no-op that reports failure.
+    /// Redirect the guest console output to `path` on Windows, where libkrun
+    /// takes handles instead of file descriptors.
+    ///
+    /// Without this a Windows guest's console goes nowhere, so a machine that
+    /// fails to boot leaves no record of why -- the log the other platforms
+    /// write is simply absent.
+    ///
+    /// The opened handles are intentionally leaked, for the same reason as on
+    /// Unix: the console device holds them for the VM's lifetime, and
+    /// `krun_start_enter` runs the VM in this process.
     ///
     /// # Safety
-    /// `unsafe` only to match the Unix signature (which dereferences libkrun
-    /// function pointers). This stub touches nothing and is always sound to call.
-    #[cfg(not(unix))]
-    pub unsafe fn console_output_to_file(&self, _ctx: u32, _path: &Path) -> i32 {
-        -1
+    /// `ctx` must be a valid libkrun context that has not yet been started.
+    #[cfg(windows)]
+    pub unsafe fn console_output_to_file(&self, ctx: u32, path: &Path) -> i32 {
+        use std::os::windows::io::IntoRawHandle;
+
+        let Ok(out) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        else {
+            return -1;
+        };
+        // Console input comes from the null device (the agent talks over vsock,
+        // not the console); output and stderr both go to the log file.
+        let Ok(null) = std::fs::OpenOptions::new().read(true).open("NUL") else {
+            return -1;
+        };
+
+        let out_handle = out.into_raw_handle();
+        let null_handle = null.into_raw_handle();
+        unsafe { (self.add_virtio_console_default)(ctx, null_handle, out_handle, out_handle) }
     }
 }
 

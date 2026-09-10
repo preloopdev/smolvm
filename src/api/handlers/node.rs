@@ -53,7 +53,8 @@ pub async fn capacity(State(state): State<Arc<ApiState>>) -> Response {
     }
 
     let (allocated_cpus, allocated_memory_mb) = state.allocated_resources();
-    let (used_cpus, used_memory_mb, used_disk_gb) = state.real_utilization();
+    let utilization = state.real_utilization();
+    let host_memory = crate::process::host_memory_stats();
     let cuda_devices = state.cuda_devices().map(|devices| {
         devices
             .into_iter()
@@ -72,9 +73,14 @@ pub async fn capacity(State(state): State<Arc<ApiState>>) -> Response {
     Json(CapacityResponse {
         allocated_cpus,
         allocated_memory_mb,
-        used_cpus,
-        used_memory_mb,
-        used_disk_gb,
+        used_cpus: utilization.used_cpus,
+        used_memory_mb: utilization.rss_mb,
+        used_memory_pss_mb: utilization.pss_mb,
+        used_memory_private_mb: utilization.private_memory_mb,
+        used_memory_shared_mapped_mb: utilization.shared_memory_mapped_mb,
+        host_memory_total_mb: host_memory.map(|memory| memory.total_bytes / (1024 * 1024)),
+        host_memory_available_mb: host_memory.map(|memory| memory.available_bytes / (1024 * 1024)),
+        used_disk_gb: utilization.disk_gb,
         boot_id: boot_id().to_string(),
         cuda_devices,
     })

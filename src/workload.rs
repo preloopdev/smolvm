@@ -8,17 +8,22 @@
 
 use crate::agent::{AgentClient, RunConfig};
 use crate::config::VmRecord;
-use crate::data::storage::HostMount;
 
-/// Convert a `VmRecord` mount list (`(host_source, guest_target, read_only)`
-/// triples) to the agent's virtiofs binding format. The host source is
-/// dropped — the agent only needs the guest-facing target and the positional
-/// `smolvm{i}` tag.
-pub fn record_mounts_to_bindings(mounts: &[(String, String, bool)]) -> Vec<(String, String, bool)> {
-    mounts
+/// Convert a record's live and staged host mounts to the agent's binding form.
+/// Reconstructing the rich list preserves original device order, while staged
+/// mounts use their stable runtime identity instead of a plain virtiofs tag.
+pub fn record_mounts_to_bindings(record: &VmRecord) -> Vec<(String, String, bool)> {
+    record
+        .host_mounts()
         .iter()
         .enumerate()
-        .map(|(i, (_host, target, ro))| (HostMount::mount_tag(i), target.clone(), *ro))
+        .map(|(i, mount)| {
+            (
+                mount.runtime_mount_tag(i),
+                mount.target.to_string_lossy().into_owned(),
+                mount.read_only,
+            )
+        })
         .collect()
 }
 
@@ -87,14 +92,17 @@ pub fn launch_image_workload(
     // first instruction and its command is never rewritten.
     let _ticker =
         WaitTicker::start("preparing the workload (a first start unpacks the machine image)");
-    match client.run_container_detached(
-        RunConfig::new(image, command)
-            .with_workdir(record.workdir.clone())
-            .with_user(record.user.clone())
-            .with_mounts(record_mounts_to_bindings(&record.mounts))
-            .in_machine(record, machine_name, &exec_env)
-            .with_env(exec_env),
-    ) {
+    let launch = |client: &mut AgentClient| {
+        client.run_container_detached(
+            RunConfig::new(image, command.clone())
+                .with_workdir(record.workdir.clone())
+                .with_user(record.user.clone())
+                .with_mounts(record_mounts_to_bindings(record))
+                .in_machine(record, machine_name, &exec_env)
+                .with_env(exec_env.clone()),
+        )
+    };
+    match launch(client) {
         Ok(_) => Ok(true),
         Err(e) if is_missing_launch_metadata(&e.to_string()) => {
             tracing::info!(
@@ -103,6 +111,26 @@ pub fn launch_image_workload(
                 "image defines no entrypoint or cmd and none was given; booting bare agent without a workload"
             );
             Ok(false)
+        }
+        Err(e) if is_image_missing(&e.to_string()) => {
+            // The agent discards a cached image whose layers no longer verify
+            // — an unclean shutdown can leave a layer without its completion
+            // marker — and then reports the image as missing. It has no way to
+            // fetch a replacement on its own, so pull it again here and launch
+            // once more. Without this a machine whose host was killed mid-run
+            // stays permanently unstartable, reporting only "image not found"
+            // for an image it holds a record of.
+            tracing::info!(
+                machine = machine_name,
+                image = %image,
+                "cached image is no longer usable; pulling it again before launching"
+            );
+            client
+                .pull_with_registry_config(image)
+                .map_err(|e| crate::Error::agent("start background CMD", format!("{e}")))?;
+            launch(client)
+                .map(|_| true)
+                .map_err(|e| crate::Error::agent("start background CMD", format!("{e}")))
         }
         Err(e) => Err(crate::Error::agent("start background CMD", format!("{e}"))),
     }
@@ -114,6 +142,13 @@ pub fn launch_image_workload(
 /// on its side for this match — is the reliable signal.
 fn is_missing_launch_metadata(message: &str) -> bool {
     message.contains("defines no entrypoint or cmd")
+}
+
+/// Whether a detached-run failure means the guest no longer holds the image.
+/// Matched on the agent's message for the same reason as
+/// [`is_missing_launch_metadata`]: only the guest knows its image store.
+fn is_image_missing(message: &str) -> bool {
+    message.contains("image not found")
 }
 
 /// Progress heartbeat for a long workload launch.
@@ -192,6 +227,23 @@ impl Drop for WaitTicker {
 mod tests {
     use super::*;
 
+    // An image the guest dropped (its layers stopped verifying after an
+    // unclean shutdown) must be recognised so the launcher re-pulls it
+    // instead of leaving the machine unstartable. The agent's own
+    // "defines no entrypoint or cmd" case must not be mistaken for it.
+    #[test]
+    fn missing_image_is_told_apart_from_a_commandless_image() {
+        assert!(is_image_missing(
+            "run container detached: image not found: docker.io/library/ubuntu:latest"
+        ));
+        assert!(!is_image_missing(
+            "run container detached: image defines no entrypoint or cmd"
+        ));
+        assert!(!is_missing_launch_metadata(
+            "run container detached: image not found: docker.io/library/ubuntu:latest"
+        ));
+    }
+
     // A plain machine's overlay is keyed by its own name; a fork clone's by
     // its golden's name, so clone execs land in the CoW-inherited overlay
     // (and its still-live restored mount) instead of a fresh empty one.
@@ -206,6 +258,27 @@ mod tests {
             persistent_overlay_owner_with_lineage("grandchild", Some("child"), Some("root")),
             "root"
         );
+    }
+
+    #[test]
+    fn bindings_preserve_staged_mount_order_and_identity() {
+        let mut record = VmRecord::new(
+            "test".into(),
+            1,
+            256,
+            vec![("/host/live".into(), "/live".into(), true)],
+            Vec::new(),
+            false,
+        );
+        record.staged_mounts = vec![(0, "/host/staged".into(), "/work".into())];
+
+        let bindings = record_mounts_to_bindings(&record);
+        assert_eq!(bindings.len(), 2);
+        assert!(bindings[0].0.starts_with("staged+"));
+        assert!(bindings[0].0.ends_with("+smolvm0"));
+        assert_eq!(bindings[0].1, "/work");
+        assert!(!bindings[0].2);
+        assert_eq!(bindings[1], ("smolvm1".into(), "/live".into(), true));
     }
 
     // Only the agent's metadata-less-image failure downgrades a machine start

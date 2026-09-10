@@ -21,7 +21,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// Current portable-checkpoint metadata version.
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 /// libkrun VM/vCPU/device-state compatibility identifier.
 pub const RUNTIME_ABI: &str = "libkrun-portable-snapshot-v1";
 /// Device topology supported by the initial portable checkpoint profile.
@@ -53,6 +53,191 @@ pub struct CaptureResult {
     pub source_pause: std::time::Duration,
     /// Complete capture and compression time.
     pub elapsed: std::time::Duration,
+}
+
+/// Restore a portable live checkpoint into a new stopped machine record.
+///
+/// The restored machine preserves the checkpoint's CPU, memory, disks,
+/// workload, and network topology. Its first start resumes the captured live
+/// state, and the machine remains checkpointable so it can immediately serve
+/// as a reusable rollback/fork root.
+pub fn restore_from_path(db: &crate::db::SmolvmDb, name: &str, artifact: &Path) -> Result<()> {
+    crate::data::validate_vm_name(name, "machine name")
+        .map_err(|reason| Error::config("restore checkpoint", reason))?;
+    if !artifact.is_file() {
+        return Err(Error::config(
+            "restore checkpoint",
+            format!("file not found: {}", artifact.display()),
+        ));
+    }
+
+    let manifest = smolvm_pack::packer::read_manifest_from_sidecar(artifact)
+        .map_err(|error| Error::agent("read checkpoint manifest", error.to_string()))?;
+    let checkpoint = manifest.checkpoint.as_ref().ok_or_else(|| {
+        Error::config(
+            "restore checkpoint",
+            format!("{} is not a .smolcheckpoint artifact", artifact.display()),
+        )
+    })?;
+    validate_compatibility(checkpoint)?;
+    crate::platform::ensure_artifact_arch_matches_host(&manifest.platform)?;
+
+    // Reserve the name before touching its data directory. SDKs and CLIs may
+    // run in separate processes, so a process-local lifecycle mutex is not a
+    // sufficient creation boundary.
+    let token = crate::db::SmolvmDb::create_reservation_token();
+    if !db.reserve_vm_create(name, &token)? {
+        return Err(Error::agent_conflict(
+            "restore checkpoint",
+            format!("machine '{name}' already exists or is being created"),
+        ));
+    }
+    let mut reservation = RestoreReservation {
+        db: db.clone(),
+        name: name.to_string(),
+        token,
+        committed: false,
+    };
+
+    let record = restored_record(name, &manifest, checkpoint)?;
+    let footer = smolvm_pack::packer::read_footer_from_sidecar(artifact)
+        .map_err(|error| Error::agent("read checkpoint footer", error.to_string()))?;
+    let vm_data = crate::agent::vm_data_dir(name);
+    let cache_dir = crate::agent::machine_layers_cache_dir(name);
+    let result = (|| -> Result<()> {
+        let _manager = crate::agent::AgentManager::for_vm_with_sizes(
+            name,
+            checkpoint.storage_gib,
+            checkpoint.overlay_gib,
+        )?;
+        smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
+        match std::fs::remove_dir_all(&cache_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(Error::agent(
+                    "clear checkpoint extraction",
+                    error.to_string(),
+                ));
+            }
+        }
+        smolvm_pack::extract::extract_sidecar(artifact, &cache_dir, &footer, false, false)
+            .map_err(|error| Error::agent("extract checkpoint", error.to_string()))?;
+        install(&cache_dir, &vm_data, checkpoint)?;
+        discard_transport_pack(&vm_data)?;
+        if !reservation
+            .db
+            .commit_reserved_vm(name, &reservation.token, &record)?
+        {
+            return Err(Error::agent_conflict(
+                "restore checkpoint",
+                format!("machine '{name}' is no longer reserved"),
+            ));
+        }
+        reservation.committed = true;
+        Ok(())
+    })();
+    smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
+    if let Err(error) = result {
+        if let Err(remove_error) = std::fs::remove_dir_all(&vm_data) {
+            if remove_error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    machine = %name,
+                    error = %remove_error,
+                    "failed to clean checkpoint restore after error"
+                );
+            }
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+struct RestoreReservation {
+    db: crate::db::SmolvmDb,
+    name: String,
+    token: String,
+    committed: bool,
+}
+
+impl Drop for RestoreReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            if let Err(error) = self
+                .db
+                .release_vm_create_reservation(&self.name, &self.token)
+            {
+                tracing::warn!(
+                    machine = %self.name,
+                    %error,
+                    "failed to release checkpoint restore reservation"
+                );
+            }
+        }
+    }
+}
+
+fn restored_record(
+    name: &str,
+    manifest: &PackManifest,
+    checkpoint: &PortableCheckpointManifest,
+) -> Result<VmRecord> {
+    let network = checkpoint.network.as_ref();
+    let mut record = VmRecord::new(
+        name.to_string(),
+        checkpoint.cpus,
+        checkpoint.memory_mib,
+        Vec::new(),
+        network
+            .into_iter()
+            .flat_map(|network| network.ports.iter())
+            .map(|port| (port.host, port.guest))
+            .collect(),
+        network.is_some_and(|network| network.enabled),
+    );
+    record.storage_gb = checkpoint.storage_gib;
+    record.overlay_gb = checkpoint.overlay_gib;
+    record.allowed_cidrs = network.and_then(|network| network.allowed_cidrs.clone());
+    record.dns_filter_hosts = network.and_then(|network| network.dns_filter_hosts.clone());
+    record.network_backend = restored_network_backend(checkpoint)?;
+    record.dns = network
+        .and_then(|network| network.dns.as_deref())
+        .map(str::parse)
+        .transpose()
+        .map_err(|error: std::net::AddrParseError| {
+            Error::config("restore checkpoint DNS", error.to_string())
+        })?;
+    record.network_name = network.and_then(|network| network.network_name.clone());
+    record.entrypoint = manifest.entrypoint.clone();
+    record.cmd = manifest.cmd.clone();
+    record.env = crate::util::parse_env_list(&manifest.env);
+    record.workdir = manifest.workdir.clone();
+    record.secret_refs = manifest.secret_refs.clone();
+    for (key, reference) in &record.secret_refs {
+        crate::secrets::validate_ref(reference, crate::secrets::ResolutionScope::Untrusted)
+            .map_err(|error| {
+                Error::config(
+                    "restore checkpoint",
+                    format!("secret '{key}': {error} (checkpoints may not carry host secret refs)"),
+                )
+            })?;
+    }
+    if let Some(workload) = &checkpoint.workload {
+        record.image = Some(workload.image.clone());
+        record.user = workload.user.clone();
+        record.fork_overlay_owner = Some(workload.overlay_owner.clone());
+        record.restart.policy = workload
+            .restart_policy
+            .parse()
+            .map_err(|error: String| Error::config("restore checkpoint restart policy", error))?;
+        record.restart.max_retries = workload.restart_max_retries;
+        record.restart.max_backoff_secs = workload.restart_max_backoff_secs;
+    }
+    // The live guest already contains the initialized workload. Re-running
+    // image pull/init on its first start would duplicate side effects.
+    record.init_completed = true;
+    record.forkable = true;
+    Ok(record)
 }
 
 struct SavedVmPause {
@@ -115,52 +300,14 @@ fn checkpoint_lib_dir(options: &CaptureOptions) -> Result<PathBuf> {
 }
 
 fn checkpoint_rootfs_dir(options: &CaptureOptions) -> Result<PathBuf> {
-    let candidates = [
+    // The same resolver a machine boots with; see `AgentManager::resolve_rootfs_path`.
+    crate::agent::AgentManager::resolve_rootfs_path(
         options.rootfs_dir.clone(),
-        std::env::var_os("SMOLVM_AGENT_ROOTFS").map(PathBuf::from),
-        dirs::data_dir().map(|dir| dir.join("smolvm/agent-rootfs")),
-        std::env::current_exe()
-            .ok()
-            .and_then(|path| path.parent().map(|dir| dir.join("agent-rootfs"))),
-    ];
-    candidates
-        .into_iter()
-        .flatten()
-        .find(|candidate| std::fs::symlink_metadata(candidate.join("sbin/init")).is_ok())
-        .ok_or_else(|| {
-            Error::agent(
-                "find checkpoint agent rootfs",
-                "could not find agent rootfs; set SMOLVM_AGENT_ROOTFS",
-            )
-        })
+        "find checkpoint agent rootfs",
+    )
 }
 
-/// Capture a running checkpointable machine into a self-contained artifact.
-///
-/// The source is paused only while libkrun saves execution state and the exact
-/// disk chains are cloned. Hashing and compression continue after it resumes.
-pub fn capture_to_path(
-    name: &str,
-    output: &Path,
-    options: &CaptureOptions,
-) -> Result<CaptureResult> {
-    let started = std::time::Instant::now();
-    if output
-        .extension()
-        .is_none_or(|extension| !extension.eq_ignore_ascii_case("smolcheckpoint"))
-    {
-        return Err(Error::config(
-            "checkpoint machine",
-            "output must end in .smolcheckpoint",
-        ));
-    }
-    if output.exists() {
-        return Err(Error::config(
-            "checkpoint machine",
-            format!("refusing to overwrite {}", output.display()),
-        ));
-    }
-
+fn validated_capture_source(name: &str) -> Result<SmolvmConfig> {
     let config = SmolvmConfig::load()?;
     let vm = config
         .vms
@@ -189,6 +336,40 @@ pub fn capture_to_path(
             format!("machine '{name}' is not checkpointable: {status}"),
         ));
     }
+    Ok(config)
+}
+
+/// Capture a running checkpointable machine into a self-contained artifact.
+///
+/// The source is paused only while libkrun saves execution state and the exact
+/// disk chains are cloned. Hashing and compression continue after it resumes.
+pub fn capture_to_path(
+    name: &str,
+    output: &Path,
+    options: &CaptureOptions,
+) -> Result<CaptureResult> {
+    let started = std::time::Instant::now();
+    if output
+        .extension()
+        .is_none_or(|extension| !extension.eq_ignore_ascii_case("smolcheckpoint"))
+    {
+        return Err(Error::config(
+            "checkpoint machine",
+            "output must end in .smolcheckpoint",
+        ));
+    }
+    if output.exists() {
+        return Err(Error::config(
+            "checkpoint machine",
+            format!("refusing to overwrite {}", output.display()),
+        ));
+    }
+
+    // Fail before staging runtime assets when the source is already known to
+    // be ineligible. The source is revalidated under the cross-process lock
+    // immediately before capture so this fast preflight is never trusted for
+    // the consistency boundary.
+    let _ = validated_capture_source(name)?;
 
     let temp_dir = tempfile::Builder::new()
         .prefix("checkpoint-staging-")
@@ -207,6 +388,18 @@ pub fn capture_to_path(
         .create_storage_template()
         .map_err(|error| Error::agent("create checkpoint storage template", error.to_string()))?;
 
+    // A serve process has its own lifecycle mutex, but another CLI process
+    // does not share it. Use the same source lock as `machine fork` so SAVE and
+    // fork can never overlap or produce two competing source generations.
+    // Release it as soon as the source resumes; hashing and compression do not
+    // touch the live machine and must not delay a subsequent fork.
+    let source_lock = crate::agent::fork::lock_fork_source(name)?;
+    let config = validated_capture_source(name)?;
+    let vm = config
+        .vms
+        .get(name)
+        .expect("validated checkpoint source must remain in its loaded config");
+    let control = crate::agent::fork::control_socket_path(name);
     crate::agent::fork::sync_fork_source(name)?;
     let snapshot_dir = staging_dir.join(ASSET_DIR);
     let pause_started = std::time::Instant::now();
@@ -228,11 +421,13 @@ pub fn capture_to_path(
     let checkpoint_disks = stage_disk_chains(&crate::agent::vm_data_dir(name), &snapshot_dir)?;
     pause.resume()?;
     let source_pause = pause_started.elapsed();
+    drop(source_lock);
 
     let assets = crate::pack_export::FromVmAssets {
         mode: PackMode::Vm,
         image: None,
         image_env: Vec::new(),
+        image_user: None,
         layer_bytes: 0,
     };
     let platform = format!("linux/{}", crate::platform::Arch::current().oci_arch());
@@ -410,13 +605,185 @@ fn cpu_vendor() -> Result<Option<String>> {
     }
 }
 
+/// Architectural features a guest on this aarch64 host can use, by name.
+///
+/// The guest sees the host's own ID registers, so the host's feature set is the
+/// guest's feature set — with one deliberate subtraction: libkrun masks SME out
+/// of `ID_AA64PFR1_EL1` before the guest runs, because a guest that sees SME
+/// "will break after enabling the MMU". Anything SME is therefore invisible to
+/// the guest on every host and must not enter the contract, or checkpoints would
+/// be refused over a feature no guest can reach.
+///
+/// Names are the ARM `FEAT_*` identifiers, which both platforms already speak:
+/// macOS publishes them through `sysctl hw.optional.arm.*`, Linux through the
+/// `Features` line in `/proc/cpuinfo`.
+#[cfg(target_arch = "aarch64")]
+fn aarch64_guest_features() -> Result<Vec<String>> {
+    let mut features = collect_aarch64_host_features()?;
+    features.retain(|name| !is_masked_from_guest(name));
+    features.sort();
+    features.dedup();
+    Ok(features)
+}
+
+/// Features the VMM removes before the guest ever sees them. Keep in step with
+/// libkrun's vCPU setup.
+#[cfg(any(target_arch = "aarch64", test))]
+#[allow(dead_code)]
+fn is_masked_from_guest(name: &str) -> bool {
+    // libkrun: `val & !AA64PFR1_EL1_SMEMASK`. Covers FEAT_SME, FEAT_SME2 and
+    // every SME_* sub-feature.
+    name.contains("SME")
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+fn collect_aarch64_host_features() -> Result<Vec<String>> {
+    let output = std::process::Command::new("sysctl")
+        .arg("-a")
+        .output()
+        .map_err(|error| Error::agent("read CPU features", error.to_string()))?;
+    if !output.status.success() {
+        return Err(Error::agent(
+            "read CPU features",
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    Ok(parse_macos_features(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+/// Pull the enabled `FEAT_*` names out of `sysctl -a`.
+///
+/// macOS reports one line per feature, `hw.optional.arm.FEAT_X: 1`, where 0
+/// means the silicon lacks it. Separated from the command so the parsing is
+/// testable against recorded output from real machines.
+// The two parsers below are pure string functions. They are compiled on every
+// aarch64 host and under `cfg(test)` everywhere, so macOS CI exercises the Linux
+// parser and vice versa; each is used by exactly one OS at runtime, hence the
+// dead-code allowance.
+#[cfg(any(target_arch = "aarch64", test))]
+#[allow(dead_code)]
+fn parse_macos_features(sysctl_output: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in sysctl_output.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let Some(name) = key.trim().strip_prefix("hw.optional.arm.") else {
+            continue;
+        };
+        if value.trim() == "1" && !name.is_empty() {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+fn collect_aarch64_host_features() -> Result<Vec<String>> {
+    let cpuinfo = std::fs::read_to_string("/proc/cpuinfo")
+        .map_err(|error| Error::agent("read CPU features", error.to_string()))?;
+    Ok(parse_linux_features(&cpuinfo))
+}
+
+/// Pull the HWCAP names out of `/proc/cpuinfo`'s `Features` line.
+///
+/// Linux prints lowercase HWCAP tokens (`asimd`, `bf16`, `i8mm`) rather than
+/// ARM's `FEAT_*` spelling, so they are normalised to a common form. Only the
+/// first processor block is read: every core in a machine smolvm will run on
+/// presents the same features.
+#[cfg(any(target_arch = "aarch64", test))]
+#[allow(dead_code)]
+fn parse_linux_features(cpuinfo: &str) -> Vec<String> {
+    for line in cpuinfo.lines().take_while(|line| !line.trim().is_empty()) {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if key.trim() != "Features" {
+            continue;
+        }
+        return value
+            .split_whitespace()
+            .map(|token| format!("FEAT_{}", token.to_ascii_uppercase()))
+            .collect();
+    }
+    Vec::new()
+}
+
 fn checkpoint_cpu_contract() -> Result<CheckpointCpuContract> {
     if cpu_vendor()?.as_deref() == Some("GenuineIntel") {
         return Ok(CheckpointCpuContract::LinuxKvmIntelPortableV1);
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return Ok(CheckpointCpuContract::Aarch64FeaturesV1 {
+            features: aarch64_guest_features()?,
+        });
+    }
+    #[allow(unreachable_code)]
     Ok(CheckpointCpuContract::ExactV1 {
         fingerprint: cpu_fingerprint()?,
     })
+}
+
+/// Accept a checkpoint whose recorded features this host also provides.
+///
+/// A superset is enough: extra features on the destination are harmless, since
+/// the guest already decided at boot what it would use. Anything missing is
+/// named, because "does not match this host" gives an operator nothing to act
+/// on, while "missing FEAT_BF16, FEAT_I8MM" says which machines can take it.
+///
+/// Note this is a genuine set comparison, not a generation ordering. Newer
+/// silicon is not automatically a superset: an M4 Max provides twenty features
+/// an M1 Pro lacks, yet lacks FEAT_SSBS that the M1 Pro has, so neither
+/// direction is safe between them and both are correctly refused.
+#[cfg(target_arch = "aarch64")]
+fn validate_aarch64_features(required: &[String]) -> Result<()> {
+    let available = aarch64_guest_features()?;
+    let missing = missing_features(required, &available);
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(Error::agent(
+        "restore checkpoint",
+        format!(
+            "this host does not provide {} the checkpoint's guest was given: {}",
+            if missing.len() == 1 {
+                "a CPU feature"
+            } else {
+                "CPU features"
+            },
+            missing.join(", ")
+        ),
+    ))
+}
+
+/// On a non-aarch64 host an aarch64 feature contract can never be satisfied;
+/// the architecture check upstream already refuses it, so this only keeps the
+/// match exhaustive.
+#[cfg(not(target_arch = "aarch64"))]
+fn validate_aarch64_features(_required: &[String]) -> Result<()> {
+    Err(Error::agent(
+        "restore checkpoint",
+        "checkpoint requires an aarch64 host",
+    ))
+}
+
+/// Recorded features this host does not provide. Pure, so the comparison is
+/// testable against feature sets captured from real machines.
+///
+/// Gated to match its only caller — the aarch64 validator — plus tests, so a
+/// non-aarch64 cross build does not see it as dead code.
+#[cfg(any(target_arch = "aarch64", test))]
+#[allow(dead_code)]
+fn missing_features(required: &[String], available: &[String]) -> Vec<String> {
+    let have: std::collections::HashSet<&str> = available.iter().map(String::as_str).collect();
+    required
+        .iter()
+        .filter(|name| !have.contains(name.as_str()))
+        .cloned()
+        .collect()
 }
 
 fn validate_cpu_compatibility(checkpoint: &PortableCheckpointManifest) -> Result<()> {
@@ -429,6 +796,9 @@ fn validate_cpu_compatibility(checkpoint: &PortableCheckpointManifest) -> Result
                 "restore checkpoint",
                 "checkpoint CPU feature contract does not match this host",
             ));
+        }
+        CheckpointCpuContract::Aarch64FeaturesV1 { features } => {
+            return validate_aarch64_features(features);
         }
         CheckpointCpuContract::LinuxKvmIntelPortableV1 => {
             let current_vendor = cpu_vendor()?.ok_or_else(|| {
@@ -456,7 +826,7 @@ fn validate_cpu_compatibility(checkpoint: &PortableCheckpointManifest) -> Result
 /// Reject host-bound device state that cannot yet be resumed from an artifact.
 pub fn validate_capture_profile(vm: &VmRecord) -> Result<()> {
     let mut unsupported = Vec::new();
-    if !vm.mounts.is_empty() {
+    if !vm.mounts.is_empty() || !vm.staged_mounts.is_empty() {
         unsupported.push("host mounts");
     }
     if !vm.published_sockets.is_empty() {
@@ -573,23 +943,29 @@ fn disk_target(role: &str, index: usize, format: &str) -> Result<String> {
             )),
         };
     }
-    let alphabet = match role {
-        "storage" => b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ".as_slice(),
-        "overlay" => b"abcdefghijklmnopqrstuvwxyz".as_slice(),
-        _ => {
-            return Err(Error::agent(
-                "checkpoint disk",
-                format!("invalid disk role '{role}'"),
-            ));
-        }
-    };
-    let byte = *alphabet.get(index - 1).ok_or_else(|| {
-        Error::agent(
+    if role != "storage" && role != "overlay" {
+        return Err(Error::agent(
+            "checkpoint disk",
+            format!("invalid disk role '{role}'"),
+        ));
+    }
+    if format != "raw" && format != "qcow2" {
+        return Err(Error::agent(
+            "checkpoint disk",
+            format!("invalid disk format '{format}'"),
+        ));
+    }
+    if index >= 64 {
+        return Err(Error::agent(
             "checkpoint disk",
             format!("{role} backing chain is too deep"),
-        )
-    })?;
-    Ok(char::from(byte).to_string())
+        ));
+    }
+    // Backings live beside the active top layer because qcow2 backing paths
+    // are relative to the image that references them. Use an explicit reserved
+    // namespace: the earlier single-character names eventually collided with
+    // live-fork's `d/` disk-generation directory at deeper lineage depths.
+    Ok(format!(".smolcheckpoint-{role}-{index}.{format}"))
 }
 
 fn inspect_qcow2(path: &Path) -> Result<(Option<String>, Option<String>)> {
@@ -733,24 +1109,7 @@ pub fn stage_disk_chains(
             let target = disk_target(role, index, format)?;
             let artifact_path = format!("checkpoint/disks/{role}/{index}");
             let staged = disk_staging.join(index.to_string());
-            if index == 0 {
-                // The active top layer is writable. Capture an independent
-                // reflink/sparse copy at the frozen disk boundary.
-                crate::disk_utils::clone_or_copy_file(&source, &staged)?;
-            } else {
-                // Qcow backings are immutable while referenced by a writable
-                // top. An owned hard link is an exact O(1) snapshot and remains
-                // valid even if the source machine is later deleted.
-                match std::fs::hard_link(&source, &staged) {
-                    Ok(()) => {}
-                    Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {
-                        crate::disk_utils::clone_or_copy_file(&source, &staged)?;
-                    }
-                    Err(error) => {
-                        return Err(Error::agent("stage checkpoint disk", error.to_string()));
-                    }
-                }
-            }
+            stage_checkpoint_disk_layer(&source, &staged, index, format)?;
 
             let next = if format == "qcow2" {
                 let (backing, backing_format) = inspect_qcow2(&source)?;
@@ -815,6 +1174,31 @@ pub fn stage_disk_chains(
         ));
     }
     Ok(disks)
+}
+
+fn stage_checkpoint_disk_layer(
+    source: &Path,
+    staged: &Path,
+    index: usize,
+    format: &str,
+) -> Result<()> {
+    if index == 0 || format == "qcow2" {
+        // The active top is writable, and every qcow2 layer below it has a
+        // backing filename that is rewritten for the self-contained artifact.
+        // Both therefore need a private inode. Hard-linking a qcow2 backing and
+        // editing its header corrupts the live source's disk chain.
+        return crate::disk_utils::clone_or_copy_file(source, staged);
+    }
+
+    // Terminal raw backings are immutable and carry no header to rewrite. An
+    // owned hard link is an exact O(1) snapshot and survives source deletion.
+    match std::fs::hard_link(source, staged) {
+        Ok(()) => Ok(()),
+        Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {
+            crate::disk_utils::clone_or_copy_file(source, staged)
+        }
+        Err(error) => Err(Error::agent("stage checkpoint disk", error.to_string())),
+    }
 }
 
 /// Build an integrity entry for a staged checkpoint payload.
@@ -1331,7 +1715,7 @@ pub fn discard_transport_pack(vm_data_dir: &Path) -> Result<()> {
 /// workload instead of silently creating a second container.
 pub fn finalize_live_restore(name: &str, record: &VmRecord) -> Result<()> {
     crate::agent::fork::rejuvenate_clone(name, record)?;
-    crate::agent::fork::release_forkpoint(name)
+    crate::agent::fork::release_forkpoint(name, &record.fork_env)
 }
 
 /// Return the pending one-shot checkpoint directory for a machine, if any.
@@ -1556,6 +1940,42 @@ mod tests {
         assert!(!pack.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn qcow2_backing_staging_never_aliases_the_live_header() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let qcow_staged = dir.path().join("qcow-staged");
+        let raw_staged = dir.path().join("raw-staged");
+        std::fs::write(&source, b"disk-layer").unwrap();
+
+        stage_checkpoint_disk_layer(&source, &qcow_staged, 1, "qcow2").unwrap();
+        assert_ne!(
+            std::fs::metadata(&source).unwrap().ino(),
+            std::fs::metadata(&qcow_staged).unwrap().ino()
+        );
+
+        stage_checkpoint_disk_layer(&source, &raw_staged, 1, "raw").unwrap();
+        assert_eq!(
+            std::fs::metadata(&source).unwrap().ino(),
+            std::fs::metadata(&raw_staged).unwrap().ino()
+        );
+    }
+
+    #[test]
+    fn checkpoint_backings_do_not_collide_with_runtime_directories() {
+        for role in ["storage", "overlay"] {
+            for index in 1..64 {
+                let target = disk_target(role, index, "qcow2").unwrap();
+                assert_ne!(target, "d");
+                assert_ne!(target, "s");
+                assert!(target.starts_with(".smolcheckpoint-"));
+            }
+        }
+    }
+
     #[test]
     fn consume_can_retain_a_live_memory_backing() {
         let machine = tempfile::tempdir().unwrap();
@@ -1684,5 +2104,161 @@ mod tests {
             linux_cpu_vendor(&format!("vendor_id: {oversized}\n\n")),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod aarch64_feature_contract_tests {
+    //! Fixtures are real `sysctl -a` output shapes from an M1 Pro
+    //! (MacBookPro18,3) and an M4 Max (Mac16,6), captured 2026-08-30.
+    use super::missing_features;
+
+    fn v(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The twenty features an M4 Max has that an M1 Pro does not, minus SME
+    /// (masked from every guest), leaves these ten.
+    const M4_ONLY: &[&str] = &[
+        "FEAT_AFP",
+        "FEAT_BF16",
+        "FEAT_BTI",
+        "FEAT_ECV",
+        "FEAT_FPAC",
+        "FEAT_FPACCOMBINE",
+        "FEAT_I8MM",
+        "FEAT_PAuth2",
+        "FEAT_RPRES",
+        "FEAT_WFxT",
+    ];
+    /// The one feature an M1 Pro has that an M4 Max does not.
+    const M1_ONLY: &[&str] = &["FEAT_SSBS"];
+    const SHARED: &[&str] = &["FEAT_LSE", "FEAT_FP16", "FEAT_DotProd", "FEAT_PAuth"];
+
+    fn m4() -> Vec<String> {
+        let mut f = v(SHARED);
+        f.extend(v(M4_ONLY));
+        f
+    }
+    fn m1() -> Vec<String> {
+        let mut f = v(SHARED);
+        f.extend(v(M1_ONLY));
+        f
+    }
+
+    #[test]
+    fn a_host_with_the_same_features_accepts_the_checkpoint() {
+        assert!(missing_features(&m4(), &m4()).is_empty());
+    }
+
+    /// Extra features on the destination are harmless: the guest already decided
+    /// at boot what it would use.
+    #[test]
+    fn a_richer_host_accepts_a_leaner_checkpoint() {
+        let lean = v(SHARED);
+        assert!(missing_features(&lean, &m4()).is_empty());
+    }
+
+    /// The case the whole contract exists for: a guest that probed an M4 cannot
+    /// resume where those instructions do not exist.
+    #[test]
+    fn an_m4_checkpoint_is_refused_on_an_m1() {
+        let missing = missing_features(&m4(), &m1());
+        assert_eq!(
+            missing,
+            v(M4_ONLY),
+            "every M4-only feature must be reported"
+        );
+        assert!(missing.contains(&"FEAT_BF16".to_string()));
+        assert!(missing.contains(&"FEAT_I8MM".to_string()));
+    }
+
+    /// Newer is NOT automatically a superset, so "older to newer is safe" is
+    /// wrong as a rule. The M4 Max lacks FEAT_SSBS, which the M1 Pro has — these
+    /// two are unordered and both directions must be refused.
+    #[test]
+    fn newer_silicon_is_not_automatically_a_superset() {
+        let missing = missing_features(&m1(), &m4());
+        assert_eq!(
+            missing,
+            v(M1_ONLY),
+            "an M1 checkpoint must be refused on an M4 over FEAT_SSBS"
+        );
+    }
+
+    /// SME must never reach the contract: libkrun masks it out of every guest,
+    /// so recording it would refuse checkpoints over a feature no guest can use.
+    #[test]
+    fn sme_is_excluded_from_the_contract() {
+        use super::is_masked_from_guest;
+        for name in [
+            "FEAT_SME",
+            "FEAT_SME2",
+            "FEAT_SME_F64F64",
+            "SME_I8I32",
+            "SME_B16F32",
+        ] {
+            assert!(is_masked_from_guest(name), "{name} must be masked");
+        }
+        for name in ["FEAT_BF16", "FEAT_I8MM", "FEAT_SSBS", "FEAT_LSE"] {
+            assert!(!is_masked_from_guest(name), "{name} must be kept");
+        }
+    }
+
+    #[test]
+    fn macos_sysctl_output_is_parsed() {
+        use super::parse_macos_features;
+        let out = "hw.optional.arm.FEAT_BF16: 1\n\
+                   hw.optional.arm.FEAT_SSBS: 0\n\
+                   hw.optional.arm.FEAT_I8MM: 1\n\
+                   hw.optional.floatingpoint: 1\n\
+                   hw.memsize: 38654705664\n";
+        let got = parse_macos_features(out);
+        assert_eq!(got, vec!["FEAT_BF16".to_string(), "FEAT_I8MM".to_string()]);
+    }
+
+    #[test]
+    fn linux_cpuinfo_features_are_normalised() {
+        use super::parse_linux_features;
+        let cpuinfo = "processor\t: 0\n\
+                       Features\t: fp asimd bf16 i8mm\n\
+                       CPU part\t: 0xd4f\n\
+                       \n\
+                       processor\t: 1\n\
+                       Features\t: fp\n";
+        let got = parse_linux_features(cpuinfo);
+        assert_eq!(
+            got,
+            vec![
+                "FEAT_FP".to_string(),
+                "FEAT_ASIMD".to_string(),
+                "FEAT_BF16".to_string(),
+                "FEAT_I8MM".to_string()
+            ],
+            "only the first processor block, upper-cased"
+        );
+    }
+}
+
+#[cfg(test)]
+mod aarch64_live_host_tests {
+    /// Enumerates THIS machine. Proves the contract is built from real hardware
+    /// rather than only from fixtures, and that SME never reaches it.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn this_host_reports_a_usable_feature_set() {
+        let features = super::aarch64_guest_features().expect("enumerate host features");
+        assert!(
+            features.len() > 10,
+            "expected a real feature set, got {features:?}"
+        );
+        assert!(
+            !features.iter().any(|f| f.contains("SME")),
+            "SME is masked from guests and must not be in the contract: {features:?}"
+        );
+        let mut sorted = features.clone();
+        sorted.sort();
+        assert_eq!(sorted, features, "contract must be sorted for stability");
+        eprintln!("host provides {} guest-visible features", features.len());
     }
 }

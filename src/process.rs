@@ -5,6 +5,8 @@
 
 #[cfg(unix)]
 use std::os::fd::IntoRawFd;
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -523,6 +525,73 @@ pub fn vmm_memory_limit_bytes(guest_memory_mib: u32, cuda: bool) -> u64 {
     limit_mib.saturating_mul(1024 * 1024)
 }
 
+#[cfg(target_os = "linux")]
+fn cgroup_v2_process_dir(pid: Pid) -> Option<std::path::PathBuf> {
+    let content = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    let rel = content
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?
+        .trim();
+    let rel = std::path::Path::new(rel.trim_start_matches('/'));
+    if rel
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(std::path::Path::new("/sys/fs/cgroup").join(rel))
+}
+
+/// Update `memory.max` only when `pid` is already inside a cgroup owned by
+/// SmolVM. Returns `false` for ordinary CLI-launched/externally-capped
+/// processes, whose enclosing cgroup must never be modified by a guest action.
+///
+/// Live branch generations retain page charges in the source VMM's cgroup even
+/// after a guardian moves: cgroup v2 does not migrate existing charges with a
+/// process. The branch lifecycle therefore uses this hook to size that owned
+/// cgroup for the source plus its retained immutable generations.
+#[cfg(target_os = "linux")]
+pub fn set_managed_vmm_memory_limit(
+    machine: &str,
+    pid: Pid,
+    memory_max_bytes: u64,
+) -> Result<bool> {
+    let Some(dir) = cgroup_v2_process_dir(pid) else {
+        return Ok(false);
+    };
+    let Some(leaf) = dir.file_name().and_then(|name| name.to_str()) else {
+        return Ok(false);
+    };
+    let scope = crate::systemd_scope::scope_name(machine);
+    if leaf == scope {
+        crate::systemd_scope::set_scope_memory_max(machine, memory_max_bytes)?;
+        return Ok(true);
+    }
+    if leaf == format!("vm-{pid}") {
+        write_cgroup(&dir, "memory.max", &memory_max_bytes.to_string()).map_err(|error| {
+            Error::agent(
+                "VM cgroup",
+                format!(
+                    "update {} memory.max to {memory_max_bytes}: {error}",
+                    dir.display()
+                ),
+            )
+        })?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+/// Leave the VMM memory limit unchanged on hosts without Linux cgroup v2.
+pub fn set_managed_vmm_memory_limit(
+    _machine: &str,
+    _pid: Pid,
+    _memory_max_bytes: u64,
+) -> Result<bool> {
+    Ok(false)
+}
+
 /// Bound each CUDA fork-pool VM to its configured CPU count or an even share
 /// of the host, whichever is smaller. Preserve two vCPUs when the configured
 /// VM and host permit it because single-vCPU CUDA forkable guests do not reach
@@ -556,9 +625,9 @@ pub fn cuda_fork_pool_vcpus(configured: u8, pool_size: u32, host_cpus: usize) ->
 // Gated by SMOLVM_SECCOMP=audit|enforce so rollout is opt-in.
 // ============================================================================
 
-/// Install the seccomp allowlist on the calling thread (and, by inheritance, on
-/// every thread it later spawns — the vCPU/worker threads libkrun creates). Must
-/// be called while still single-threaded, before `krun_start_enter`.
+/// Install the seccomp allowlist on every current thread with TSYNC.  Device
+/// setup may create a permanently restricted io_uring first; this function is
+/// still called before `krun_start_enter` creates the vCPU and device workers.
 ///
 /// `enforce = true`  → a non-allowlisted syscall kills the process (KillProcess).
 /// `enforce = false` → audit mode: non-allowlisted syscalls are logged but allowed
@@ -567,13 +636,28 @@ pub fn cuda_fork_pool_vcpus(configured: u8, pool_size: u32, host_cpus: usize) ->
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-pub fn install_seccomp_filter(enforce: bool) -> std::result::Result<(), String> {
+pub fn install_seccomp_filter(
+    enforce: bool,
+    allow_restricted_io_uring: bool,
+) -> std::result::Result<(), String> {
     // Build the BPF program (allocates) and apply it (a single seccomp syscall,
     // allocation-free). Split out so tests can build in the parent and apply in a
     // forked child without allocating post-fork.
-    let program = build_seccomp_program(enforce)?;
-    seccompiler::apply_filter(&program).map_err(|e| e.to_string())?;
+    let program = build_seccomp_program(enforce, allow_restricted_io_uring)?;
+    seccompiler::apply_filter_all_threads(&program).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Apply the configured VMM filter after device setup and before entering the
+/// guest.  Enforce mode fails closed; audit mode logs denied syscalls.
+pub fn install_configured_seccomp_filter(
+    allow_restricted_io_uring: bool,
+) -> std::result::Result<(), String> {
+    match std::env::var("SMOLVM_SECCOMP").as_deref() {
+        Ok("enforce") => install_seccomp_filter(true, allow_restricted_io_uring),
+        Ok("audit") => install_seccomp_filter(false, allow_restricted_io_uring),
+        _ => Ok(()),
+    }
 }
 
 /// Compile the syscall allowlist into a seccomp BPF program. See
@@ -582,7 +666,10 @@ pub fn install_seccomp_filter(enforce: bool) -> std::result::Result<(), String> 
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfProgram, String> {
+fn build_seccomp_program(
+    enforce: bool,
+    allow_restricted_io_uring: bool,
+) -> std::result::Result<seccompiler::BpfProgram, String> {
     use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch};
     use std::collections::BTreeMap;
 
@@ -604,6 +691,10 @@ fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfP
         libc::SYS_dup, libc::SYS_dup3, libc::SYS_getdents64,
         libc::SYS_readlinkat, libc::SYS_faccessat, libc::SYS_faccessat2, libc::SYS_umask,
         libc::SYS_fgetxattr, libc::SYS_flistxattr, libc::SYS_pipe2,
+        // The VMM-owned host-mount watcher mirrors host changes into guest
+        // fsnotify after this filter is installed. `notify` uses inotify on
+        // Linux; without these, enabling a `-v` mount kills an enforced VMM.
+        libc::SYS_inotify_init1, libc::SYS_inotify_add_watch, libc::SYS_inotify_rm_watch,
         // memory (guest RAM, dlopen of libkrun)
         libc::SYS_mmap, libc::SYS_munmap, libc::SYS_mremap, libc::SYS_mprotect,
         libc::SYS_madvise, libc::SYS_brk,
@@ -681,20 +772,39 @@ fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfP
         libc::SYS_setresuid, libc::SYS_setresgid,
     ];
 
+    // An async block ring is created with R_DISABLED, fixed-file-only and
+    // readv/writev-only restrictions before this filter is installed.  The
+    // running VMM may enter that ring, but cannot create or reconfigure one:
+    // io_uring_setup and io_uring_register remain outside this allowlist.
+    if allow_restricted_io_uring {
+        allowed.push(libc::SYS_io_uring_enter);
+    }
+
     // Legacy syscalls present only on x86_64; aarch64 exposes only the *at/p
     // variants (already in the common list above) plus a few of its own. These
     // libc::SYS_* constants don't exist on the other arch, so they must be
     // arch-gated. The arm64 set is a starting point — refine from an audit run.
     #[cfg(target_arch = "x86_64")]
     allowed.extend_from_slice(&[
+        // A live fork generation creates a syscall-only RAM guardian after all
+        // vCPUs and device workers are quiesced. `clone` was already allowed;
+        // `fork` is the equivalent kernel entry used by this constrained path.
+        libc::SYS_fork,
         libc::SYS_dup2,
         libc::SYS_readlink,
         libc::SYS_unlink,
         libc::SYS_rename,
         libc::SYS_mkdir,
+        // A fresh live-fork generation binds its private RAM-guardian socket,
+        // then restricts that path to the owning VM uid before forking the
+        // guardian. Rust's path-based set_permissions uses chmod(2) here.
+        libc::SYS_chmod,
         libc::SYS_access,
         libc::SYS_epoll_wait,
         libc::SYS_poll,
+        // notify-rs uses legacy inotify_init on x86_64; newer architectures
+        // expose only inotify_init1.
+        libc::SYS_inotify_init,
         libc::SYS_arch_prctl,
     ]);
     #[cfg(target_arch = "aarch64")]
@@ -728,7 +838,10 @@ fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfP
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 )))]
-pub fn install_seccomp_filter(_enforce: bool) -> std::result::Result<(), String> {
+pub fn install_seccomp_filter(
+    _enforce: bool,
+    _allow_restricted_io_uring: bool,
+) -> std::result::Result<(), String> {
     Ok(())
 }
 
@@ -1750,6 +1863,54 @@ pub fn process_start_time(pid: Pid) -> Option<u64> {
     fields.get(19)?.parse::<u64>().ok()
 }
 
+/// Open a kernel-fault-capable userfaultfd without requiring the global
+/// `vm.unprivileged_userfaultfd=1` switch when Linux exposes its
+/// permission-governed `/dev/userfaultfd` device.
+///
+/// The syscall remains the first choice for privileged services and hosts that
+/// intentionally enable it. An unprivileged service then falls back to the
+/// device, whose ownership and mode can grant this capability only to SmolVM.
+#[cfg(target_os = "linux")]
+pub fn open_kernel_userfaultfd() -> std::io::Result<OwnedFd> {
+    const FLAGS: libc::c_int = libc::O_CLOEXEC | libc::O_NONBLOCK;
+    // `_IO(USERFAULTFD_IOC, 0x00)` from linux/userfaultfd.h. `_IO` carries no
+    // size or direction bits, so its stable value is type << 8 | number.
+    const USERFAULTFD_IOC_NEW: libc::c_ulong = 0xaa00;
+
+    let syscall_fd = unsafe { libc::syscall(libc::SYS_userfaultfd, FLAGS) as libc::c_int };
+    if syscall_fd >= 0 {
+        return Ok(unsafe { OwnedFd::from_raw_fd(syscall_fd) });
+    }
+    let syscall_error = std::io::Error::last_os_error();
+
+    let control = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/userfaultfd")
+    {
+        Ok(control) => control,
+        Err(device_error) => {
+            return Err(std::io::Error::new(
+                device_error.kind(),
+                format!(
+                    "userfaultfd syscall failed ({syscall_error}) and /dev/userfaultfd could not be opened ({device_error}); grant the SmolVM service read/write access to /dev/userfaultfd"
+                ),
+            ));
+        }
+    };
+    let device_fd = unsafe { libc::ioctl(control.as_raw_fd(), USERFAULTFD_IOC_NEW, FLAGS) };
+    if device_fd < 0 {
+        let device_error = std::io::Error::last_os_error();
+        return Err(std::io::Error::new(
+            device_error.kind(),
+            format!(
+                "userfaultfd syscall failed ({syscall_error}) and USERFAULTFD_IOC_NEW failed ({device_error})"
+            ),
+        ));
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(device_fd as libc::c_int) })
+}
+
 /// Get the start time of a process (Windows process creation FILETIME).
 #[cfg(windows)]
 pub fn process_start_time(pid: Pid) -> Option<u64> {
@@ -1769,6 +1930,160 @@ pub struct ProcessStats {
     pub cpu_time_ns: u64,
     /// Resident set size in bytes (physical memory currently held by the process).
     pub rss_bytes: u64,
+}
+
+/// Host-visible memory attributed to one VMM process.
+///
+/// RSS counts a shared page once in every process mapping it. PSS divides that
+/// page across its mappings, so summing PSS is the meaningful physical-memory
+/// gauge for a branch lineage. The remaining fields make the sharing visible
+/// without pretending that the mapped-shared sum is unique physical memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessMemoryStats {
+    /// Resident bytes mapped by this process.
+    pub rss_bytes: u64,
+    /// Proportional resident bytes, when the host exposes `smaps_rollup`.
+    pub pss_bytes: Option<u64>,
+    /// Private clean + dirty resident bytes.
+    pub private_bytes: Option<u64>,
+    /// Shared clean + dirty bytes mapped by this process.
+    pub shared_mapped_bytes: Option<u64>,
+    /// Proportional swapped bytes.
+    pub swap_pss_bytes: Option<u64>,
+}
+
+/// Physical-memory capacity currently available to this SmolVM process.
+/// On Linux this is the tighter of host `MemAvailable` and any finite cgroup-v2
+/// ancestor headroom, preventing a service-scoped deployment from admitting
+/// against RAM it cannot actually consume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostMemoryStats {
+    /// Effective host or cgroup memory ceiling.
+    pub total_bytes: u64,
+    /// Effective currently available host or cgroup memory.
+    pub available_bytes: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn parse_kib_field(contents: &str, field: &str) -> Option<u64> {
+    let value = contents.lines().find_map(|line| {
+        let (name, rest) = line.split_once(':')?;
+        (name == field).then_some(rest)
+    })?;
+    let kib = value.split_whitespace().next()?.parse::<u64>().ok()?;
+    kib.checked_mul(1024)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_smaps_rollup(contents: &str) -> Option<ProcessMemoryStats> {
+    let rss_bytes = parse_kib_field(contents, "Rss")?;
+    let private_bytes = parse_kib_field(contents, "Private_Clean")?
+        .checked_add(parse_kib_field(contents, "Private_Dirty")?)?;
+    let shared_mapped_bytes = parse_kib_field(contents, "Shared_Clean")?
+        .checked_add(parse_kib_field(contents, "Shared_Dirty")?)?;
+    Some(ProcessMemoryStats {
+        rss_bytes,
+        pss_bytes: parse_kib_field(contents, "Pss"),
+        private_bytes: Some(private_bytes),
+        shared_mapped_bytes: Some(shared_mapped_bytes),
+        swap_pss_bytes: parse_kib_field(contents, "SwapPss"),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn parse_statm_memory(contents: &str, page_size: u64) -> Option<(u64, u64)> {
+    let mut fields = contents.split_whitespace();
+    let _virtual_pages = fields.next()?;
+    let resident_pages = fields.next()?.parse::<u64>().ok()?;
+    let shared_pages = fields.next()?.parse::<u64>().ok()?;
+    Some((
+        resident_pages.checked_mul(page_size)?,
+        shared_pages.checked_mul(page_size)?,
+    ))
+}
+
+/// Read PSS/private/shared memory for a VMM. Linux uses the kernel's rollup
+/// view and falls back to `statm`'s cheaper resident/shared split when smaps is
+/// restricted; other hosts retain an RSS-only result.
+pub fn process_memory_stats(pid: Pid) -> Option<ProcessMemoryStats> {
+    #[cfg(target_os = "linux")]
+    if let Ok(contents) = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")) {
+        if let Some(stats) = parse_smaps_rollup(&contents) {
+            return Some(stats);
+        }
+    }
+    let stats = process_stats(pid)?;
+    #[cfg(target_os = "linux")]
+    let statm = std::fs::read_to_string(format!("/proc/{pid}/statm"))
+        .ok()
+        .and_then(|contents| {
+            let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            (page_size > 0)
+                .then_some(page_size as u64)
+                .and_then(|page_size| parse_statm_memory(&contents, page_size))
+        });
+    #[cfg(not(target_os = "linux"))]
+    let statm: Option<(u64, u64)> = None;
+    let shared_mapped_bytes = statm.map(|(_, shared)| shared);
+    Some(ProcessMemoryStats {
+        rss_bytes: stats.rss_bytes,
+        pss_bytes: None,
+        private_bytes: shared_mapped_bytes.map(|shared| stats.rss_bytes.saturating_sub(shared)),
+        shared_mapped_bytes,
+        swap_pss_bytes: None,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn parse_host_meminfo(contents: &str) -> Option<HostMemoryStats> {
+    Some(HostMemoryStats {
+        total_bytes: parse_kib_field(contents, "MemTotal")?,
+        available_bytes: parse_kib_field(contents, "MemAvailable")?,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn finite_cgroup_memory_headroom(mut dir: std::path::PathBuf) -> Option<(u64, u64)> {
+    let cgroup_root = std::path::Path::new("/sys/fs/cgroup");
+    let mut tightest_limit: Option<u64> = None;
+    let mut tightest_headroom: Option<u64> = None;
+    loop {
+        let max = std::fs::read_to_string(dir.join("memory.max")).ok();
+        let current = std::fs::read_to_string(dir.join("memory.current")).ok();
+        if let (Some(max), Some(current)) = (max, current) {
+            if let (Ok(max), Ok(current)) =
+                (max.trim().parse::<u64>(), current.trim().parse::<u64>())
+            {
+                tightest_limit = Some(tightest_limit.map_or(max, |limit| limit.min(max)));
+                let headroom = max.saturating_sub(current);
+                tightest_headroom =
+                    Some(tightest_headroom.map_or(headroom, |available| available.min(headroom)));
+            }
+        }
+        if dir == cgroup_root || !dir.pop() || !dir.starts_with(cgroup_root) {
+            break;
+        }
+    }
+    tightest_limit.zip(tightest_headroom)
+}
+
+/// Report effective host memory available to SmolVM.
+pub fn host_memory_stats() -> Option<HostMemoryStats> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut stats = parse_host_meminfo(&std::fs::read_to_string("/proc/meminfo").ok()?)?;
+        if let Some(dir) = cgroup_v2_self_dir() {
+            if let Some((limit, headroom)) = finite_cgroup_memory_headroom(dir) {
+                stats.total_bytes = stats.total_bytes.min(limit);
+                stats.available_bytes = stats.available_bytes.min(headroom);
+            }
+        }
+        Some(stats)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 /// Sample CPU time and RSS for a single process. Returns None if the PID is
@@ -2762,7 +3077,7 @@ mod tests {
     fn seccomp_denies_forbidden_syscall() {
         // Build the filter in the parent (allocating), then fork a child that
         // applies it (allocation-free) and attempts the forbidden syscall.
-        let program = build_seccomp_program(true).expect("build seccomp program");
+        let program = build_seccomp_program(true, false).expect("build seccomp program");
         unsafe {
             let pid = libc::fork();
             assert!(pid >= 0, "fork failed");
@@ -2779,6 +3094,87 @@ mod tests {
             assert!(
                 libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS,
                 "forbidden syscall (kexec_load) should trigger SIGSYS, status={status:#x}"
+            );
+        }
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn async_block_seccomp_allows_enter_but_denies_new_rings() {
+        let program = build_seccomp_program(true, true).expect("build seccomp program");
+        unsafe {
+            let enter_pid = libc::fork();
+            assert!(enter_pid >= 0, "fork failed");
+            if enter_pid == 0 {
+                if seccompiler::apply_filter(&program).is_err() {
+                    libc::_exit(2);
+                }
+                let result = libc::syscall(libc::SYS_io_uring_enter, -1, 0, 0, 0, 0, 0);
+                libc::_exit(if result == -1 { 0 } else { 3 });
+            }
+            let mut status = 0;
+            libc::waitpid(enter_pid, &mut status, 0);
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "io_uring_enter should remain available to the prepared ring, status={status:#x}"
+            );
+
+            let setup_pid = libc::fork();
+            assert!(setup_pid >= 0, "fork failed");
+            if setup_pid == 0 {
+                if seccompiler::apply_filter(&program).is_err() {
+                    libc::_exit(2);
+                }
+                libc::syscall(
+                    libc::SYS_io_uring_setup,
+                    1,
+                    std::ptr::null_mut::<libc::c_void>(),
+                );
+                libc::_exit(0);
+            }
+            libc::waitpid(setup_pid, &mut status, 0);
+            assert!(
+                libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS,
+                "io_uring_setup must remain blocked, status={status:#x}"
+            );
+        }
+    }
+
+    /// A second live fork must be able to protect the previous generation's
+    /// RAM-guardian socket while the VMM is confined. This is deliberately a
+    /// direct syscall check so a future stdlib implementation change cannot
+    /// hide the exact x86_64 allowlist requirement.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn seccomp_allows_guardian_socket_chmod() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("guardian.sock");
+        std::fs::write(&path, b"").expect("create guardian stand-in");
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("cstring");
+        let program = build_seccomp_program(true, false).expect("build seccomp program");
+
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                if seccompiler::apply_filter(&program).is_err() {
+                    libc::_exit(2);
+                }
+                if libc::syscall(libc::SYS_chmod, path.as_ptr(), 0o600) != 0 {
+                    libc::_exit(3);
+                }
+                libc::_exit(0);
+            }
+            let mut status: libc::c_int = 0;
+            libc::waitpid(pid, &mut status, 0);
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "guardian chmod should survive seccomp, status={status:#x}"
             );
         }
     }
@@ -2975,6 +3371,56 @@ mod tests {
             "a live process must have non-zero RSS, got {}",
             stats.rss_bytes
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn smaps_rollup_distinguishes_proportional_private_and_shared_memory() {
+        let sample = "00400000-00452000 r--p 00000000 00:00 0 [rollup]\n\
+                      Rss:                1024 kB\n\
+                      Pss:                 640 kB\n\
+                      Shared_Clean:        256 kB\n\
+                      Shared_Dirty:         64 kB\n\
+                      Private_Clean:       128 kB\n\
+                      Private_Dirty:       576 kB\n\
+                      SwapPss:              16 kB\n";
+        let stats = parse_smaps_rollup(sample).expect("parse rollup");
+        assert_eq!(stats.rss_bytes, 1024 * 1024);
+        assert_eq!(stats.pss_bytes, Some(640 * 1024));
+        assert_eq!(stats.private_bytes, Some(704 * 1024));
+        assert_eq!(stats.shared_mapped_bytes, Some(320 * 1024));
+        assert_eq!(stats.swap_pss_bytes, Some(16 * 1024));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn statm_fallback_distinguishes_resident_private_and_shared_pages() {
+        let (resident, shared) = parse_statm_memory("1000 300 220 8 0 400 0\n", 4096).unwrap();
+        assert_eq!(resident, 300 * 4096);
+        assert_eq!(shared, 220 * 4096);
+        assert_eq!(resident - shared, 80 * 4096);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn host_meminfo_uses_available_not_free_memory() {
+        let sample = "MemTotal:       16384000 kB\n\
+                      MemFree:          100000 kB\n\
+                      MemAvailable:    4096000 kB\n";
+        let stats = parse_host_meminfo(sample).expect("parse meminfo");
+        assert_eq!(stats.total_bytes, 16_384_000 * 1024);
+        assert_eq!(stats.available_bytes, 4_096_000 * 1024);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_memory_stats_samples_self() {
+        let stats = process_memory_stats(std::process::id() as Pid)
+            .expect("memory stats must sample the current process");
+        assert!(stats.rss_bytes > 0);
+        if let Some(pss) = stats.pss_bytes {
+            assert!(pss <= stats.rss_bytes);
+        }
     }
 
     /// A PID that does not exist must yield None, not a bogus sample.

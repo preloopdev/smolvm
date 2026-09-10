@@ -11,23 +11,32 @@
 # Usage:
 #   sudo ./scripts/install-k8s-runtime.sh [--shim PATH] [--runtime-dir DIR]
 #
-#   --shim PATH          The built containerd-shim-smolvm-v2 binary
-#                        (default: target/release/containerd-shim-smolvm-v2).
+#   --shim PATH          The built containerd-shim-smolvm-v2 binary (default:
+#                        the one beside this script in an unpacked release,
+#                        else target/release/containerd-shim-smolvm-v2).
 #   --runtime-dir DIR    A directory holding the smolvm runtime artifacts to
 #                        install into /var/lib/smolvm: lib/ (libkrun*.so),
-#                        init.krun, smolvm-vmm, agent-rootfs/. A smolvm Linux
+#                        init.krun, agent-rootfs/. A smolvm Linux
 #                        distribution directory has these. If omitted, the
 #                        artifacts already under /var/lib/smolvm are kept and
 #                        only the shim is (re)installed.
 #
 set -euo pipefail
 
-SHIM_SRC="target/release/containerd-shim-smolvm-v2"
+# Default shim location, resolved for both layouts this script ships in: an
+# unpacked release, where it sits beside the runtime artifacts one level up
+# from this script, and a source checkout, where cargo leaves it in target/.
+_HERE="$(cd "$(dirname "$0")" && pwd)"
+if [ -x "$_HERE/../containerd-shim-smolvm-v2" ]; then
+    SHIM_SRC="$_HERE/../containerd-shim-smolvm-v2"
+else
+    SHIM_SRC="target/release/containerd-shim-smolvm-v2"
+fi
 RUNTIME_SRC=""
 DATA_DIR="/var/lib/smolvm"
 BIN_DIR="/usr/local/bin"
 SHIM_DST="$BIN_DIR/containerd-shim-smolvm-v2"
-RUNTIME_ARTIFACTS=(lib init.krun smolvm-vmm agent-rootfs)
+RUNTIME_ARTIFACTS=(lib init.krun agent-rootfs)
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -60,7 +69,7 @@ fi
 
 # Sanity-check the artifacts the shim will need at runtime are present.
 missing=0
-for a in lib/libkrun.so agent-rootfs smolvm-vmm; do
+for a in lib/libkrun.so agent-rootfs; do
     [ -e "$DATA_DIR/$a" ] || { echo "error: required artifact missing: $DATA_DIR/$a" >&2; missing=1; }
 done
 [ "$missing" = 0 ] || { echo "install incomplete — supply --runtime-dir with a smolvm distribution" >&2; exit 1; }

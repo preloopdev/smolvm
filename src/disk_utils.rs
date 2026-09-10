@@ -109,6 +109,14 @@ pub(crate) fn copy_disk_from_template<D: DiskType>(
             .open(disk_path)
             .map_err(|e| Error::storage("open for resize", e.to_string()))?;
         write_last_byte(&mut file, size_bytes, "seek for resize", "extend disk")?;
+    } else if current_size > size_bytes {
+        // A request below the template's size is a promise about an upper
+        // bound (a quota, a dense host), so it is honored rather than rounded
+        // up. Shrinking has to happen here, before the first boot: the guest
+        // grows the filesystem to its block device at every boot, so a file
+        // left at the template size would simply grow back. It is a one-time
+        // cost on this machine's first start, about half a second.
+        shrink_ext4_image::<D>(disk_path, size_bytes)?;
     }
 
     tracing::info!(
@@ -117,6 +125,65 @@ pub(crate) fn copy_disk_from_template<D: DiskType>(
         "{} copied from template",
         D::NAME
     );
+    Ok(())
+}
+
+/// Shrink the ext4 filesystem in `disk_path` to `size_bytes` and truncate
+/// the sparse file to match, so the guest's block device and filesystem
+/// agree on the requested size.
+fn shrink_ext4_image<D: DiskType>(disk_path: &Path, size_bytes: u64) -> Result<()> {
+    let resize2fs = find_e2fsprogs_tool("resize2fs").ok_or_else(|| {
+        let hint = if Os::current().is_macos() {
+            "On macOS, install with: brew install e2fsprogs"
+        } else {
+            "On Linux, install with: apt install e2fsprogs (or equivalent)"
+        };
+        Error::storage(
+            "find resize2fs",
+            format!(
+                "resize2fs not found - required to create a {} disk smaller than the {} GiB template.\n  {}",
+                D::NAME,
+                D::DEFAULT_SIZE_GIB,
+                hint
+            ),
+        )
+    })?;
+    tracing::info!(
+        path = %disk_path.display(),
+        disk_type = D::NAME,
+        size_gib = size_bytes / BYTES_PER_GIB,
+        "shrinking {} filesystem below the template size",
+        D::NAME
+    );
+    // Kibibytes keep the request exact for any block size; `-f` skips the
+    // fsck requirement, which a freshly cloned, never-mounted template meets.
+    let output = std::process::Command::new(&resize2fs)
+        .arg("-f")
+        .arg(disk_path)
+        .arg(format!("{}K", size_bytes / 1024))
+        .output()
+        .map_err(|e| Error::storage("run resize2fs", e.to_string()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = if stderr.contains("No space left") {
+            format!(
+                "{} GiB cannot hold the template filesystem's contents; ask for a larger disk",
+                size_bytes / BYTES_PER_GIB
+            )
+        } else {
+            stderr.trim().to_string()
+        };
+        return Err(Error::storage(
+            "shrink disk",
+            format!("resize2fs failed for {}: {detail}", disk_path.display()),
+        ));
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(disk_path)
+        .map_err(|e| Error::storage("open for truncate", e.to_string()))?;
+    file.set_len(size_bytes)
+        .map_err(|e| Error::storage("truncate disk", e.to_string()))?;
     Ok(())
 }
 
@@ -666,6 +733,66 @@ mod tests {
     /// overflows u64 with a clean `Err`, never a panic (debug) or a wrapped /
     /// zero-length sparse file (release). `2^34 GiB * 2^30 bytes/GiB = 2^64`,
     /// which is exactly the u64 overflow boundary.
+    /// A request below the template's size yields a disk of exactly that
+    /// size, filesystem and file alike, instead of the template's size.
+    #[test]
+    fn template_copy_shrinks_to_a_smaller_request() {
+        let (Some(mkfs), Some(_)) = (
+            find_e2fsprogs_tool("mkfs.ext4"),
+            find_e2fsprogs_tool("resize2fs"),
+        ) else {
+            eprintln!("skipping template_copy_shrinks_to_a_smaller_request: e2fsprogs not found");
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        // A 64 MiB "template" formatted the way the shipped one is.
+        let template = temp.path().join("template.ext4");
+        std::fs::File::create(&template)
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+        let status = std::process::Command::new(mkfs)
+            .args(["-q", "-F"])
+            .arg(&template)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let disk = temp.path().join("storage.raw");
+        let want = 32 * 1024 * 1024;
+        copy_disk_from_template::<crate::storage::Storage>(&disk, want, &template).unwrap();
+        assert_eq!(std::fs::metadata(&disk).unwrap().len(), want);
+        if let Some(dumpe2fs) = find_e2fsprogs_tool("dumpe2fs") {
+            let out = std::process::Command::new(dumpe2fs)
+                .arg("-h")
+                .arg(&disk)
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            let blocks: u64 = text
+                .lines()
+                .find_map(|l| l.strip_prefix("Block count:"))
+                .and_then(|v| v.trim().parse().ok())
+                .expect("block count");
+            let block_size: u64 = text
+                .lines()
+                .find_map(|l| l.strip_prefix("Block size:"))
+                .and_then(|v| v.trim().parse().ok())
+                .expect("block size");
+            assert_eq!(blocks * block_size, want);
+        }
+
+        // Too small to hold the template's contents is an error, not a corrupt disk.
+        let tiny = temp.path().join("tiny.raw");
+        let err = copy_disk_from_template::<crate::storage::Storage>(&tiny, 1024 * 1024, &template)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cannot hold") || err.contains("resize2fs failed"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn expand_rejects_overflowing_size_gb() {
         let dir = tempfile::tempdir().unwrap();

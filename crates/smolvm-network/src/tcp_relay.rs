@@ -211,6 +211,16 @@ impl TcpRelayTable {
         }
     }
 
+    /// Number of guest TCP flows currently occupying relay table entries.
+    pub(crate) fn active_connections(&self) -> usize {
+        self.connections.len()
+    }
+
+    /// Maximum number of simultaneous guest TCP flows accepted by this table.
+    pub(crate) fn capacity(&self) -> usize {
+        self.max_connections
+    }
+
     fn destination_allowed(&self, destination: SocketAddr) -> bool {
         self.egress.allows(destination.ip())
             || (self
@@ -276,7 +286,11 @@ impl TcpRelayTable {
         sockets: &mut SocketSet<'_>,
     ) -> bool {
         if self.connections.len() >= self.max_connections {
-            tracing::warn!("dropping TCP connection because the relay table is full");
+            virtio_net_log!(
+                "virtio-net: dropping outbound TCP connection because relay table is full active={} capacity={}",
+                self.connections.len(),
+                self.max_connections
+            );
             return false;
         }
 
@@ -364,7 +378,11 @@ impl TcpRelayTable {
         sockets: &mut SocketSet<'_>,
     ) -> bool {
         if self.connections.len() >= self.max_connections {
-            tracing::warn!("dropping published TCP connection because the relay table is full");
+            virtio_net_log!(
+                "virtio-net: dropping published TCP connection because relay table is full active={} capacity={}",
+                self.connections.len(),
+                self.max_connections
+            );
             return false;
         }
 
@@ -606,14 +624,16 @@ pub fn spawn_tcp_relay(
     to_smoltcp: SyncSender<Vec<u8>>,
     relay_wake: Arc<WakePipe>,
     exit_state: RelayExitState,
-) {
+) -> io::Result<()> {
     let thread_name = format!("smolvm-tcp-{}", destination.port());
     virtio_net_log!(
-        "virtio-net: spawning host TCP relay thread destination={} thread={}",
+        "virtio-net: host TCP relay thread spawn attempt destination={} thread={}",
         destination,
         thread_name
     );
-    let _ = thread::Builder::new().name(thread_name).spawn(move || {
+    let spawn_failure_exit_state = exit_state.clone();
+    let spawn_failure_wake = relay_wake.clone();
+    let spawn_result = thread::Builder::new().name(thread_name).spawn(move || {
         run_tcp_relay(
             destination,
             relay_target,
@@ -623,6 +643,37 @@ pub fn spawn_tcp_relay(
             exit_state,
         )
     });
+    match handle_relay_spawn_result(
+        spawn_result,
+        destination,
+        &spawn_failure_exit_state,
+        &spawn_failure_wake,
+    ) {
+        Ok(_handle) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn handle_relay_spawn_result<T>(
+    result: io::Result<T>,
+    destination: SocketAddr,
+    exit_state: &RelayExitState,
+    relay_wake: &WakePipe,
+) -> io::Result<T> {
+    result.map_err(|err| {
+        virtio_net_log!(
+            "virtio-net: failed to spawn host TCP relay thread destination={} error={}",
+            destination,
+            err
+        );
+        // `take_new_connections` has already marked this entry as having a
+        // relay. Without an explicit terminal state, a failed OS thread
+        // creation leaves the entry in Running forever and eventually
+        // exhausts the bounded relay table.
+        exit_state.store(RelayExitMode::Abort);
+        relay_wake.wake();
+        err
+    })
 }
 
 fn run_tcp_relay(
@@ -887,6 +938,20 @@ mod tests {
             exit_state: RelayExitState::new(),
             reserved_published_port: None,
         }
+    }
+
+    #[test]
+    fn failed_relay_thread_spawn_aborts_the_guest_connection() {
+        let exit_state = RelayExitState::new();
+        let wake = WakePipe::new();
+        let destination = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 6443);
+        let spawn_error = io::Error::other("injected thread spawn failure");
+
+        let result =
+            handle_relay_spawn_result::<()>(Err(spawn_error), destination, &exit_state, &wake);
+
+        assert!(result.is_err());
+        assert_eq!(exit_state.load(), RelayExitMode::Abort);
     }
 
     #[test]

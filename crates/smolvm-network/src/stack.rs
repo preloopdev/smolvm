@@ -82,6 +82,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant as StdInstant};
 
 const DNS_SOCKET_PORT: u16 = 53;
+const TCP_RELAY_STATS_INTERVAL: Duration = Duration::from_secs(5);
 const DNS_PACKET_SLOTS: usize = 8;
 const DNS_BUFFER_BYTES: usize = 2048;
 // DNS-over-TCP to the gateway. Real resolvers (and resolv.conf clients) fall
@@ -230,6 +231,11 @@ fn run_network_stack(
         gateway_addrs.to_vec(),
         config.host_service,
     );
+    let mut relay_spawn_attempts = 0_u64;
+    let mut relay_spawn_successes = 0_u64;
+    let mut relay_spawn_failures = 0_u64;
+    let mut reported_relay_spawn_failures = 0_u64;
+    let mut last_relay_stats = StdInstant::now();
     let mut udp_sockets = udp_relay::UdpSocketTable::new();
     let udp_channels = {
         let shutdown_queues = queues.clone();
@@ -441,17 +447,42 @@ fn run_network_stack(
         // Once the guest-side TCP handshake is established inside smoltcp, we
         // can spawn the corresponding host relay thread.
         for connection in relays.take_new_connections(&mut sockets) {
-            spawn_tcp_relay(
+            relay_spawn_attempts = relay_spawn_attempts.saturating_add(1);
+            if spawn_tcp_relay(
                 connection.destination,
                 connection.relay_target,
                 connection.from_smoltcp,
                 connection.to_smoltcp,
                 relay_wake.clone(),
                 connection.exit_state,
-            );
+            )
+            .is_ok()
+            {
+                relay_spawn_successes = relay_spawn_successes.saturating_add(1);
+            } else {
+                relay_spawn_failures = relay_spawn_failures.saturating_add(1);
+            }
         }
 
         relays.cleanup_closed(&mut sockets);
+
+        let relay_table_under_pressure =
+            relays.active_connections() >= relays.capacity().saturating_mul(3) / 4;
+        let has_new_spawn_failure = relay_spawn_failures != reported_relay_spawn_failures;
+        if (relay_table_under_pressure || has_new_spawn_failure)
+            && last_relay_stats.elapsed() >= TCP_RELAY_STATS_INTERVAL
+        {
+            virtio_net_log!(
+                "virtio-net: TCP relay stats active={} capacity={} spawn_attempts={} spawn_successes={} spawn_failures={}",
+                relays.active_connections(),
+                relays.capacity(),
+                relay_spawn_attempts,
+                relay_spawn_successes,
+                relay_spawn_failures
+            );
+            reported_relay_spawn_failures = relay_spawn_failures;
+            last_relay_stats = StdInstant::now();
+        }
 
         // Second egress pass: DNS responses or relay data may have queued more
         // packets for the guest.

@@ -10,7 +10,7 @@ A tool to build and run portable, self-contained virtual machines locally. <200m
 | Linux x86_64 / aarch64 | matching Linux | KVM | `/dev/kvm` |
 | Windows x86_64 | x86_64 Linux | Windows Hypervisor Platform (WHP) | WHP feature enabled |
 
-Windows caveats (run, persistent machines, volumes, port-forwarding, pack create/run, and interactive TTY all work): networking is TSI-only (TCP/UDP + inbound `-p`, no virtio-net); no GPU acceleration; no fork/snapshot. `pack create` needs `storage-template.ext4` / `overlay-template.ext4` beside `smolvm.exe` (Windows has no host `mkfs.ext4`). Set `SMOLVM_LIB_DIR` (folder holding `krun.dll` + `libkrunfw.dll`) and `SMOLVM_AGENT_ROOTFS` when running from a non-standard layout.
+Windows caveats (run, persistent machines, volumes, port-forwarding, pack create/run, and interactive TTY all work): networking is TSI-only (TCP/UDP + inbound `-p`, no virtio-net); no GPU acceleration; no branch/snapshot. `pack create` needs `storage-template.ext4` / `overlay-template.ext4` beside `smolvm.exe` (Windows has no host `mkfs.ext4`). Set `SMOLVM_LIB_DIR` (folder holding `krun.dll` + `libkrunfw.dll`) and `SMOLVM_AGENT_ROOTFS` when running from a non-standard layout.
 
 ## Quick Reference
 
@@ -169,6 +169,7 @@ rejected with a hint to build first (`docker build … && docker save … | … 
 | `--gpu` | | run, create | Enable GPU acceleration (Vulkan via virtio-gpu) |
 | `--gpu-vram` | | run, create | GPU shared-memory region size in MiB (default: 4096). Ignored without `--gpu`. |
 | `--volume` | `-v` | run, create, update | Mount host dir: `HOST:GUEST[:ro]` |
+| `--allow-system-mounts` | | run, create, update, pack run | Permit trusted read-only `/etc` and `/var/log` mounts below `/host` |
 | `--port` | `-p` | run, create, update | Port mapping: `HOST:GUEST` |
 | `--smolfile` | `-s` | run, create, pack create | Load config from Smolfile |
 | `--interactive` | `-i` | run, exec | Keep stdin open |

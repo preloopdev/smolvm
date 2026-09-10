@@ -45,7 +45,11 @@ loaded and your user is in the `kvm` group.
   release tarball served on the GitHub Releases page, patchelf'd for Nix. The
   bundled libkrun/libkrunfw fork lives under the package's `libexec`, so it does
   not collide with a system `libkrun`.
-- The pinned version and hashes in `nix/smolvm.nix` are bumped automatically on
-  every release by `.github/workflows/update-nix-flake.yml` (which opens a PR).
+- The pinned version and hashes in `nix/smolvm.nix` are bumped after every
+  release by `.github/workflows/update-nix-flake.yml`, which pushes a
+  `nix-bump-<version>` branch and tries to open a PR. **The bump only reaches
+  users once that PR is merged**, so check for an unmerged `nix-bump-*` branch
+  if the flake lags the latest release. `./scripts/update-nix-hashes.sh VERSION`
+  refreshes the hashes by hand from a release's `checksums.sha256`.
 - A submission to the upstream **nixpkgs** collection is planned so
   `nix profile install nixpkgs#smolvm` works without referencing this flake.

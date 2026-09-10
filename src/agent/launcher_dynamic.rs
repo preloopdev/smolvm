@@ -34,12 +34,16 @@ use super::VmResources;
 pub struct PackedMount {
     /// Virtiofs tag (e.g., "smolvm0").
     pub tag: String,
+    /// Agent/container tag, including staged working-copy identity when used.
+    pub runtime_tag: String,
     /// Host source path (passed to `krun_add_virtiofs`).
     pub host_path: String,
     /// Guest mount path (passed to agent via `SMOLVM_MOUNT_*` env).
     pub guest_path: String,
     /// Whether the mount is read-only.
     pub read_only: bool,
+    /// Whether the guest uses a local staged working copy.
+    pub staged: bool,
 }
 
 /// Configuration for launching a packed VM.
@@ -108,6 +112,10 @@ pub fn launch_agent_vm_dynamic(
     krun: &KrunFunctions,
     config: &PackedLaunchConfig,
 ) -> Result<(), String> {
+    config
+        .resources
+        .validate()
+        .map_err(|error| error.to_string())?;
     crate::network::validate_requested_network_backend(
         &config.resources,
         config.dns_filter_hosts.as_deref(),
@@ -348,7 +356,16 @@ pub fn launch_agent_vm_dynamic(
         free_ctx_on_err!("root DAX requires libkrun with krun_add_virtiofs3");
     };
     // SAFETY: ctx is valid; root_tag/root are valid null-terminated C strings.
-    if unsafe { add_virtiofs3(ctx, root_tag.as_ptr(), root.as_ptr(), 1 << 29, false) } < 0 {
+    if unsafe {
+        add_virtiofs3(
+            ctx,
+            root_tag.as_ptr(),
+            root.as_ptr(),
+            super::virtiofs::rootfs_dax_window(),
+            false,
+        )
+    } < 0
+    {
         free_ctx_on_err!("krun_add_virtiofs3 failed for root filesystem");
     }
 
@@ -591,18 +608,20 @@ pub fn launch_agent_vm_dynamic(
         "storage path contains null byte"
     );
     let storage_format = krun_disk_format(config.storage_path);
-    // SAFETY: ctx is valid, block_id and disk_path are valid C strings
-    if unsafe {
-        (krun.add_disk2)(
-            ctx,
-            block_id.as_ptr(),
-            disk_path.as_ptr(),
-            storage_format,
-            false,
-        )
-    } < 0
-    {
-        free_ctx_on_err!("krun_add_disk2 failed");
+    let storage_result = add_dynamic_block_disk(
+        krun,
+        ctx,
+        block_id.as_ptr(),
+        disk_path.as_ptr(),
+        storage_format,
+        config.resources.block_io,
+    );
+    if storage_result < 0 {
+        free_ctx_on_err!(dynamic_block_error(
+            "storage",
+            config.resources.block_io,
+            storage_result
+        ));
     }
 
     // Add overlay disk as 2nd disk (/dev/vdb) for VM mode
@@ -611,18 +630,20 @@ pub fn launch_agent_vm_dynamic(
         let overlay_disk =
             try_or_free_ctx!(path_to_cstring(overlay), "overlay path contains null byte");
         let overlay_format = krun_disk_format(overlay);
-        // SAFETY: ctx is valid, overlay_id and overlay_disk are valid C strings
-        if unsafe {
-            (krun.add_disk2)(
-                ctx,
-                overlay_id.as_ptr(),
-                overlay_disk.as_ptr(),
-                overlay_format,
-                false,
-            )
-        } < 0
-        {
-            free_ctx_on_err!("krun_add_disk2 failed for overlay disk");
+        let overlay_result = add_dynamic_block_disk(
+            krun,
+            ctx,
+            overlay_id.as_ptr(),
+            overlay_disk.as_ptr(),
+            overlay_format,
+            config.resources.block_io,
+        );
+        if overlay_result < 0 {
+            free_ctx_on_err!(dynamic_block_error(
+                "overlay",
+                config.resources.block_io,
+                overlay_result
+            ));
         }
     }
 
@@ -671,15 +692,6 @@ pub fn launch_agent_vm_dynamic(
     // upstream virtio-console API (krun_set_console_output was removed).
     // SAFETY: ctx is a valid, not-yet-started libkrun context.
     if unsafe { krun.console_output_to_file(ctx, &config.console_log) } < 0 {
-        // On Windows the fd-based virtio-console redirection isn't wired (the
-        // wrapper is a known no-op that always returns < 0), so this is expected
-        // — NOT a boot failure. Keep it out of the startup error log at WARN so a
-        // benign line can't become what the readiness monitor surfaces as "the
-        // error" when the boot later fails for a real reason (see
-        // `boot_failure_reason`).
-        #[cfg(windows)]
-        tracing::debug!("guest console not captured on Windows (fd redirection unsupported)");
-        #[cfg(not(windows))]
         tracing::warn!("failed to set console output");
     }
 
@@ -702,10 +714,16 @@ pub fn launch_agent_vm_dynamic(
 
     // Pass mount info to the agent via environment
     for (i, mount) in config.mounts.iter().enumerate() {
-        let ro_flag = if mount.read_only { "ro" } else { "rw" };
+        let mode = if mount.staged {
+            "staged"
+        } else if mount.read_only {
+            "ro"
+        } else {
+            "rw"
+        };
         let env_val = format!(
             "SMOLVM_MOUNT_{}={}:{}:{}",
-            i, mount.tag, mount.guest_path, ro_flag
+            i, mount.runtime_tag, mount.guest_path, mode
         );
         if let Ok(cstr) = CString::new(env_val) {
             env_strings.push(cstr);
@@ -789,15 +807,8 @@ pub fn launch_agent_vm_dynamic(
         free_ctx_on_err!("krun_set_exec failed");
     }
 
-    // Every virtiofs mount gets a DAX window (like the root fs above): without
-    // DAX, virtiofs falls back to writeback caching where each file access is a
-    // FUSE round-trip over the virtio queue — pathological for read-heavy mounts
-    // with many files (a multi-GB Python venv took minutes just to import, and a
-    // single file larger than the window stalled entirely). 2 GiB exceeds any
-    // realistic single mapped file; the window is virtual host address space
-    // backed on demand, so oversizing costs nothing until touched.
-    const VIRTIOFS_DAX_WINDOW: u64 = 1 << 31;
-
+    // Packed image layers use DAX where the guest architecture supports it.
+    // User mounts follow the same explicit policy as every other launch path.
     // Add virtiofs mount for packed layers (AFTER set_exec)
     if config.layers_dir.exists() {
         let layers_tag = cstr("smolvm_layers");
@@ -811,7 +822,7 @@ pub fn launch_agent_vm_dynamic(
                 ctx,
                 layers_tag.as_ptr(),
                 layers_path.as_ptr(),
-                VIRTIOFS_DAX_WINDOW,
+                super::virtiofs::packed_layers_dax_window(),
                 false,
             )
         } < 0
@@ -831,13 +842,14 @@ pub fn launch_agent_vm_dynamic(
             "mount path contains null byte"
         );
 
+        let dax_window = super::virtiofs::user_mount_dax_window(Path::new(&mount.guest_path));
         // SAFETY: ctx is valid, tag and host_path are valid C strings
         if unsafe {
             add_virtiofs3(
                 ctx,
                 tag.as_ptr(),
                 host_path.as_ptr(),
-                VIRTIOFS_DAX_WINDOW,
+                dax_window,
                 mount.read_only,
             )
         } < 0
@@ -846,6 +858,13 @@ pub fn launch_agent_vm_dynamic(
                 "krun_add_virtiofs failed for '{}' - requested mount cannot be attached",
                 mount.tag
             ));
+        }
+        if dax_window > 0 {
+            tracing::info!(
+                tag = %mount.tag,
+                dax_window_mib = dax_window >> 20,
+                "virtiofs DAX enabled"
+            );
         }
     }
 
@@ -867,6 +886,14 @@ pub fn launch_agent_vm_dynamic(
         }
     }
 
+    if let Err(error) = crate::process::install_configured_seccomp_filter(
+        config.resources.block_io == crate::data::resources::BlockIoEngine::Async,
+    ) {
+        free_ctx_on_err!(format!(
+            "seccomp filter failed; refusing to boot unconfined: {error}"
+        ));
+    }
+
     // Start VM (never returns on success)
     // SAFETY: ctx is valid, all configuration has been set
     let ret = unsafe { (krun.start_enter)(ctx) };
@@ -880,6 +907,60 @@ pub fn launch_agent_vm_dynamic(
         ret,
         start_error_detail.as_deref(),
     ))
+}
+
+fn add_dynamic_block_disk(
+    krun: &KrunFunctions,
+    ctx: u32,
+    block_id: *const libc::c_char,
+    disk_path: *const libc::c_char,
+    disk_format: u32,
+    engine: crate::data::resources::BlockIoEngine,
+) -> i32 {
+    const KRUN_SYNC_FULL: u32 = 2;
+    const KRUN_BLOCK_IO_ASYNC: u32 = 1;
+    const KRUN_ADD_DISK4_MISSING: i32 = i32::MIN + 4;
+
+    if engine == crate::data::resources::BlockIoEngine::Async {
+        let Some(add_disk4) = krun.add_disk4 else {
+            return KRUN_ADD_DISK4_MISSING;
+        };
+        // Buffered disk, full guest flush semantics, restricted io_uring engine.
+        return unsafe {
+            add_disk4(
+                ctx,
+                block_id,
+                disk_path,
+                disk_format,
+                false,
+                false,
+                KRUN_SYNC_FULL,
+                KRUN_BLOCK_IO_ASYNC,
+            )
+        };
+    }
+    unsafe { (krun.add_disk2)(ctx, block_id, disk_path, disk_format, false) }
+}
+
+fn dynamic_block_error(
+    disk: &str,
+    engine: crate::data::resources::BlockIoEngine,
+    result: i32,
+) -> String {
+    const KRUN_ADD_DISK4_MISSING: i32 = i32::MIN + 4;
+    if engine == crate::data::resources::BlockIoEngine::Async && result == KRUN_ADD_DISK4_MISSING {
+        return format!(
+            "async block I/O for {disk} requires a newer bundled libkrun (krun_add_disk4 missing)"
+        );
+    }
+    if engine == crate::data::resources::BlockIoEngine::Async
+        && matches!(result, r if r == -libc::ENOSYS || r == -libc::EPERM || r == -libc::EACCES || r == -libc::ENOTSUP)
+    {
+        return format!(
+            "async block I/O is unavailable for {disk} on this host (io_uring error {result}); use --block-io sync"
+        );
+    }
+    format!("failed to add {disk} disk with {engine:?} block I/O (error {result})")
 }
 
 /// Create a CString from a static string that is known not to contain NUL bytes.
@@ -1075,6 +1156,20 @@ fn raise_fd_limits() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn async_block_errors_distinguish_old_library_from_host_support() {
+        use crate::data::resources::BlockIoEngine;
+
+        assert!(
+            dynamic_block_error("storage", BlockIoEngine::Async, i32::MIN + 4)
+                .contains("newer bundled libkrun")
+        );
+        assert!(
+            dynamic_block_error("storage", BlockIoEngine::Async, -libc::EPERM)
+                .contains("use --block-io sync")
+        );
+    }
 
     #[test]
     fn describe_krun_start_error_decodes_common_codes() {

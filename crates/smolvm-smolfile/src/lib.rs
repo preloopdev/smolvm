@@ -19,15 +19,17 @@
 //! | `cmd` | string[] | No | Default args appended to entrypoint. Overrides image CMD. |
 //! | `env` | string[] | No | Environment variables as `KEY=VALUE`. |
 //! | `workdir` | string | No | Working directory inside the VM. |
+//! | `user` | string | No | User the workload runs as, like `docker run --user`: a name or `uid[:gid]`. Overrides the image `USER`. |
 //! | `cpus` | int | No | Number of vCPUs (default: 4). |
 //! | `memory` | int | No | Memory in MiB (default: 8192). |
 //! | `net` | bool | No | Enable outbound networking via NAT. |
 //! | `cuda` | bool | No | Enable CUDA-over-vsock (host NVIDIA GPU). |
 //! | `auto_graph` | bool | No | Best-effort framework CUDA graphs; implies `cuda`. |
+//! | `block_io` | `"sync"` or `"async"` | No | Host block I/O engine; defaults to `sync`. |
 //! | `storage` | int | No | Storage disk size in GiB. |
 //! | `overlay` | int | No | Overlay disk size in GiB. |
 //! | `ports` | string[] | No | Port mappings (`"host:guest"` or equal-length `"host-start-host-end:guest-start-guest-end"` ranges). Prefer `[dev] ports`. |
-//! | `volumes` | string[] | No | Volume mounts (`"host:guest"`). Prefer `[dev] volumes`. |
+//! | `volumes` | string[] | No | Volume mounts (`"host:guest[:ro|rw|staged]"`). Prefer `[dev] volumes`. |
 //! | `init` | string[] | No | Commands run on every VM start. Prefer `[dev] init`. |
 //!
 //! ## Sections
@@ -38,10 +40,11 @@
 //!
 //! | Field | Type | Description |
 //! |-------|------|-------------|
-//! | `volumes` | string[] | Bind mounts (`"./src:/app"`) |
+//! | `volumes` | string[] | Mounts (`"./src:/app[:ro|rw|staged]"`) |
 //! | `env` | string[] | Dev-only environment variables |
 //! | `init` | string[] | Bootstrap commands run on start |
 //! | `workdir` | string | Dev working directory override |
+//! | `user` | string | Dev user override (name or `uid[:gid]`) |
 //! | `ports` | string[] | Port mappings or equal-length one-to-one ranges for development |
 //!
 //! ### `[artifact]` — Pack/distribution overrides
@@ -66,17 +69,18 @@
 //! | `allow_hosts` | string[] | Allowed hostnames (resolved to IPs at start) |
 //! | `allow_cidrs` | string[] | Allowed CIDR ranges (`"10.0.0.0/8"`) |
 //!
-//! ### `[fork]` — Forkable launch and CUDA capacity
+//! ### `[branch]` — Branchable launch and CUDA capacity
 //!
 //! Controls how a machine created from this Smolfile starts. A configured pool
 //! size implies `enabled = true` and applies the same transparent CUDA capacity
-//! policy as `machine start --fork-pool-size`.
+//! policy as `machine start --branch-pool-size`. `[fork]` remains accepted as a
+//! compatibility alias.
 //!
 //! | Field | Type | Description |
 //! |-------|------|-------------|
-//! | `enabled` | bool | Start as a copy-on-write fork base |
-//! | `pool_size` | int | Planned number of runnable CUDA clones; implies `enabled` |
-//! | `cuda_vram_limit_mib` | int | Logical VRAM limit per golden/clone; requires `pool_size` |
+//! | `enabled` | bool | Start as a copy-on-write branch source |
+//! | `pool_size` | int | Planned number of runnable CUDA children; implies `enabled` |
+//! | `cuda_vram_limit_mib` | int | Logical VRAM limit per source/child; requires `pool_size` |
 //!
 //! ### `[health]` — Health checks
 //!
@@ -160,7 +164,7 @@
 //! allow_hosts = ["pypi.org"]
 //! allow_cidrs = ["10.0.0.0/8"]
 //!
-//! [fork]
+//! [branch]
 //! enabled = true
 //! pool_size = 8
 //! cuda_vram_limit_mib = 8192
@@ -244,6 +248,11 @@ pub struct Smolfile {
     pub secrets: std::collections::BTreeMap<String, smolvm_protocol::SecretRef>,
     /// Working directory inside the VM.
     pub workdir: Option<String>,
+    /// User the workload runs as, like `docker run --user`: a name from the
+    /// image's passwd database or a numeric `uid[:gid]`. Overrides the image
+    /// `USER`, which is what lets a workload match the owner of a mounted
+    /// host directory when the image was built for a different account.
+    pub user: Option<String>,
 
     // Resources
     /// Number of vCPUs.
@@ -252,6 +261,14 @@ pub struct Smolfile {
     pub memory: Option<u32>,
     /// Enable outbound networking.
     pub net: Option<bool>,
+    /// Networking backend, matching the `--net-backend` flag: `"tsi"` or
+    /// `"virtio-net"`. Only meaningful alongside `net = true`.
+    ///
+    /// Held as a string rather than the backend enum because that enum lives in
+    /// the `smolvm` crate, which depends on this one. The CLI parses this value
+    /// with the flag's own `ValueEnum`, so the spellings a Smolfile accepts can
+    /// never drift from the ones `--net-backend` accepts.
+    pub net_backend: Option<String>,
     /// Enable GPU acceleration (Vulkan via virtio-gpu).
     pub gpu: Option<bool>,
     /// GPU VRAM (shared memory region) size in MiB. Ignored unless
@@ -273,6 +290,8 @@ pub struct Smolfile {
     pub storage: Option<u64>,
     /// Overlay disk size in GiB.
     pub overlay: Option<u64>,
+    /// Host block I/O engine: `sync` (default) or Linux raw-disk `async`.
+    pub block_io: Option<String>,
 
     // Legacy top-level fields (prefer [dev] section)
     /// Port mappings (e.g., `["8080:8080"]`).
@@ -296,7 +315,11 @@ pub struct Smolfile {
     // Sections
     /// Network egress policy.
     pub network: Option<NetworkConfig>,
-    /// Forkable launch and CUDA fork-capacity policy.
+    /// Branchable launch and CUDA branch-capacity policy.
+    ///
+    /// `[branch]` is the preferred section name; `[fork]` remains accepted for
+    /// compatibility with existing Smolfiles.
+    #[serde(alias = "branch")]
     pub fork: Option<ForkConfig>,
     /// Health check configuration.
     pub health: Option<HealthConfig>,
@@ -320,18 +343,21 @@ pub struct NetworkConfig {
     pub allow_cidrs: Vec<String>,
 }
 
-/// Forkable launch and CUDA fork-capacity policy.
+/// Branchable launch and CUDA branch-capacity policy.
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ForkConfig {
-    /// Start the machine as a copy-on-write fork base.
+    /// Start the machine as a copy-on-write branch source.
     pub enabled: Option<bool>,
-    /// Planned number of runnable CUDA clones. Implies `enabled`.
+    /// Planned number of runnable CUDA children. Implies `enabled`.
     pub pool_size: Option<u32>,
-    /// Explicit logical VRAM limit for each golden/clone CUDA session.
+    /// Explicit logical VRAM limit for each source/child CUDA session.
     /// Requires `pool_size`.
     pub cuda_vram_limit_mib: Option<u64>,
 }
+
+/// Preferred public name for [`ForkConfig`].
+pub type BranchConfig = ForkConfig;
 
 /// Credential forwarding configuration.
 #[derive(Debug, Deserialize, Default)]
@@ -374,6 +400,8 @@ pub struct DevConfig {
     pub init: Vec<String>,
     /// Development working directory override.
     pub workdir: Option<String>,
+    /// Dev user override (name or `uid[:gid]`).
+    pub user: Option<String>,
     /// Port mappings for development (e.g., `["8080:8080"]`).
     #[serde(default)]
     pub ports: Vec<String>,
@@ -469,6 +497,22 @@ mod tests {
         let sf: Smolfile = parse("").unwrap();
         assert_eq!(sf.image, None);
         assert_eq!(sf.cpus, None);
+    }
+
+    /// `user` is accepted at the top level and as a `[dev]` override, in the
+    /// same forms `docker run --user` takes.
+    #[test]
+    fn parse_user_directive() {
+        let sf = parse("image = \"alpine\"\nuser = \"1000:1000\"\n").unwrap();
+        assert_eq!(sf.user.as_deref(), Some("1000:1000"));
+        assert!(sf.dev.is_none());
+
+        let sf = parse("image = \"alpine\"\nuser = \"app\"\n\n[dev]\nuser = \"501:20\"\n").unwrap();
+        assert_eq!(sf.user.as_deref(), Some("app"));
+        assert_eq!(sf.dev.unwrap().user.as_deref(), Some("501:20"));
+
+        let sf = parse("image = \"alpine\"\n").unwrap();
+        assert!(sf.user.is_none());
     }
 
     #[test]
@@ -623,6 +667,15 @@ protocol = "http"
     }
 
     #[test]
+    fn parse_block_io_field() {
+        let sf = parse("block_io = \"async\"").unwrap();
+        assert_eq!(sf.block_io.as_deref(), Some("async"));
+
+        let sf = parse("").unwrap();
+        assert_eq!(sf.block_io, None);
+    }
+
+    #[test]
     fn parse_fork_section() {
         let sf = parse(
             r#"
@@ -637,6 +690,34 @@ cuda_vram_limit_mib = 4096
         assert_eq!(fork.enabled, Some(true));
         assert_eq!(fork.pool_size, Some(16));
         assert_eq!(fork.cuda_vram_limit_mib, Some(4096));
+    }
+
+    #[test]
+    fn parse_branch_section_and_reject_duplicate_legacy_section() {
+        let sf = parse(
+            r#"
+[branch]
+enabled = true
+pool_size = 16
+cuda_vram_limit_mib = 4096
+"#,
+        )
+        .unwrap();
+        let branch = sf.fork.unwrap();
+        assert_eq!(branch.enabled, Some(true));
+        assert_eq!(branch.pool_size, Some(16));
+        assert_eq!(branch.cuda_vram_limit_mib, Some(4096));
+
+        assert!(parse(
+            r#"
+[branch]
+enabled = true
+
+[fork]
+enabled = true
+"#,
+        )
+        .is_err());
     }
 
     #[test]

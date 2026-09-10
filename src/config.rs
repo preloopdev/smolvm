@@ -390,9 +390,20 @@ pub struct VmRecord {
     #[serde(default = "default_mem")]
     pub mem: u32,
 
+    /// Host engine used for writable virtio block disks.
+    #[serde(default)]
+    pub block_io: crate::data::resources::BlockIoEngine,
+
     /// Volume mounts (host_path, guest_path, read_only).
     #[serde(default)]
     pub mounts: Vec<(String, String, bool)>,
+
+    /// Guest-local working trees synchronized with host directories in
+    /// batches. Kept separate from `mounts` so existing records retain their
+    /// tuple encoding and cannot accidentally reinterpret a staged mount as a
+    /// live writable virtiofs mount.
+    #[serde(default)]
+    pub staged_mounts: Vec<(usize, String, String)>,
 
     /// Port mappings (host_port, guest_port).
     #[serde(default)]
@@ -582,6 +593,21 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub golden: Option<String>,
 
+    /// Immutable RAM/disk generation inherited by this clone. This is the
+    /// short directory id under the golden's `s/` tree, never a caller-supplied
+    /// path. It lets the host retain a demand-paging guardian exactly while a
+    /// live clone can still fault pages from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_generation: Option<String>,
+
+    /// Process identity of a live branch source whose RAM has been rebased onto
+    /// private mappings. Such a source can retain its original memfd backing in
+    /// addition to its current private pages even after every older child is
+    /// deleted, so Linux cgroup accounting must keep one structural RAM unit
+    /// until this exact VMM process exits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_lineage_pid_start_time: Option<u64>,
+
     /// Persistent container-overlay owner inherited from the root of a fork
     /// lineage. A clone's live overlay keeps its original on-disk name across
     /// every generation; descendants must continue addressing that root name.
@@ -667,7 +693,9 @@ impl VmRecord {
             pid_start_time: None,
             cpus,
             mem,
+            block_io: Default::default(),
             mounts,
+            staged_mounts: Vec::new(),
             ports,
             published_sockets: Vec::new(),
             network,
@@ -709,6 +737,8 @@ impl VmRecord {
             ephemeral: false,
             source_smolmachine: None,
             golden: None,
+            fork_generation: None,
+            fork_lineage_pid_start_time: None,
             fork_overlay_owner: None,
             forkpoint_held: false,
             fork_env: Vec::new(),
@@ -734,7 +764,9 @@ impl VmRecord {
             pid_start_time: None,
             cpus,
             mem,
+            block_io: Default::default(),
             mounts,
+            staged_mounts: Vec::new(),
             ports,
             published_sockets: Vec::new(),
             network,
@@ -776,6 +808,8 @@ impl VmRecord {
             ephemeral: false,
             source_smolmachine: None,
             golden: None,
+            fork_generation: None,
+            fork_lineage_pid_start_time: None,
             fork_overlay_owner: None,
             forkpoint_held: false,
             fork_env: Vec::new(),
@@ -810,14 +844,42 @@ impl VmRecord {
 
     /// Convert stored mounts to HostMount format.
     pub fn host_mounts(&self) -> Vec<crate::data::storage::HostMount> {
-        self.mounts
+        let mut live = self
+            .mounts
             .iter()
             .map(|(host, guest, ro)| crate::data::storage::HostMount {
                 source: std::path::PathBuf::from(host),
                 target: std::path::PathBuf::from(guest),
                 read_only: *ro,
+                staged: false,
             })
-            .collect()
+            .collect::<std::collections::VecDeque<_>>();
+        let staged = self
+            .staged_mounts
+            .iter()
+            .map(|(index, host, guest)| {
+                (
+                    *index,
+                    crate::data::storage::HostMount::from_staged_storage_tuple(
+                        host.clone(),
+                        guest.clone(),
+                    ),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let total = live.len() + staged.len();
+        let mut mounts = Vec::with_capacity(total);
+        for index in 0..total {
+            if let Some(mount) = staged.get(&index) {
+                mounts.push(mount.clone());
+            } else if let Some(mount) = live.pop_front() {
+                mounts.push(mount);
+            }
+        }
+        // Malformed records with duplicate/out-of-range staged indices remain
+        // inspectable rather than silently dropping their live mounts.
+        mounts.extend(live);
+        mounts
     }
 
     /// Convert stored ports to PortMapping format.
@@ -935,6 +997,7 @@ impl VmRecord {
             rosetta: self.rosetta.unwrap_or(false),
             storage_gib: self.storage_gb,
             overlay_gib: self.overlay_gb,
+            block_io: self.block_io,
             allowed_cidrs: self.allowed_cidrs.clone(),
             dns: self.dns,
             network_name: self.network_name.clone(),
@@ -1396,6 +1459,20 @@ mod tests {
         let deserialized: VmRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.storage_gb, Some(50));
         assert_eq!(deserialized.overlay_gb, Some(20));
+    }
+
+    #[test]
+    fn block_io_defaults_to_sync_and_round_trips_async() {
+        let legacy = r#"{"name":"legacy"}"#;
+        let record: VmRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(record.block_io, crate::data::resources::BlockIoEngine::Sync);
+
+        let mut record = VmRecord::new("queued".to_string(), 2, 512, vec![], vec![], false);
+        record.block_io = crate::data::resources::BlockIoEngine::Async;
+        let decoded: VmRecord =
+            serde_json::from_str(&serde_json::to_string(&record).unwrap()).unwrap();
+        assert_eq!(decoded.block_io, record.block_io);
+        assert_eq!(decoded.vm_resources().block_io, record.block_io);
     }
 
     #[test]

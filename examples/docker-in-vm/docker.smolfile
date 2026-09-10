@@ -37,9 +37,17 @@
 #   /storage/ is mounted from /dev/vda (ext4), which supports file handles.
 #   Docker's overlay2 layers then live on ext4 and nest correctly.
 #
-#   This bind-mount must be re-applied after every VM start (mounts don't
-#   persist across stop/start). The init commands create the directory on
-#   first start; the "Start dockerd" exec command does the bind-mount each
+#   containerd needs the same treatment. Its overlay snapshots live under a
+#   SEPARATE state root, /var/lib/containerd (Docker's containerd-snapshotter
+#   backend and any system/external containerd both store there). Relocating
+#   Docker's data root alone leaves those snapshots on the rootfs overlay, so
+#   container start fails the same way — containerd's overlay mount is rejected
+#   with "failed to mount ... fstype: overlay ... invalid argument". Bind-mount
+#   /storage/containerd → /var/lib/containerd too.
+#
+#   These bind-mounts must be re-applied after every VM start (mounts don't
+#   persist across stop/start). The init commands create the directories on
+#   first start; the "Start dockerd" exec command does the bind-mounts each
 #   time.
 #
 # ── Create and start ─────────────────────────────────────────────────────────
@@ -50,8 +58,9 @@
 # ── Start dockerd ─────────────────────────────────────────────────────────────
 #
 #   smolvm machine exec --name docker -- sh -c '
-#     mkdir -p /storage/docker /var/lib/docker
+#     mkdir -p /storage/docker /var/lib/docker /storage/containerd /var/lib/containerd
 #     mount --bind /storage/docker /var/lib/docker
+#     mount --bind /storage/containerd /var/lib/containerd
 #     rm -f /var/run/docker.pid
 #     dockerd --storage-driver=overlay2 >/tmp/dockerd.log 2>&1 &
 #     for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
@@ -135,7 +144,8 @@
 #
 #   On the cloud platform each `exec` runs in its own mount namespace, so the
 #   `mount --bind` above is invisible to dockerd. Point docker's data-root
-#   straight at the ext4 disk instead:
+#   straight at the ext4 disk instead; dockerd's managed containerd keeps its
+#   state under the data root, so this covers the containerd snapshots too:
 #
 #     dockerd --data-root=/storage/docker --storage-driver=overlay2
 #
@@ -158,7 +168,10 @@ init = [
     "apk update -q",
     # docker: daemon + CLI
     "apk add docker -q",
-    # Bind /var/lib/docker to ext4 storage so overlay2 works (avoids overlay-on-overlay)
-    "mkdir -p /storage/docker /var/lib/docker",
+    # Bind /var/lib/docker AND /var/lib/containerd to ext4 storage so overlay2
+    # works (avoids overlay-on-overlay). containerd keeps its own overlay
+    # snapshots under a separate state root, so both must live on ext4.
+    "mkdir -p /storage/docker /var/lib/docker /storage/containerd /var/lib/containerd",
     "mount --bind /storage/docker /var/lib/docker",
+    "mount --bind /storage/containerd /var/lib/containerd",
 ]

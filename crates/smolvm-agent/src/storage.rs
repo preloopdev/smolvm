@@ -12,7 +12,9 @@ use crate::crun::CrunCommand;
 use crate::oci::{generate_container_id, OciSpec};
 use crate::paths::{self, STORAGE_ROOT};
 use crate::process::{WaitResult, TIMEOUT_EXIT_CODE};
-use smolvm_oci_layer::{decompress_layer_reader, extract_oci_layer};
+#[cfg(test)]
+use smolvm_oci_layer::extract_oci_layer;
+use smolvm_oci_layer::{decompress_layer_reader, extract_oci_layer_with_size};
 use smolvm_protocol::guest_env;
 use smolvm_protocol::{
     image_repo, normalize_image_ref, ImageInfo, OverlayInfo, RegistryAuth, StorageStatus,
@@ -327,6 +329,81 @@ static PACKED_LAYERS_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
 /// Global state for boot-time volume mounts.
 /// Set at startup if SMOLVM_MOUNT_COUNT env var is present.
 static BOOT_VOLUME_MOUNTS: OnceLock<Vec<(String, String, bool)>> = OnceLock::new();
+static BOOT_VOLUME_MOUNTS_FAILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Prefix used only inside the guest agent's mount table. Runtime tags are
+/// `staged+<stable-id>+<device-tag>`: the virtiofs device keeps `device-tag`,
+/// while `stable-id` prevents reordered/replaced mounts from reusing stale data.
+const STAGED_MOUNT_TAG_PREFIX: &str = "staged+";
+const STAGED_MOUNT_ROOT: &str = "/storage/staged-mounts";
+
+fn split_staged_mount_tag(tag: &str) -> (&str, Option<&str>) {
+    if let Some(rest) = tag.strip_prefix(STAGED_MOUNT_TAG_PREFIX) {
+        if let Some((working_id, device_tag)) = rest.split_once('+') {
+            return (device_tag, Some(working_id));
+        }
+    }
+    (tag, None)
+}
+
+/// Path a workload container should bind for a prepared mount.
+/// Staged mounts bind the guest-local working copy; live mounts bind the
+/// virtiofs staging directory.
+pub fn volume_bind_source(tag: &str) -> PathBuf {
+    let (device_tag, staged_id) = split_staged_mount_tag(tag);
+    if let Some(staged_id) = staged_id {
+        Path::new(STAGED_MOUNT_ROOT).join(staged_id)
+    } else {
+        Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(device_tag)
+    }
+}
+
+/// Mount a virtiofs device with one policy for every host-backed filesystem:
+/// request DAX first, then fall back to the normal buffered data path when the
+/// host did not give this device a DAX window. Explicit fsync still provides
+/// durability; forcing the whole mount synchronous serializes every small
+/// write and is unlike Docker/Podman's bind-mount behavior.
+#[cfg(target_os = "linux")]
+fn mount_virtiofs(tag: &str, mount_point: &Path) -> std::io::Result<bool> {
+    let src = std::ffi::CString::new(tag)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid tag"))?;
+    let dst = std::ffi::CString::new(mount_point.to_string_lossy().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid mount point")
+    })?;
+    let fstype = std::ffi::CString::new("virtiofs").expect("static filesystem type");
+    let opts_dax = std::ffi::CString::new("dax").expect("static mount options");
+
+    // SAFETY: every argument is a valid, live CString and mount() copies them.
+    let dax_rc = unsafe {
+        libc::mount(
+            src.as_ptr(),
+            dst.as_ptr(),
+            fstype.as_ptr(),
+            0,
+            opts_dax.as_ptr() as *const libc::c_void,
+        )
+    };
+    if dax_rc == 0 {
+        return Ok(true);
+    }
+
+    // SAFETY: same arguments and lifetime as the DAX attempt above.
+    let plain_rc = unsafe {
+        libc::mount(
+            src.as_ptr(),
+            dst.as_ptr(),
+            fstype.as_ptr(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    if plain_rc == 0 {
+        Ok(false)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
 
 /// Initialize packed layers support by checking SMOLVM_PACKED_LAYERS env var.
 /// Format: "virtiofs_tag:mount_point" (e.g., "smolvm_layers:/packed_layers")
@@ -358,26 +435,14 @@ pub fn init_packed_layers() -> Option<PathBuf> {
     // Mount virtiofs using direct syscall (avoids ~3-5ms fork+exec overhead)
     #[cfg(target_os = "linux")]
     {
-        let src = std::ffi::CString::new(tag).ok()?;
-        let dst = std::ffi::CString::new(mount_point.to_str()?).ok()?;
-        let fstype = std::ffi::CString::new("virtiofs").unwrap();
-        // SAFETY: mount virtiofs with valid CString arguments
-        let rc = unsafe {
-            libc::mount(
-                src.as_ptr(),
-                dst.as_ptr(),
-                fstype.as_ptr(),
-                0,
-                std::ptr::null(),
-            )
+        let dax = match mount_virtiofs(tag, &mount_point) {
+            Ok(dax) => dax,
+            Err(err) => {
+                warn!(error = %err, tag = %tag, "failed to mount packed layers virtiofs");
+                return None;
+            }
         };
-
-        if rc != 0 {
-            let err = std::io::Error::last_os_error();
-            warn!(error = %err, tag = %tag, "failed to mount packed layers virtiofs");
-            return None;
-        }
-        info!(mount_point = %mount_point.display(), "packed layers mounted successfully");
+        info!(mount_point = %mount_point.display(), dax, "packed layers mounted successfully");
 
         // List contents for debugging (only at debug level to avoid boot overhead)
         if let Ok(entries) = std::fs::read_dir(&mount_point) {
@@ -399,8 +464,69 @@ pub fn init_packed_layers() -> Option<PathBuf> {
 }
 
 /// Get the packed layers directory if available.
+/// Seed `/storage/workspace` from a pack's workspace seed, once.
+///
+/// `pack create --from-vm --include-workspace` ships the source machine's
+/// `/workspace` as `workspace-seed/workspace.tar` beside the staged layers. The
+/// workspace lives on the storage disk, which is fresh for every ephemeral run
+/// and for a machine's first boot, so this is the only way those files reach
+/// it. Runs as root, so ownership is exactly what the source machine had.
+///
+/// Guarded by a marker on the storage disk: a persistent machine seeds on its
+/// first boot only, and later boots leave whatever the user has done since.
+/// Absent seed, or any failure, leaves the workspace as it was.
+pub fn seed_workspace_from_pack() {
+    const SEED_DIR: &str = "workspace-seed";
+    const SEED_FILE: &str = "workspace.tar";
+    const MARKER: &str = ".smolvm-workspace-seeded";
+    let Some(packed) = get_packed_layers_dir() else {
+        return;
+    };
+    let seed = packed.join(SEED_DIR).join(SEED_FILE);
+    if !seed.is_file() {
+        return;
+    }
+    let workspace = Path::new(STORAGE_ROOT).join(WORKSPACE_DIR);
+    let marker = workspace.join(MARKER);
+    if marker.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::create_dir_all(&workspace) {
+        warn!(error = %e, "workspace seed: cannot create workspace dir");
+        return;
+    }
+    info!("seeding /workspace from the pack");
+    match extract_layer_tar(&seed, &workspace) {
+        Ok(()) => {
+            if let Err(e) = std::fs::write(&marker, b"") {
+                warn!(error = %e, "workspace seed: cannot write marker");
+            }
+        }
+        Err(e) => warn!(error = %e, "workspace seed: extraction failed; workspace left as-is"),
+    }
+}
+
 pub fn get_packed_layers_dir() -> Option<&'static PathBuf> {
     PACKED_LAYERS_DIR.get_or_init(init_packed_layers).as_ref()
+}
+
+/// Whether any boot-time mount needs the persistent guest storage disk.
+///
+/// Live virtiofs mounts can be initialized before `/storage` is available, but
+/// staged mounts place their working copy there and must not race the deferred
+/// storage mount.
+pub fn staged_boot_mount_requested() -> bool {
+    let count = std::env::var("SMOLVM_MOUNT_COUNT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    (0..count).any(|index| {
+        std::env::var(format!("SMOLVM_MOUNT_{index}")).is_ok_and(|value| value.ends_with(":staged"))
+    })
+}
+
+pub fn boot_volume_mounts_failed() -> bool {
+    BOOT_VOLUME_MOUNTS_FAILED.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Initialize volume mounts at boot by reading SMOLVM_MOUNT_* env vars.
@@ -444,18 +570,36 @@ pub fn init_volume_mounts() -> &'static [(String, String, bool)] {
                 continue;
             }
 
+            let staged = parts[2] == "staged";
+            if staged && split_staged_mount_tag(parts[0]).1.is_none() {
+                BOOT_VOLUME_MOUNTS_FAILED.store(true, std::sync::atomic::Ordering::Release);
+                warn!(key = %env_key, "staged mount is missing its stable working-copy identity");
+                continue;
+            }
             let tag = parts[0].to_string();
             let guest_path = parts[1].to_string();
             let read_only = parts[2] == "ro";
 
-            info!(tag = %tag, guest_path = %guest_path, read_only = read_only, "boot volume mount");
+            info!(tag = %tag, guest_path = %guest_path, read_only, staged, "boot volume mount");
             mounts.push((tag, guest_path, read_only));
+        }
+
+        if mounts
+            .iter()
+            .any(|(tag, _, _)| split_staged_mount_tag(tag).1.is_some())
+        {
+            if let Err(error) = prune_staged_working_copies(&mounts) {
+                BOOT_VOLUME_MOUNTS_FAILED.store(true, std::sync::atomic::Ordering::Release);
+                warn!(error = %error, "failed to prune stale staged working copies");
+                return mounts;
+            }
         }
 
         // Mount using existing logic with empty rootfs prefix so bind mounts
         // go to absolute guest paths (e.g., "/data"), visible to VmExec.
         if !mounts.is_empty() {
             if let Err(e) = setup_volume_mounts("/", &mounts) {
+                BOOT_VOLUME_MOUNTS_FAILED.store(true, std::sync::atomic::Ordering::Release);
                 warn!(error = %e, "failed to setup boot volume mounts");
             }
         }
@@ -486,7 +630,8 @@ pub fn repair_boot_volume_mounts() -> Result<()> {
 
     for mount in &missing {
         let (tag, target, _) = mount;
-        let staging = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
+        let (device_tag, _) = split_staged_mount_tag(tag);
+        let staging = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(device_tag);
         if is_mountpoint(&staging) {
             detach_mount(&staging);
         }
@@ -497,7 +642,7 @@ pub fn repair_boot_volume_mounts() -> Result<()> {
                 tag, target
             )));
         }
-        info!(tag = %tag, target = %target, "restored boot volume mount after clone resume");
+        info!(tag = %device_tag, target = %target, "restored boot volume mount after clone resume");
     }
     Ok(())
 }
@@ -783,13 +928,35 @@ fn ordered_packed_layer_names(packed_dir: &Path) -> Result<Vec<String>> {
         let entry = entry?;
         if entry.path().is_dir() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if !name.ends_with(".tar") {
+            // A packed store is a volume root on macOS, so it always carries
+            // filesystem bookkeeping directories. They are not image layers,
+            // and mistaking one for the whole image builds a rootfs out of it.
+            // A `.partial` directory is an extraction the host had not finished
+            // (it renames a complete one into its layer name); it is never a
+            // layer, whatever it happens to contain.
+            if !name.ends_with(".tar")
+                && !name.ends_with(".partial")
+                && !is_volume_metadata(&entry.file_name())
+            {
                 present.insert(name);
             }
         }
     }
 
+    // A store with no usable layer directory at all cannot produce the image's
+    // filesystem. Returning an empty list here would hand the caller an overlay
+    // with no lower layer, which surfaces much later as a missing executable.
+    if present.is_empty() {
+        return Err(StorageError::new(format!(
+            "no image layers are present in {}. The image has to be unpacked again \
+             before this machine can start.",
+            packed_dir.display()
+        )));
+    }
+
     // Prefer the explicit order index when it resolves to layers we actually have.
+    // A stale index that names a layer we do not have falls back to the name sort
+    // below rather than dropping the real layers that are here.
     if let Ok(contents) = std::fs::read_to_string(packed_dir.join(LAYER_ORDER_FILE)) {
         let ordered: Vec<String> = contents
             .lines()
@@ -1303,7 +1470,45 @@ fn recover_archive_config(archive: &Path, dest: &Path) -> Result<()> {
         StorageError::new("archive manifest.json has no Config entry".to_string())
     })?;
     let config_bytes = extract_tar_member(archive, config_path)?;
+    if let Ok(config_json) = serde_json::from_slice::<serde_json::Value>(&config_bytes) {
+        if let Some(arch) = config_json["architecture"].as_str() {
+            ensure_archive_arch_compatible(arch)?;
+        }
+    }
     std::fs::write(dest, &config_bytes)?;
+    Ok(())
+}
+
+/// Validate that a local image archive's architecture is compatible with the guest microVM.
+fn ensure_archive_arch_compatible(archive_arch: &str) -> Result<()> {
+    let guest_arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    let norm_arch = match archive_arch.trim() {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        "i386" | "i486" | "i586" | "i686" => "386",
+        "armhf" | "armel" | "armv5" | "armv6" | "armv7" => "arm",
+        other => other,
+    };
+
+    // If Rosetta translation is active on an arm64 guest, amd64 is supported.
+    let rosetta_supported =
+        guest_arch == "arm64" && norm_arch == "amd64" && crate::rosetta::is_enabled();
+
+    if matches!(
+        norm_arch,
+        "amd64" | "arm64" | "386" | "arm" | "riscv64" | "ppc64le" | "s390x"
+    ) && norm_arch != guest_arch
+        && !rosetta_supported
+    {
+        return Err(StorageError::new(format!(
+            "this local image archive is built for architecture '{archive_arch}', but this guest microVM is '{guest_arch}'. \
+             A local image archive carries native binaries and cannot run on an incompatible CPU architecture — save the image on or for an '{guest_arch}' system."
+        )));
+    }
     Ok(())
 }
 
@@ -1677,6 +1882,23 @@ fn layer_ok_marker(layer_dir: &Path) -> PathBuf {
     layer_dir.with_file_name(name)
 }
 
+/// Cached logical size of one immutable content-addressed layer. Like the
+/// completion marker, this lives beside the lowerdir so it never appears in a
+/// container filesystem.
+fn layer_size_marker(layer_dir: &Path) -> PathBuf {
+    let mut name = layer_dir.file_name().unwrap_or_default().to_os_string();
+    name.push(".size");
+    layer_dir.with_file_name(name)
+}
+
+fn read_layer_size(layer_dir: &Path) -> Option<u64> {
+    std::fs::read_to_string(layer_size_marker(layer_dir))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 fn image_size_cache_path(root: &Path, image: &str) -> PathBuf {
     root.join(IMAGE_METADATA_DIR)
         .join(sanitize_image_name(image) + ".size")
@@ -1695,7 +1917,8 @@ fn calculate_image_size(root: &Path, layers: &[String]) -> u64 {
         .iter()
         .filter_map(|digest| {
             let id = digest.strip_prefix("sha256:").unwrap_or(digest);
-            dir_size(&root.join(LAYERS_DIR).join(id)).ok()
+            let layer_dir = root.join(LAYERS_DIR).join(id);
+            read_layer_size(&layer_dir).or_else(|| dir_size(&layer_dir).ok())
         })
         .sum()
 }
@@ -1942,6 +2165,126 @@ fn json_string_array(value: &serde_json::Value, key: &str) -> Vec<String> {
 /// Pull an OCI image with progress callback and optional authentication.
 ///
 /// The callback is called for each layer being pulled with (current, total, layer_id).
+/// Fetch one layer blob from the registry and unpack it into `layer_dir`.
+///
+/// Runs on a worker thread, so it touches only this layer's own directory and
+/// reports nothing: progress belongs to the caller's thread.
+#[allow(clippy::too_many_arguments)]
+fn fetch_and_extract_layer(
+    image: &str,
+    layer_digest: &str,
+    layer_id: &str,
+    layer_dir: &Path,
+    oci_platform: Option<&str>,
+    auth: Option<&RegistryAuth>,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
+    index: usize,
+    total_layers: usize,
+) -> Result<u64> {
+    // Clean up an incomplete or unverified layer directory: empty, or left
+    // by an interrupted/unflushed earlier extraction (no completion marker).
+    if layer_dir.exists() {
+        warn!(layer = %layer_id, "removing incomplete or unverified layer directory");
+        if let Err(e) = std::fs::remove_dir_all(layer_dir) {
+            warn!(layer = %layer_id, error = %e, "failed to remove incomplete layer directory");
+        }
+    }
+    let _ = std::fs::remove_file(layer_ok_marker(layer_dir));
+    let _ = std::fs::remove_file(layer_size_marker(layer_dir));
+
+    info!(
+        layer = %layer_id,
+        progress = format!("{}/{}", index + 1, total_layers),
+        "extracting layer"
+    );
+
+    std::fs::create_dir_all(layer_dir)?;
+
+    // Set up auth if provided (temp_dir must stay alive until command completes)
+    let temp_dir = setup_docker_auth(image, auth)?;
+
+    let mut crane_cmd = Command::new("crane");
+    crane_cmd.arg("blob");
+    crane_cmd.arg(format!("{}@{}", image_repo(image), layer_digest));
+    if let Some(p) = oci_platform {
+        crane_cmd.arg("--platform").arg(p);
+    }
+    crane_cmd.stdout(Stdio::piped());
+    // Capture crane stderr to a file (not a pipe — a file can't deadlock on a
+    // full buffer) so the real fetch failure (DNS, TLS, 4xx, redirect) is
+    // surfaced instead of a bare "crane blob failed".
+    let crane_stderr_path = layer_dir.join(".crane-stderr");
+    match std::fs::File::create(&crane_stderr_path) {
+        Ok(f) => {
+            crane_cmd.stderr(Stdio::from(f));
+        }
+        Err(_) => {
+            crane_cmd.stderr(Stdio::null());
+        }
+    }
+    if let Some(ref td) = temp_dir {
+        crane_cmd.env("DOCKER_CONFIG", td.path());
+    }
+    apply_proxy_env(&mut crane_cmd, proxy, no_proxy);
+
+    let mut crane = crane_cmd
+        .spawn()
+        .map_err(|e| StorageError::new(format!("failed to spawn crane: {}", e)))?;
+
+    // Extract straight from crane's stdout. `extract_oci_layer` transparently
+    // decompresses gzip- OR zstd-compressed layers in-process (the guest
+    // ships no zstd tool, and the old external `gunzip` pipe silently failed
+    // on every zstd layer). Reading the stream to EOF also drives the crane
+    // fetch to completion.
+    let crane_stdout = crane
+        .stdout
+        .take()
+        .ok_or_else(|| StorageError::new("failed to capture crane stdout".to_string()))?;
+
+    let extract_result = extract_oci_layer_with_size(crane_stdout, layer_dir);
+
+    let crane_status = crane
+        .wait()
+        .map_err(|e| StorageError::new(format!("failed to wait for crane: {}", e)))?;
+
+    let crane_stderr = std::fs::read_to_string(&crane_stderr_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&crane_stderr_path);
+    let crane_stderr = crane_stderr.trim();
+
+    // Order matters. A genuine crane fetch failure (network/auth) prints a
+    // real message to its stderr, so surface that first. Otherwise, if
+    // extraction failed, THAT is the real cause — a crane that exited
+    // non-zero with empty stderr is just the SIGPIPE from us closing the pipe
+    // when extraction stopped reading (the exact trap that made every zstd
+    // layer look like "crane blob failed" when the real problem was that the
+    // old pipeline couldn't decompress it).
+    let layer_failure = if !crane_status.success() && !crane_stderr.is_empty() {
+        Some(format!(
+            "crane blob failed for layer {}: {}",
+            layer_digest, crane_stderr
+        ))
+    } else if let Err(ref e) = extract_result {
+        Some(format!(
+            "layer extraction failed for layer {}: {}",
+            layer_digest, e
+        ))
+    } else if !crane_status.success() {
+        Some(format!("crane blob failed for layer {}", layer_digest))
+    } else {
+        None
+    };
+
+    if let Some(message) = layer_failure {
+        if let Err(e) = std::fs::remove_dir_all(layer_dir) {
+            warn!(layer = %layer_id, error = %e, "failed to clean up layer directory after extraction failure");
+        }
+        return Err(StorageError::new(message));
+    }
+
+    Ok(extract_result.unwrap_or(0))
+}
+
 pub fn pull_image_with_progress_and_auth<F>(
     image: &str,
     oci_platform: Option<&str>,
@@ -2087,131 +2430,109 @@ where
     let config_json: serde_json::Value =
         serde_json::from_str(&config).map_err(|e| StorageError::parse_error("config", e))?;
 
-    // Extract layers with progress updates
+    // Extract layers with progress updates.
+    //
+    // Each layer is fetched from the registry and unpacked into its OWN
+    // directory, so layers are independent and run concurrently: a serial loop
+    // leaves the network idle while a layer unpacks and the CPU idle while the
+    // next one downloads, which on a multi-layer image is most of the wall
+    // clock. Stacking order is applied later from the manifest, so completion
+    // order here does not matter. Concurrency is bounded because each worker
+    // holds a crane process and a decompressor.
+    //
     // Layers extracted by THIS pull; their completion markers are written only
     // after the writeback barrier below confirms the data reached the disk.
-    let mut newly_extracted: Vec<PathBuf> = Vec::new();
-    for (i, layer_digest) in layers.iter().enumerate() {
-        let layer_id = layer_digest.strip_prefix("sha256:").unwrap_or(layer_digest);
-        let layer_dir = root.join(LAYERS_DIR).join(layer_id);
+    let mut newly_extracted: Vec<(PathBuf, u64)> = Vec::new();
 
-        if is_layer_cached(&layer_dir) {
-            info!(layer = %layer_id, "layer already cached");
-            // Report progress after confirming cache hit
-            progress(i + 1, total_layers, layer_id);
+    // Decide what actually needs fetching before spawning anything: duplicate
+    // digests within one manifest, and layers a previous pull already
+    // completed, are reported as progress and skipped.
+    let mut pending: Vec<(usize, &String, String, PathBuf)> = Vec::new();
+    let mut seen_dirs: Vec<PathBuf> = Vec::new();
+    for (i, layer_digest) in layers.iter().enumerate() {
+        let layer_id = layer_digest
+            .strip_prefix("sha256:")
+            .unwrap_or(layer_digest)
+            .to_string();
+        let layer_dir = root.join(LAYERS_DIR).join(&layer_id);
+        if seen_dirs.contains(&layer_dir) {
+            progress(i + 1, total_layers, &layer_id);
             continue;
         }
-
-        // Clean up an incomplete or unverified layer directory: empty, or left
-        // by an interrupted/unflushed earlier extraction (no completion marker).
-        if layer_dir.exists() {
-            warn!(layer = %layer_id, "removing incomplete or unverified layer directory");
-            if let Err(e) = std::fs::remove_dir_all(&layer_dir) {
-                warn!(layer = %layer_id, error = %e, "failed to remove incomplete layer directory");
-            }
+        if is_layer_cached(&layer_dir) {
+            info!(layer = %layer_id, "layer already cached");
+            progress(i + 1, total_layers, &layer_id);
+            continue;
         }
-        let _ = std::fs::remove_file(layer_ok_marker(&layer_dir));
+        seen_dirs.push(layer_dir.clone());
+        pending.push((i, layer_digest, layer_id, layer_dir));
+    }
 
-        info!(
-            layer = %layer_id,
-            progress = format!("{}/{}", i + 1, total_layers),
-            "extracting layer"
+    if !pending.is_empty() {
+        // One crane fetch + decompress per worker; more than a handful of
+        // concurrent streams only competes for the same link and page cache.
+        let workers = pending.len().min(4);
+        let queue = std::sync::Mutex::new(
+            pending
+                .into_iter()
+                .collect::<std::collections::VecDeque<_>>(),
         );
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(usize, String, PathBuf, u64)>>();
 
-        std::fs::create_dir_all(&layer_dir)?;
-
-        // Stream layer directly to tar extraction using direct process piping
-        // (no shell to avoid injection risks)
-
-        // Set up auth if provided (temp_dir must stay alive until command completes)
-        let temp_dir = setup_docker_auth(image, auth)?;
-
-        // Build crane command
-        let mut crane_cmd = Command::new("crane");
-        crane_cmd.arg("blob");
-        crane_cmd.arg(format!("{}@{}", image_repo(image), layer_digest));
-        if let Some(p) = oci_platform {
-            crane_cmd.arg("--platform").arg(p);
-        }
-        crane_cmd.stdout(Stdio::piped());
-        // Capture crane stderr to a file (not a pipe — a file can't deadlock on a
-        // full buffer) so the real fetch failure (DNS, TLS, 4xx, redirect) is
-        // surfaced instead of a bare "crane blob failed".
-        let crane_stderr_path = layer_dir.join(".crane-stderr");
-        match std::fs::File::create(&crane_stderr_path) {
-            Ok(f) => {
-                crane_cmd.stderr(Stdio::from(f));
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let tx = tx.clone();
+                let queue = &queue;
+                scope.spawn(move || loop {
+                    let Some((i, layer_digest, layer_id, layer_dir)) =
+                        queue.lock().unwrap().pop_front()
+                    else {
+                        break;
+                    };
+                    let outcome = fetch_and_extract_layer(
+                        image,
+                        layer_digest,
+                        &layer_id,
+                        &layer_dir,
+                        oci_platform,
+                        auth,
+                        proxy,
+                        no_proxy,
+                        i,
+                        total_layers,
+                    )
+                    .map(|size| (i, layer_id, layer_dir, size));
+                    let failed = outcome.is_err();
+                    if tx.send(outcome).is_err() || failed {
+                        break;
+                    }
+                });
             }
-            Err(_) => {
-                crane_cmd.stderr(Stdio::null());
+            drop(tx);
+
+            // Progress stays on this thread: the caller's closure is FnMut and
+            // is not required to be thread-safe.
+            let mut done = 0usize;
+            let mut first_error: Option<StorageError> = None;
+            for received in rx {
+                match received {
+                    Ok((_, layer_id, layer_dir, size)) => {
+                        newly_extracted.push((layer_dir, size));
+                        done += 1;
+                        progress(done, total_layers, &layer_id);
+                    }
+                    Err(e) => {
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
+                    }
+                }
             }
-        }
-
-        if let Some(ref td) = temp_dir {
-            crane_cmd.env("DOCKER_CONFIG", td.path());
-        }
-
-        apply_proxy_env(&mut crane_cmd, proxy, no_proxy);
-
-        // Spawn crane process
-        let mut crane = crane_cmd
-            .spawn()
-            .map_err(|e| StorageError::new(format!("failed to spawn crane: {}", e)))?;
-
-        // Extract straight from crane's stdout. `extract_oci_layer` transparently
-        // decompresses gzip- OR zstd-compressed layers in-process (the guest
-        // ships no zstd tool, and the old external `gunzip` pipe silently failed
-        // on every zstd layer). Reading the stream to EOF also drives the crane
-        // fetch to completion.
-        let crane_stdout = crane
-            .stdout
-            .take()
-            .ok_or_else(|| StorageError::new("failed to capture crane stdout".to_string()))?;
-
-        let extract_result = extract_oci_layer(crane_stdout, &layer_dir);
-
-        let crane_status = crane
-            .wait()
-            .map_err(|e| StorageError::new(format!("failed to wait for crane: {}", e)))?;
-
-        let crane_stderr = std::fs::read_to_string(&crane_stderr_path).unwrap_or_default();
-        let _ = std::fs::remove_file(&crane_stderr_path);
-        let crane_stderr = crane_stderr.trim();
-
-        // Order matters. A genuine crane fetch failure (network/auth) prints a
-        // real message to its stderr, so surface that first. Otherwise, if
-        // extraction failed, THAT is the real cause — a crane that exited
-        // non-zero with empty stderr is just the SIGPIPE from us closing the pipe
-        // when extraction stopped reading (the exact trap that made every zstd
-        // layer look like "crane blob failed" when the real problem was that the
-        // old pipeline couldn't decompress it).
-        let layer_failure = if !crane_status.success() && !crane_stderr.is_empty() {
-            Some(format!(
-                "crane blob failed for layer {}: {}",
-                layer_digest, crane_stderr
-            ))
-        } else if let Err(e) = extract_result {
-            Some(format!(
-                "layer extraction failed for layer {}: {}",
-                layer_digest, e
-            ))
-        } else if !crane_status.success() {
-            Some(format!("crane blob failed for layer {}", layer_digest))
-        } else {
-            None
-        };
-
-        if let Some(message) = layer_failure {
-            if let Err(e) = std::fs::remove_dir_all(&layer_dir) {
-                warn!(layer = %layer_id, error = %e, "failed to clean up layer directory after extraction failure");
+            match first_error {
+                Some(e) => Err(e),
+                None => Ok(()),
             }
-            return Err(StorageError::new(message));
-        }
-
-        newly_extracted.push(layer_dir);
-
-        // Report progress after successful extraction
-        progress(i + 1, total_layers, layer_id);
+        })?;
     }
 
     // Signal that layers are done and we're syncing — this can take a while
@@ -2227,17 +2548,20 @@ where
     //    (a host out of disk surfaces exactly this way) — only an error-reporting
     //    sync catches it, and a pull must FAIL then, not report done.
     if let Err(sync_error) = sync_layer_writeback(root) {
-        for dir in &newly_extracted {
+        for (dir, _) in &newly_extracted {
             let _ = std::fs::remove_dir_all(dir);
             let _ = std::fs::remove_file(layer_ok_marker(dir));
+            let _ = std::fs::remove_file(layer_size_marker(dir));
         }
         return Err(sync_error);
     }
 
     // Markers last: a layer without one is re-pulled, never trusted.
-    for dir in &newly_extracted {
+    for (dir, logical_bytes) in &newly_extracted {
         std::fs::write(layer_ok_marker(dir), "ok")
             .map_err(|e| StorageError::new(format!("write layer completion marker: {}", e)))?;
+        std::fs::write(layer_size_marker(dir), logical_bytes.to_string())
+            .map_err(|e| StorageError::new(format!("write layer size marker: {}", e)))?;
     }
 
     // Directory traversal is expensive for multi-gigabyte images and image
@@ -2552,14 +2876,23 @@ pub fn garbage_collect(dry_run: bool) -> Result<u64> {
     if layers_dir.exists() {
         for entry in std::fs::read_dir(&layers_dir)? {
             let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                // Completion and size sidecars live beside layer directories;
+                // they are handled with their directory below, not mistaken
+                // for independently garbage-collectable layers.
+                continue;
+            }
             let layer_id = entry.file_name().to_string_lossy().to_string();
 
             if !referenced_layers.contains(&layer_id) {
-                let size = dir_size(&entry.path()).unwrap_or(0);
+                let size = read_layer_size(&entry.path())
+                    .unwrap_or_else(|| dir_size(&entry.path()).unwrap_or(0));
                 info!(layer = %layer_id, size = size, dry_run = dry_run, "unreferenced layer");
 
                 if !dry_run {
                     std::fs::remove_dir_all(entry.path())?;
+                    let _ = std::fs::remove_file(layer_ok_marker(&entry.path()));
+                    let _ = std::fs::remove_file(layer_size_marker(&entry.path()));
                 }
 
                 freed += size;
@@ -2578,6 +2911,71 @@ pub fn garbage_collect(dry_run: bool) -> Result<u64> {
 ///
 /// Encapsulates the common logic for preparing overlay directories,
 /// mounting layers, and creating OCI bundles.
+/// Entries a filesystem puts at a volume root that never belong to an image
+/// layer. A layer store on macOS is an APFS volume, so it always carries at
+/// least `.fseventsd` -- which made an emptied store look populated and let a
+/// container start on an image that no longer had a filesystem.
+fn is_volume_metadata(name: &std::ffi::OsStr) -> bool {
+    matches!(
+        name.to_string_lossy().as_ref(),
+        ".fseventsd"
+            | ".Spotlight-V100"
+            | ".Trashes"
+            | ".TemporaryItems"
+            | ".DS_Store"
+            | ".DocumentRevisions-V100"
+            | "lost+found"
+    )
+}
+
+/// Reject lower layers that cannot produce the image's filesystem.
+///
+/// A single empty layer is legal -- an OCI layer may carry only metadata or
+/// whiteouts. Every layer being empty is not: the image then contributes
+/// nothing, the container runs on its upper layer alone, and the first sign of
+/// trouble is `executable file not found in $PATH` for a binary the image was
+/// supposed to provide. Failing here names the real problem instead.
+fn verify_layers(lowerdirs: &[String]) -> Result<()> {
+    let mut populated = 0usize;
+    for layer_path in lowerdirs {
+        let path = Path::new(layer_path);
+        if !path.exists() {
+            return Err(StorageError::new(format!(
+                "layer path does not exist: {}",
+                layer_path
+            )));
+        }
+        let entry_count = std::fs::read_dir(path)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| !is_volume_metadata(&e.file_name()))
+                    .count()
+            })
+            .unwrap_or(0);
+        if entry_count == 0 {
+            warn!(layer = %layer_path, "layer directory is empty");
+        } else {
+            populated += 1;
+        }
+    }
+    if populated == 0 && !lowerdirs.is_empty() {
+        return Err(StorageError::new(format!(
+            "the machine's image layers are missing: all {} unpacked layer \
+             director{} empty, so the container would have no image \
+             filesystem. The image has to be unpacked again before this \
+             machine can start.",
+            lowerdirs.len(),
+            if lowerdirs.len() == 1 {
+                "y is"
+            } else {
+                "ies are"
+            },
+        )));
+    }
+    Ok(())
+}
+
 struct OverlaySetup {
     overlay_root: PathBuf,
     upper_path: PathBuf,
@@ -2687,30 +3085,21 @@ impl OverlaySetup {
 
     /// Verify that all layer paths exist and log warnings for empty layers.
     fn verify_layers(&self, lowerdirs: &[String]) -> Result<()> {
-        for layer_path in lowerdirs {
-            let path = Path::new(layer_path);
-            if !path.exists() {
-                return Err(StorageError::new(format!(
-                    "layer path does not exist: {}",
-                    layer_path
-                )));
-            }
-            // Check if layer has contents
-            let entry_count = std::fs::read_dir(path)
-                .map(|entries| entries.count())
-                .unwrap_or(0);
-            if entry_count == 0 {
-                warn!(layer = %layer_path, "layer directory is empty");
-            }
-        }
-        Ok(())
+        verify_layers(lowerdirs)
     }
 
     /// Mount the overlay filesystem with fallback from multi-lowerdir to sequential.
     fn mount(&self, lowerdirs: &[String]) -> Result<()> {
+        // OCI manifests may repeat a content-addressed layer. Reapplying the
+        // exact same filesystem diff is idempotent, while passing the same
+        // directory to overlayfs twice makes fsconfig reject the stack with
+        // ELOOP and needlessly sends large images through the physical merge
+        // fallback.
+        let lowerdirs = unique_lowerdirs(lowerdirs);
+
         // Try multi-lowerdir mount first (efficient)
         let mount_result = try_mount_overlay_multi_lower(
-            lowerdirs,
+            &lowerdirs,
             &self.upper_path,
             &self.work_path,
             &self.merged_path,
@@ -2726,7 +3115,7 @@ impl OverlaySetup {
                 );
 
                 mount_overlay_sequential(
-                    lowerdirs,
+                    &lowerdirs,
                     &self.upper_path,
                     &self.work_path,
                     &self.merged_path,
@@ -3212,7 +3601,7 @@ pub fn run_command(
             let mut spec = OciSpec::new(cmd, spec_env, workdir_str, false, &identity, unprivileged);
             spec.add_gpu_devices_if_available();
             for (tag, container_path, read_only) in mounts {
-                let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
+                let virtiofs_mount = volume_bind_source(tag);
                 spec.add_bind_mount(
                     &virtiofs_mount.to_string_lossy(),
                     container_path,
@@ -3336,7 +3725,7 @@ pub fn spawn_in_overlay(
     let mut spec = OciSpec::new(command, env, workdir_str, false, &identity, unprivileged);
 
     for (tag, container_path, read_only) in mounts {
-        let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
+        let virtiofs_mount = volume_bind_source(tag);
         spec.add_bind_mount(
             &virtiofs_mount.to_string_lossy(),
             container_path,
@@ -3438,12 +3827,14 @@ where
 /// Request mounts merged with the BOOT env mounts (SMOLVM_MOUNT_*): boot-time
 /// binds land in a rootfs the workload's overlay later mounts OVER, so
 /// launcher-injected mounts (e.g. the CUDA ring mount) must ride every
-/// container's own mount list. Request entries win on target collision.
+/// container's own mount list. Boot entries win on target collision because
+/// they retain the launch-time positional tag and staged/live mode; a caller
+/// rebuilding bindings from an older persisted shape may not have either.
 pub fn merged_with_boot_mounts(mounts: &[(String, String, bool)]) -> Vec<(String, String, bool)> {
-    let mut v: Vec<(String, String, bool)> = mounts.to_vec();
-    for bm in init_volume_mounts() {
-        if !v.iter().any(|(_, t, _)| t == &bm.1) {
-            v.push(bm.clone());
+    let mut v = init_volume_mounts().to_vec();
+    for mount in mounts {
+        if !v.iter().any(|(_, target, _)| target == &mount.1) {
+            v.push(mount.clone());
         }
     }
     v
@@ -3461,66 +3852,40 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
     let rootfs_path = Path::new(rootfs);
 
     for (tag, container_path, read_only) in mounts {
-        validate_storage_id(tag, "mount tag")?;
-        debug!(tag = %tag, container_path = %container_path, read_only = %read_only, "setting up volume mount");
+        let (device_tag, staged_id) = split_staged_mount_tag(tag);
+        let staged = staged_id.is_some();
+        validate_storage_id(device_tag, "mount tag")?;
+        if let Some(staged_id) = staged_id {
+            validate_storage_id(staged_id, "staged mount identity")?;
+        }
+        debug!(tag = %device_tag, container_path = %container_path, read_only = %read_only, staged, "setting up volume mount");
 
         // First, mount the virtiofs device at a staging location
-        let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
+        let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(device_tag);
         std::fs::create_dir_all(&virtiofs_mount)?;
 
         // Check if already mounted
         if !is_mountpoint(&virtiofs_mount) {
-            info!(tag = %tag, mount_point = %virtiofs_mount.display(), "mounting virtiofs");
+            info!(tag = %device_tag, mount_point = %virtiofs_mount.display(), "mounting virtiofs");
 
-            // Mount virtiofs using direct syscall (avoids ~3-5ms fork+exec overhead).
-            // Use sync option to ensure writes are persisted immediately.
-            let src = std::ffi::CString::new(tag.as_str()).map_err(|e| StorageError::Internal {
-                message: format!("invalid tag: {}", e),
-            })?;
-            let dst =
-                std::ffi::CString::new(virtiofs_mount.to_string_lossy().as_ref()).map_err(|e| {
-                    StorageError::Internal {
-                        message: format!("invalid mount point: {}", e),
+            let dax = match mount_virtiofs(device_tag, &virtiofs_mount) {
+                Ok(dax) => dax,
+                Err(err) => {
+                    warn!(error = %err, tag = %device_tag, "failed to mount virtiofs device");
+                    if staged {
+                        return Err(err.into());
                     }
-                })?;
-            let fstype = std::ffi::CString::new("virtiofs").unwrap();
-            // DAX first: when the device has a DAX window (host passed a
-            // nonzero shm_size — SMOLVM_MOUNT_DAX=1), a dax mount maps host
-            // page-cache pages directly into the guest, making guest/host
-            // MAP_SHARED mmaps of the same file coherent shared memory (the
-            // clone-ring transport). The kernel silently downgrades dax on a
-            // window-less device; the explicit fallback covers kernels that
-            // reject the option outright.
-            let opts_dax = std::ffi::CString::new("dax,sync").unwrap();
-            let opts_plain = std::ffi::CString::new("sync").unwrap();
-            // SAFETY: mount virtiofs with valid CString arguments
-            let mut rc = unsafe {
-                libc::mount(
-                    src.as_ptr(),
-                    dst.as_ptr(),
-                    fstype.as_ptr(),
-                    0,
-                    opts_dax.as_ptr() as *const libc::c_void,
-                )
+                    continue;
+                }
             };
-            if rc != 0 {
-                // SAFETY: as above, plain options.
-                rc = unsafe {
-                    libc::mount(
-                        src.as_ptr(),
-                        dst.as_ptr(),
-                        fstype.as_ptr(),
-                        0,
-                        opts_plain.as_ptr() as *const libc::c_void,
-                    )
-                };
-            }
-            if rc != 0 {
-                let err = std::io::Error::last_os_error();
-                warn!(error = %err, tag = %tag, "failed to mount virtiofs device");
-                continue;
-            }
+            info!(tag = %device_tag, dax, "virtiofs mount active");
         }
+
+        let bind_source = if staged {
+            ensure_staged_working_copy(staged_id.expect("checked staged id"), &virtiofs_mount)?
+        } else {
+            virtiofs_mount.clone()
+        };
 
         // Now bind-mount into the container rootfs
         let target_path = ensure_mount_target_under_root(rootfs_path, container_path)?;
@@ -3528,16 +3893,18 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
         // Check if already bind-mounted
         if !is_mountpoint(&target_path) {
             info!(
-                source = %virtiofs_mount.display(),
+                source = %bind_source.display(),
                 target = %target_path.display(),
                 read_only = %read_only,
                 "bind-mounting into container"
             );
 
             // Bind mount using direct syscall
-            let bind_src = std::ffi::CString::new(virtiofs_mount.to_string_lossy().as_ref())
-                .map_err(|e| StorageError::Internal {
-                    message: format!("invalid source: {}", e),
+            let bind_src =
+                std::ffi::CString::new(bind_source.to_string_lossy().as_ref()).map_err(|e| {
+                    StorageError::Internal {
+                        message: format!("invalid source: {}", e),
+                    }
                 })?;
             let bind_dst =
                 std::ffi::CString::new(target_path.to_string_lossy().as_ref()).map_err(|e| {
@@ -3558,6 +3925,13 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
             if rc != 0 {
                 let err = std::io::Error::last_os_error();
                 warn!(error = %err, target = %target_path.display(), "failed to bind-mount");
+                if staged {
+                    return Err(StorageError::new(format!(
+                        "failed to bind staged mount '{}' at '{}': {err}",
+                        device_tag,
+                        target_path.display()
+                    )));
+                }
                 continue;
             }
 
@@ -3580,6 +3954,87 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
     }
 
     Ok(mounted_paths)
+}
+
+/// Materialize a host share once into the guest storage disk. The temporary
+/// directory and atomic rename mean an interrupted first boot can never leave
+/// a partially seeded working tree looking complete on the next start.
+#[cfg(target_os = "linux")]
+fn ensure_staged_working_copy(tag: &str, source: &Path) -> Result<PathBuf> {
+    use std::process::{Command, Stdio};
+
+    validate_storage_id(tag, "staged mount tag")?;
+    let root = Path::new(STAGED_MOUNT_ROOT);
+    std::fs::create_dir_all(root)?;
+    let destination = root.join(tag);
+    if destination.exists() {
+        return Ok(destination);
+    }
+
+    let temporary = root.join(format!(".{tag}.seed-{}", std::process::id()));
+    if temporary.exists() {
+        std::fs::remove_dir_all(&temporary)?;
+    }
+    std::fs::create_dir(&temporary)?;
+
+    let mut producer = Command::new("tar")
+        .args(["-cf", "-", "-C"])
+        .arg(source)
+        .arg(".")
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|error| StorageError::new(format!("start staged mount archive: {error}")))?;
+    let producer_stdout = producer
+        .stdout
+        .take()
+        .ok_or_else(|| StorageError::new("staged mount archive stdout was not captured"))?;
+    let consumer_status = Command::new("tar")
+        .args(["-xf", "-", "-C"])
+        .arg(&temporary)
+        .stdin(Stdio::from(producer_stdout))
+        .status()
+        .map_err(|error| StorageError::new(format!("extract staged mount archive: {error}")))?;
+    let producer_status = producer
+        .wait()
+        .map_err(|error| StorageError::new(format!("wait for staged mount archive: {error}")))?;
+    if !producer_status.success() || !consumer_status.success() {
+        let _ = std::fs::remove_dir_all(&temporary);
+        return Err(StorageError::new(format!(
+            "staged mount seed failed (archive={producer_status}, extract={consumer_status})"
+        )));
+    }
+    std::fs::rename(&temporary, &destination)?;
+    Ok(destination)
+}
+
+#[cfg(target_os = "linux")]
+pub fn prune_staged_working_copies(mounts: &[(String, String, bool)]) -> Result<()> {
+    let root = Path::new(STAGED_MOUNT_ROOT);
+    if !root.exists() {
+        return Ok(());
+    }
+    let wanted = mounts
+        .iter()
+        .filter_map(|(tag, _, _)| split_staged_mount_tag(tag).1)
+        .collect::<std::collections::HashSet<_>>();
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if !wanted.contains(name.to_string_lossy().as_ref()) {
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                std::fs::remove_dir_all(entry.path())?;
+            } else {
+                std::fs::remove_file(entry.path())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn prune_staged_working_copies(_mounts: &[(String, String, bool)]) -> Result<()> {
+    Ok(())
 }
 
 /// Stub for non-Linux platforms.
@@ -3685,7 +4140,7 @@ fn establish_keepalive_container(
     if !create.status.success() {
         return Err(StorageError::new(format!(
             "keep-alive crun create failed: {}",
-            String::from_utf8_lossy(&create.stderr).trim()
+            crate::crun::create_failure_reason(&container_id, &create)
         )));
     }
 
@@ -4028,7 +4483,7 @@ fn mount_overlay_fsconfig(
 /// is tarred directly, since overlayfs requires two lower layers when there is no
 /// upperdir.
 pub fn flatten_layers_to_tar(lowerdirs: &[String], output: &Path) -> Result<()> {
-    let present = mountable_lowerdirs(lowerdirs);
+    let present = unique_lowerdirs(&mountable_lowerdirs(lowerdirs));
 
     let source = match present.len() {
         0 => {
@@ -4073,6 +4528,16 @@ fn mountable_lowerdirs(lowerdirs: &[String]) -> Vec<String> {
                     .map(|mut entries| entries.next().is_some())
                     .unwrap_or(false)
         })
+        .cloned()
+        .collect()
+}
+
+/// Keep the first (highest-priority) occurrence of each lower directory.
+fn unique_lowerdirs(lowerdirs: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::with_capacity(lowerdirs.len());
+    lowerdirs
+        .iter()
+        .filter(|dir| seen.insert((*dir).clone()))
         .cloned()
         .collect()
 }
@@ -4636,6 +5101,151 @@ fn dir_size(path: &Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_archive_arch_compatibility() {
+        let guest_arch = match std::env::consts::ARCH {
+            "x86_64" => "amd64",
+            "aarch64" => "arm64",
+            other => other,
+        };
+        let other_arch = if guest_arch == "amd64" {
+            "arm64"
+        } else {
+            "386"
+        };
+
+        // Same arch is accepted
+        assert!(ensure_archive_arch_compatible(guest_arch).is_ok());
+        // Unknown / empty arch is leniently accepted
+        assert!(ensure_archive_arch_compatible("").is_ok());
+        assert!(ensure_archive_arch_compatible("unknown_arch").is_ok());
+        // Incompatible arch is rejected
+        let err = ensure_archive_arch_compatible(other_arch).unwrap_err();
+        assert!(err.to_string().contains("is built for architecture"));
+    }
+
+    /// One empty layer is a legal OCI layer (metadata or whiteouts only), so
+    /// verification must not reject an image just for containing one.
+    #[test]
+    fn a_single_empty_layer_beside_a_populated_one_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty");
+        let full = dir.path().join("full");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::create_dir_all(full.join("usr")).unwrap();
+        let layers = vec![
+            empty.to_string_lossy().into_owned(),
+            full.to_string_lossy().into_owned(),
+        ];
+        assert!(verify_layers(&layers).is_ok());
+    }
+
+    /// Every layer empty means the container would run on its upper layer
+    /// alone. That used to be accepted with only a warning, and surfaced much
+    /// later as a misleading "executable file not found in $PATH".
+    #[test]
+    fn layers_that_are_all_empty_are_rejected_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let layers = vec![
+            a.to_string_lossy().into_owned(),
+            b.to_string_lossy().into_owned(),
+        ];
+        let err = verify_layers(&layers).expect_err("all-empty layers must not be accepted");
+        assert!(
+            err.to_string().contains("image layers are missing"),
+            "error should name the real problem, got: {err}"
+        );
+    }
+
+    /// The failure this pair of fixes came from: an emptied macOS layer store
+    /// still has `.fseventsd`, which was enumerated as the image's only layer,
+    /// so the container came up on a rootfs made of filesystem bookkeeping.
+    #[test]
+    fn volume_metadata_is_never_enumerated_as_an_image_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".fseventsd")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".Spotlight-V100")).unwrap();
+        let err = ordered_packed_layer_names(dir.path())
+            .expect_err("bookkeeping directories are not layers");
+        assert!(err.to_string().contains("no image layers"), "got: {err}");
+    }
+
+    /// An extraction the host did not finish is staged as `<layer>.partial`;
+    /// whatever it contains, it is not a layer, and a store holding nothing
+    /// else must fail the same way an empty one does.
+    #[test]
+    fn an_unfinished_extraction_is_never_enumerated_as_an_image_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("aaaa1111bbbb.partial");
+        std::fs::create_dir_all(staging.join("usr/bin")).unwrap();
+        std::fs::write(staging.join("usr/bin/sh"), b"").unwrap();
+        let err = ordered_packed_layer_names(dir.path())
+            .expect_err("a half-written layer must not be served as the image");
+        assert!(err.to_string().contains("no image layers"), "got: {err}");
+
+        // Once the host renames it into place it is a layer like any other.
+        std::fs::rename(&staging, dir.path().join("aaaa1111bbbb")).unwrap();
+        assert_eq!(
+            ordered_packed_layer_names(dir.path()).unwrap(),
+            vec!["aaaa1111bbbb".to_string()]
+        );
+    }
+
+    /// A store with no usable layer directory cannot produce the image, so it
+    /// must fail by name rather than hand back an empty layer list.
+    #[test]
+    fn a_store_with_no_usable_layer_directory_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".fseventsd")).unwrap();
+        std::fs::write(dir.path().join(LAYER_ORDER_FILE), "aaaa1111bbbb\n").unwrap();
+        let err = ordered_packed_layer_names(dir.path())
+            .expect_err("a store holding no layer must not resolve");
+        assert!(err.to_string().contains("no image layers"), "got: {err}");
+    }
+
+    /// The fallback still works for a legacy store that has no index at all.
+    #[test]
+    fn a_store_without_an_order_index_still_sorts_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("bbbb")).unwrap();
+        std::fs::create_dir_all(dir.path().join("aaaa")).unwrap();
+        let names = ordered_packed_layer_names(dir.path()).unwrap();
+        assert_eq!(names, vec!["aaaa".to_string(), "bbbb".to_string()]);
+    }
+
+    /// The exact shape that got through: a layer store that is an emptied
+    /// macOS volume still carries `.fseventsd`, which counted as content and
+    /// let a container start on an image with no filesystem.
+    #[test]
+    fn a_layer_holding_only_volume_metadata_counts_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("layers-cs");
+        std::fs::create_dir_all(store.join(".fseventsd")).unwrap();
+        std::fs::write(store.join(".DS_Store"), b"").unwrap();
+        let layers = vec![store.to_string_lossy().into_owned()];
+        let err = verify_layers(&layers).expect_err("volume metadata is not image content");
+        assert!(
+            err.to_string().contains("image layers are missing"),
+            "got: {err}"
+        );
+    }
+
+    /// A missing layer directory is still reported as such, not folded into
+    /// the all-empty case.
+    #[test]
+    fn a_missing_layer_path_is_reported_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone");
+        let layers = vec![gone.to_string_lossy().into_owned()];
+        let err = verify_layers(&layers).expect_err("a missing layer must not be accepted");
+        assert!(err.to_string().contains("does not exist"), "got: {err}");
+    }
+
     // OCI layer helpers now live in the shared crate; these tests exercise them
     // through its public API (the crate also unit-tests them independently).
     use smolvm_oci_layer::{classify_layer_entry, jailed_join, LayerEntry};
@@ -4746,6 +5356,24 @@ mod tests {
             kept,
             vec![populated.to_string_lossy().into_owned()],
             "only the populated directory is mountable"
+        );
+    }
+
+    #[test]
+    fn duplicate_lowerdirs_keep_the_highest_priority_occurrence() {
+        let dirs = vec![
+            "/layers/top".to_string(),
+            "/layers/shared".to_string(),
+            "/layers/base".to_string(),
+            "/layers/shared".to_string(),
+        ];
+        assert_eq!(
+            unique_lowerdirs(&dirs),
+            vec![
+                "/layers/top".to_string(),
+                "/layers/shared".to_string(),
+                "/layers/base".to_string(),
+            ]
         );
     }
 
@@ -5445,6 +6073,26 @@ mod tests {
     }
 
     #[test]
+    fn image_size_uses_layer_sidecars_and_falls_back_for_old_caches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layers_root = tmp.path().join(LAYERS_DIR);
+        let cached = layers_root.join("cached");
+        let legacy = layers_root.join("legacy");
+        std::fs::create_dir_all(&cached).unwrap();
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(cached.join("ignored-by-sidecar"), b"123456789").unwrap();
+        std::fs::write(legacy.join("measured"), b"1234").unwrap();
+        std::fs::write(layer_size_marker(&cached), "7").unwrap();
+
+        assert_eq!(
+            calculate_image_size(tmp.path(), &["cached".into(), "legacy".into()]),
+            11
+        );
+        assert_eq!(read_layer_size(&cached), Some(7));
+        assert_eq!(layer_size_marker(&cached).parent(), cached.parent());
+    }
+
+    #[test]
     fn test_validate_storage_id_rejects_traversal() {
         assert!(validate_storage_id("../escape", "workload_id").is_err());
         assert!(validate_storage_id("foo/bar", "workload_id").is_err());
@@ -5630,6 +6278,47 @@ mod tests {
         // The merged view exposes files from every layer.
         assert!(merged.join("f0").exists());
         assert!(merged.join("f7").exists());
+        let _ = std::process::Command::new("umount").arg(&merged).status();
+    }
+
+    /// Verify that the new mount API preserves OCI layer precedence and hides a
+    /// lower-layer name deleted by a whiteout in the top layer. This catches
+    /// ordering changes that ordinary additive-layer tests cannot observe.
+    #[test]
+    #[ignore = "requires root + Linux overlayfs"]
+    #[cfg(target_os = "linux")]
+    fn overlay_fsconfig_applies_lower_layer_whiteouts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let base = root.join("base");
+        let top = root.join("top");
+        let upper = root.join("upper");
+        let work = root.join("work");
+        let merged = root.join("merged");
+        for path in [&base, &top, &upper, &work, &merged] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::create_dir_all(base.join("dir")).unwrap();
+        std::fs::create_dir_all(top.join("dir")).unwrap();
+        std::fs::write(base.join("priority"), b"base").unwrap();
+        std::fs::write(top.join("priority"), b"top").unwrap();
+        std::fs::write(base.join("dir/deleted"), b"lower payload").unwrap();
+        smolvm_oci_layer::create_overlay_whiteout(&top.join("dir/deleted")).unwrap();
+
+        let lowerdirs = vec![
+            top.to_string_lossy().into_owned(),
+            base.to_string_lossy().into_owned(),
+        ];
+        mount_overlay_fsconfig(&lowerdirs, &upper, &work, &merged).unwrap();
+
+        assert_eq!(std::fs::read(merged.join("priority")).unwrap(), b"top");
+        assert!(!merged.join("dir/deleted").exists());
+        let names: Vec<_> = std::fs::read_dir(merged.join("dir"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(!names.iter().any(|name| name == "deleted"));
+
         let _ = std::process::Command::new("umount").arg(&merged).status();
     }
 }

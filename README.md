@@ -24,7 +24,7 @@ Install
 # install (macOS + Linux)
 curl -sSL https://smolmachines.com/install.sh | bash
 
-# for coding agents — install + discover all commands
+# for coding agents: install + discover all commands
 curl -sSL https://smolmachines.com/install.sh | bash && smolvm --help
 ```
 
@@ -47,7 +47,7 @@ smolvm machine run --net -it --image alpine -- /bin/sh
 Smolfile
 --------
 
-A Smolfile declares a machine in TOML — the equivalent of a `Dockerfile` or a
+A Smolfile declares a machine in TOML, the equivalent of a `Dockerfile` or a
 cloud-init file, but for a whole VM: image, resources, network policy, mounts,
 ports, and setup commands in one checked-in file.
 
@@ -79,13 +79,75 @@ Unknown keys are rejected rather than ignored, so a typo fails at create time
 instead of silently doing nothing.
 
 Common keys: `image`, `cpus`, `memory`, `net`, `ports`, `volumes`, `env`,
-`init`, `workdir`, `gpu`, `cuda`, `docker_socket`, `storage`, `overlay`, and the
+`init` (runs once as root, like a Dockerfile `RUN`), `workdir`, `user` (who the
+workload runs as), `gpu`, `cuda`, `docker_socket`, `storage`, `overlay`, and the
 `[network]`, `[dev]`, `[auth]`, `[health]`, `[restart]`, `[service]` tables.
+
+### Branch a running machine
+
+A branch is a live fork: an independent copy-on-write child that resumes with
+the source's running processes, memory, and disk. Start the source as
+branchable, then branch it:
+
+```bash
+smolvm machine start --name source --branchable
+smolvm machine branch --from source --name child          # checkpoints the source wherever it is
+```
+
+To fan out many children from one checkpoint, the source's workload marks the
+point to take it by running `smolvm-branch-ready` once its setup is done, and
+names the program each child should run after it. The helper blocks in the
+source, which stays parked there; in each child it hands off to that program
+with the child's identity in its environment:
+
+```bash
+# the workload: install, warm up, then "fork me here, and run this in each child"
+smolvm machine create --name source --image python:3.12-alpine --net -- sh -c '
+  pip install -q requests
+  python3 serve.py &                    # keeps running in every child
+  exec smolvm-branch-ready -- python3 episode.py'
+
+smolvm machine start --name source --branchable
+smolvm machine branch --from source --count 8 --name-prefix worker --parallel 8
+```
+
+`episode.py` starts in each child with `SMOLVM_BRANCH_NAME`,
+`SMOLVM_BRANCH_INDEX`, `SMOLVM_BRANCH_BATCH_ID`, and `SMOLVM_BRANCH_BATCH_SIZE`
+set, plus any `--env` the branch command passed. A shell script that wants to
+continue inline instead runs `eval "$(smolvm-branch-ready)"`: the same command,
+whose output is those variables as `export` lines. `machine exec` sessions in a
+child see them in their environment too.
+
+When a child has its own warm-up after the branch (loading a checkpoint,
+binding a port), it can report the moment it is actually usable by running
+`smolvm-worker-ready`, and the branch command can wait for that instead of
+for the release alone:
+
+```bash
+smolvm machine branch --from source --count 8 --name-prefix worker --wait-worker-ready
+```
+
+With `--wait-worker-ready` (window: `--worker-ready-timeout`, default 5m) a
+child that never reports is torn down with its batch rather than handed back
+looking alive. `machine branch-release` takes the same flags for a held pool
+slot.
+
+Container rules apply, as in Docker: the container lives as long as its main
+process. `exec smolvm-branch-ready` with no program simply parks; the child
+keeps running with the helper as its init. A batch branch waits
+(`--ready-timeout`, default 10m) for the source to reach its branchpoint; a
+single `--name` branch never waits. With `--name-prefix` or `--hold`, even a
+count of one is a batch and gets the same boundary, identity, and release.
+
+Add `--branchable` to a child when it must branch again. `fork`, `--golden`, and
+`--forkable` remain compatibility aliases. A branch takes a checkpoint of the
+source in memory; `machine checkpoint` saves that same state as a durable
+`.smolcheckpoint` artifact that can be restored later or elsewhere.
 
 ### Snapshot a machine into a reusable image
 
 You don't need a Dockerfile to keep an environment. Set a machine up however you
-like — by hand, or from a Smolfile — then pack the stopped machine into a
+like (by hand, or from a Smolfile), then pack the stopped machine into a
 `.smolmachine` artifact and push it to any OCI registry:
 
 ```bash
@@ -106,30 +168,30 @@ Working Smolfiles: [python](https://github.com/smol-machines/smolvm/tree/main/ex
 Use This For
 ------------
 
-**Sandbox untrusted code** — run untrusted programs in a hardware-isolated VM. Host filesystem, network, and credentials are separated by a hypervisor boundary.
+**Sandbox untrusted code.** Run untrusted programs in a hardware-isolated VM. Host filesystem, network, and credentials are separated by a hypervisor boundary.
 
 ```bash
-# network is off by default — untrusted code can't phone home
+# network is off by default, so untrusted code can't phone home
 smolvm machine run --image alpine -- nslookup example.com
-# fails — no network access
+# fails: no network access
 
-# lock down egress — only allow specific hosts
+# lock down egress: only allow specific hosts
 smolvm machine run --net --image alpine --allow-host registry.npmjs.org -- wget -q -O /dev/null https://registry.npmjs.org
-# works — allowed host
+# works: allowed host
 
 smolvm machine run --net --image alpine --allow-host registry.npmjs.org -- wget -q -O /dev/null https://google.com
-# fails — not in allow list
+# fails: not in allow list
 ```
 
-**Pack into portable executables** — turn any workload into a self-contained binary. All dependencies are pre-baked — no install step, no runtime downloads, boots in <200ms.
+**Pack into portable executables.** Turn any workload into a self-contained binary. All dependencies are pre-baked, so there is no install step and no runtime downloads, and it boots in <200ms.
 
 ```bash
 smolvm pack create --image python:3.12-alpine -o ./python312
 ./python312 run -- python3 --version
-# Python 3.12.x — isolated, no pyenv/venv/conda needed
+# Python 3.12.x, isolated: no pyenv/venv/conda needed
 ```
 
-**Use local container images** — for CI, air-gapped hosts, and fast iteration. Feed `--image` a `docker save` / `podman save` archive, pipe one on stdin, or point it at an unpacked rootfs directory. Image work is delegated to your container tooling; smolvm just boots the result.
+**Use local container images** for CI, air-gapped hosts, and fast iteration. Feed `--image` a `docker save` / `podman save` archive, pipe one on stdin, or point it at an unpacked rootfs directory. Image work is delegated to your container tooling; smolvm just boots the result.
 
 ```bash
 # build locally, run in the VM with no push/pull
@@ -143,16 +205,28 @@ smolvm machine run --image ./myapp.tar -- ./app
 smolvm machine run --image ./rootfs/ -- ./app
 ```
 
-**Persistent machines for development** — create, stop, start. Installed packages survive restarts.
+**Persistent machines for development.** Create, stop, start. Installed packages survive restarts.
 
 ```bash
 smolvm machine create --net --name myvm
 smolvm machine start --name myvm
 smolvm machine exec --name myvm -- apk add sl
 smolvm machine exec --name myvm -it -- /bin/sh
-# inside: sl, ls, uname -a — type 'exit' to leave
+# inside: sl, ls, uname -a. Type 'exit' to leave
 smolvm machine stop --name myvm
 ```
+
+Host directory mounts propagate host-side changes into guest inotify, so tools
+such as Vite, nodemon, and file-watch test runners reload without polling. Set
+`SMOL_NO_HOT_RELOAD=1` in the host process to disable recursive watching for a
+machine with an unusually large directory tree.
+
+For sequential or mmap-heavy reads, `SMOLVM_MOUNT_DAX=1` enables a 2 GiB
+virtiofs DAX window for each user mount when the machine starts. This is a host
+process setting (set it on `smolvm serve` for served machines), and an existing
+machine needs a stop/start to apply it. DAX does not materially accelerate
+metadata-heavy traversal. Confirm it in the guest with
+`grep virtiofs /proc/mounts`; an active mount includes `dax=always`.
 
 **Use git and SSH without copying private keys into the guest.** Forward your host SSH agent into the VM. The guest can ask the agent to sign with any forwarded key while the socket is available, so forward it only to workloads you trust. Requires an SSH agent running on your host (`ssh-add -l` to check).
 
@@ -163,7 +237,7 @@ smolvm machine run --ssh-agent --net --image alpine -- sh -c "apk add -q openssh
 smolvm machine exec --name myvm -- git clone git@github.com:org/private-repo.git
 ```
 
-**Declare environments in a file** — see [Smolfile](#smolfile) above for
+**Declare environments in a file.** See [Smolfile](#smolfile) above for
 reproducible machine config, and for snapshotting a configured machine into a
 reusable `.smolmachine` image without writing a Dockerfile.
 
@@ -172,9 +246,9 @@ How It Works
 
 Each workload runs in a hardware-virtualized VM with its own guest kernel on [Hypervisor.framework](https://developer.apple.com/documentation/hypervisor) (macOS), KVM (Linux), or the [Windows Hypervisor Platform](https://learn.microsoft.com/en-us/virtualization/api/) (Windows). [libkrun](https://github.com/containers/libkrun) is the VMM and [libkrunfw](https://github.com/smol-machines/libkrunfw) supplies the guest kernel. Pack it into a `.smolmachine` and it runs anywhere the host architecture matches, with zero dependencies.
 
-Images use the [OCI](https://opencontainers.org/) format — the same open standard Docker uses. Any image on Docker Hub, ghcr.io, or other OCI registries can be pulled and booted as a microVM. No Docker daemon required.
+Images use the [OCI](https://opencontainers.org/) format, the same open standard Docker uses. Any image on Docker Hub, ghcr.io, or other OCI registries can be pulled and booted as a microVM. No Docker daemon required.
 
-Defaults: 4 vCPUs, 8 GiB RAM. Memory is elastic via virtio balloon — the host only commits what the guest actually uses and reclaims the rest automatically. vCPU threads sleep in the hypervisor when idle, so over-provisioning has near-zero cost. Override with `--cpus` and `--mem`.
+Defaults: 4 vCPUs, 8 GiB RAM. Memory is elastic via virtio balloon, so the host only commits what the guest actually uses and reclaims the rest automatically. vCPU threads sleep in the hypervisor when idle, so over-provisioning has near-zero cost. Override with `--cpus` and `--mem`.
 
 Security Model
 --------------
@@ -183,6 +257,7 @@ smolvm strengthens the guest/host boundary by giving each workload a separate VM
 
 * The `smolvm` CLI and VMM processes run with the permissions of the invoking host user. That user account, the host OS, the hypervisor backend, libkrun, and smolvm are in the trusted computing base.
 * Host directories passed with `--volume` are intentionally exposed to the guest with the requested access. Do not mount secrets or sensitive paths into an untrusted workload.
+* Protected host configuration and log trees remain blocked by default. A trusted local workload may explicitly expose `/etc` or `/var/log` read-only below `/host` with `--allow-system-mounts` (for example, `-v /etc:/host/etc:ro`). Writable system mounts, other protected trees, and HTTP API requests remain blocked.
 * `--ssh-agent` does not copy private key material into the guest, but it grants the guest access to the forwarded agent socket and therefore the ability to request signatures while the VM is running.
 * Networking is disabled by default. Enabling `--net`, port forwarding, or host services expands the workload's reachable surface.
 * In standalone local use, smolvm's state and control endpoints are scoped to the invoking user's environment. For hostile local co-tenants, add host-level account separation and OS confinement around the VMM process. This section does not describe the separate smolmachines cloud control plane or its tenant-isolation guarantees.
@@ -218,11 +293,39 @@ Known Limitations
 -----------------
 
 * Network is opt-in (`--net` on `machine create`). TCP/UDP only, no ICMP.
-* Volume mounts: directories only (no single files). Mounting at `/workspace` (`-v /host/dir:/workspace`) takes priority over the default storage-disk workspace — your host directory is used instead.
+* Volume mounts: directories only (no single files). Mounting at `/workspace` (`-v /host/dir:/workspace`) takes priority over the default storage-disk workspace, so your host directory is used instead.
 * macOS: binary must be signed with Hypervisor.framework entitlements (`com.apple.security.hypervisor`). The shipped release is; a re-signed or freshly built binary silently loses it and every VM start then fails with `krun_start_enter returned: -22 (EINVAL)`. Re-sign it (ad-hoc is fine): `codesign --force --sign - --entitlements hv.entitlements <smolvm-bin>` where `hv.entitlements` is a plist containing `<key>com.apple.security.hypervisor</key><true/>`.
 * `--ssh-agent` requires an SSH agent running on the host (`SSH_AUTH_SOCK` must be set).
 * GPU acceleration requires libkrun built with `GPU=1` and virglrenderer + a Vulkan driver on the host (see [GPU Acceleration](#gpu-acceleration) below).
-* Windows: `--net` works the same as on other platforms (virtio-net with inbound port-forwarding; TSI for outbound-only VMs), as do `machine exec` / interactive sessions and `machine stats`. Not yet available on Windows: GPU acceleration and `machine fork` / snapshot. Pack *create* needs `storage-template.ext4` / `overlay-template.ext4` next to `smolvm.exe` (Windows has no host `mkfs.ext4`).
+* Windows: `--net` works the same as on other platforms (virtio-net with inbound port-forwarding; TSI for outbound-only VMs), as do `machine exec` / interactive sessions and `machine stats`. Not yet available on Windows: GPU acceleration and `machine branch` / `machine checkpoint`. Pack *create* needs `storage-template.ext4` / `overlay-template.ext4` next to `smolvm.exe` (Windows has no host `mkfs.ext4`).
+
+Kubernetes
+----------
+
+smolvm ships a **containerd shim v2**, so Kubernetes runs a pod as its own microVM
+through a `RuntimeClass`, the same integration point Kata uses. The Linux release
+carries the shim and the manifests; there is nothing to build.
+
+On each node that should run microVM pods (requires KVM):
+
+```bash
+# 1. install the shim + runtime artifacts, then apply the containerd config it prints
+sudo ./kubernetes/install-k8s-runtime.sh
+sudo systemctl restart containerd
+
+# 2. label the node so the RuntimeClass will schedule to it
+kubectl label node <node> smolvm-runtime=true
+```
+
+Then register the class and run a pod:
+
+```bash
+kubectl apply -f kubernetes/runtimeclass.yaml
+kubectl apply -f kubernetes/example-pod.yaml
+kubectl logs smolvm-hello    # prints the guest's own kernel, so it is a real VM
+```
+
+Any pod opts in with `runtimeClassName: smolvm`.
 
 GPU Acceleration
 ----------------
@@ -235,16 +338,17 @@ ANGLE (Intel, Vulkan 1.4 (Virtio-GPU Venus (Intel(R) UHD Graphics ...)), venus)
 
 ### Host requirements
 
-**macOS** — virglrenderer and MoltenVK are bundled in the smolvm distribution. No extra installs needed.
+**macOS**: virglrenderer and MoltenVK are bundled in the smolvm distribution. No extra installs needed.
 
-**Linux** — virglrenderer and a host Vulkan driver must be installed from the system package manager:
+**Linux**: virglrenderer and a host Vulkan driver must be installed from the system package manager:
 
 | Distro | Packages |
 |--------|----------|
 | Alpine | `apk add virglrenderer mesa-vulkan-intel` (or `mesa-vulkan-ati` for AMD) |
 | Debian/Ubuntu | `apt install virglrenderer0 mesa-vulkan-drivers` |
+| Nix / NixOS | the flake does not put virglrenderer on the loader path; export `LD_LIBRARY_PATH` with the nixpkgs `virglrenderer` and `libepoxy` lib dirs (and `/run/opengl-driver/lib` on NixOS), see the [GPU page](https://smolmachines.com/docs/introduction/concepts/gpu) |
 
-> virglrenderer depends on libEGL and libdrm from the host GPU driver stack — these are hardware-specific and cannot be bundled. Any GPU-capable Linux host will already have them installed via its GPU driver.
+> virglrenderer depends on libEGL and libdrm from the host GPU driver stack. These are hardware-specific and cannot be bundled. Any GPU-capable Linux host will already have them installed via its GPU driver.
 
 ### Usage
 
@@ -288,5 +392,16 @@ Development
 -----------
 
 See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+
+Documentation
+-------------
+
+The user documentation at [smolmachines.com/docs](https://smolmachines.com/docs/) is written in
+[smol-machines/docs](https://github.com/smol-machines/docs), and corrections and new pages are
+welcome there. It is Markdown only, with no build to run; its
+[CONTRIBUTING.md](https://github.com/smol-machines/docs/blob/main/CONTRIBUTING.md) covers the
+page format and how a change reaches the site.
+
+Bugs and feature requests for the runtime stay here.
 
 [Apache-2.0](LICENSE) · made by [@binsquare](https://github.com/BinSquare) · [twitter](https://x.com/binsquares) · [github](https://github.com/smol-machines/smolvm)

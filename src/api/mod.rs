@@ -94,9 +94,11 @@ use state::ApiState;
         handlers::machines::get_machine,
         handlers::machines::get_machine_egress_events,
         handlers::machines::start_machine,
+        handlers::machines::branch_machine,
         handlers::machines::fork_machine,
         handlers::machines::release_held_fork,
         handlers::machines::stop_machine,
+        handlers::machines::sync_machine,
         handlers::machines::delete_machine,
         handlers::machines::resize_machine,
         handlers::machines::export_machine,
@@ -228,7 +230,7 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
 
     // Explicit, control-initiated node drain (decommission). Stops all VMs
     // cleanly. Control-only by construction (the listener is mTLS-gated; the
-    // loopback door is localhost). See docs/lossless-serve-restart.md.
+    // loopback door is localhost).
     let drain_route = Router::new().route("/drain", post(handlers::machines::drain_node));
 
     // Brokered P2P blob serving: hand a cached layer blob to a sibling node so a
@@ -270,12 +272,18 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
             get(handlers::machines::get_machine_egress_events),
         )
         .route("/{id}/start", post(handlers::machines::start_machine))
+        .route("/{id}/branches", post(handlers::machines::branch_machine))
         .route("/{id}/fork", post(handlers::machines::fork_machine))
+        .route(
+            "/{id}/branch-release",
+            post(handlers::machines::release_held_fork),
+        )
         .route(
             "/{id}/fork-release",
             post(handlers::machines::release_held_fork),
         )
         .route("/{id}/stop", post(handlers::machines::stop_machine))
+        .route("/{id}/sync", post(handlers::machines::sync_machine))
         .route("/{id}/resize", post(handlers::machines::resize_machine))
         .route("/{id}/export", post(handlers::machines::export_machine))
         .route("/{id}", delete(handlers::machines::delete_machine))

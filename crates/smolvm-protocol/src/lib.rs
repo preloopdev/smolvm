@@ -374,6 +374,53 @@ pub enum AgentRequest {
         output: String,
     },
 
+    /// Wait until the workload has declared a branchpoint, returning the ready
+    /// marker's contents (its profile lines) in `data.contents`.
+    BranchpointWait {
+        /// Give up after this many milliseconds.
+        timeout_ms: u64,
+    },
+    /// Put a negotiated helper into its restore-safe loop before capture.
+    BranchpointArm,
+    /// Return a parked source to its ordinary wait after capture.
+    BranchpointPark,
+    /// Release a restored clone: write the release marker for the generation
+    /// recorded in its ready marker, carrying the clone's identity, and wait
+    /// for the helper to acknowledge.
+    BranchpointRelease {
+        /// The clone's parameters in dotenv form, appended to the marker.
+        #[serde(default)]
+        env_dotenv: Option<String>,
+    },
+    /// Assign and release a held clone in one idempotent step: claim it with
+    /// `activation_token` (a retry with the same token completes a partial
+    /// commit; a different token is refused), install the per-clone
+    /// parameters, then write the release marker.
+    BranchpointActivate {
+        /// Per-clone parameters, dotenv form, written to `env_path`.
+        env_dotenv: String,
+        /// The same parameters in shell-sourceable form, written to `branch_env_path`.
+        env_sourceable: String,
+        /// Guest path of the dotenv file (under the clone's overlay for image machines).
+        env_path: String,
+        /// Guest path of the sourceable file.
+        branch_env_path: String,
+        /// Directory that must already exist, typically the clone's merged
+        /// overlay root; activation refuses rather than fabricating it.
+        require_dir: Option<String>,
+        /// Directory to create before writing the env files.
+        env_dir: String,
+        /// Token identifying this activation attempt.
+        activation_token: String,
+    },
+    /// Wait until a released clone's workload publishes its worker-ready token.
+    BranchpointWaitWorkerReady {
+        /// The token the workload must publish; any other is a mismatch.
+        token: String,
+        /// Give up after this many milliseconds.
+        timeout_ms: u64,
+    },
+
     /// Execute a command directly in the VM (not in a container).
     ///
     /// This runs the command in the agent's Alpine rootfs without any
@@ -559,6 +606,14 @@ pub enum AgentRequest {
         path: String,
     },
 
+    /// Stream a tar archive of a guest directory without creating a guest-side
+    /// temporary file. Used by staged mounts to batch many small files across
+    /// vsock instead of paying one virtiofs round trip per file.
+    ArchiveDirectory {
+        /// Absolute directory path in the VM filesystem.
+        path: String,
+    },
+
     /// Create (without starting) a Kubernetes pod container whose rootfs is a
     /// virtiofs-shared host directory (containerd snapshotter output) and whose
     /// process definition comes from the host's OCI config. The agent builds
@@ -680,6 +735,12 @@ impl AgentRequest {
                 format!("FlattenLayers {{ count: {} }}", lowerdirs.len())
             }
             AgentRequest::VmExec { .. } => "VmExec".into(),
+            AgentRequest::BranchpointWait { .. } => "BranchpointWait".into(),
+            AgentRequest::BranchpointArm => "BranchpointArm".into(),
+            AgentRequest::BranchpointPark => "BranchpointPark".into(),
+            AgentRequest::BranchpointRelease { .. } => "BranchpointRelease".into(),
+            AgentRequest::BranchpointActivate { .. } => "BranchpointActivate".into(),
+            AgentRequest::BranchpointWaitWorkerReady { .. } => "BranchpointWaitWorkerReady".into(),
             AgentRequest::Run { image, .. } => format!("Run {{ image: {image} }}"),
             AgentRequest::Stdin { .. } => "Stdin".into(),
             AgentRequest::Resize { .. } => "Resize".into(),
@@ -687,6 +748,7 @@ impl AgentRequest {
             AgentRequest::FileWriteBegin { .. } => "FileWriteBegin".into(),
             AgentRequest::FileWriteChunk { .. } => "FileWriteChunk".into(),
             AgentRequest::FileRead { .. } => "FileRead".into(),
+            AgentRequest::ArchiveDirectory { .. } => "ArchiveDirectory".into(),
             // Pod requests: spec/process JSON may carry env secrets — emit ids only.
             AgentRequest::PodCreate { id, .. } => format!("PodCreate {{ id: {id} }}"),
             AgentRequest::PodStart { id, exec_id } => match exec_id {
@@ -1404,11 +1466,11 @@ mod tests {
     fn test_agent_response_serialization() {
         let resp = AgentResponse::Pong {
             version: PROTOCOL_VERSION,
-            capabilities: vec![forkpoint::WORKER_READY_CAPABILITY.to_string()],
+            capabilities: vec![forkpoint::TYPED_BRANCHPOINT_CAPABILITY.to_string()],
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("pong"));
-        assert!(json.contains(forkpoint::WORKER_READY_CAPABILITY));
+        assert!(json.contains(forkpoint::TYPED_BRANCHPOINT_CAPABILITY));
 
         let legacy: AgentResponse =
             serde_json::from_str(r#"{"status":"pong","version":1}"#).unwrap();

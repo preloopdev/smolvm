@@ -447,6 +447,25 @@ pub enum CheckpointCpuContract {
         /// Hash of the host CPU virtualization feature contract.
         fingerprint: String,
     },
+    /// The architectural features the source guest was given, by name.
+    ///
+    /// aarch64 has no equivalent of the x86 `KVM_SET_CPUID2` check: the guest is
+    /// handed the host's own ID registers (libkrun only ORs in EL2/GICv3 and
+    /// masks out SME), and nothing compares them on restore. So a guest that
+    /// probed the source CPU at boot carries those conclusions in its restored
+    /// memory, and meeting an instruction the destination does not implement is
+    /// an undefined-instruction fault inside the guest rather than a clean
+    /// refusal.
+    ///
+    /// Recording the set by NAME replaces an opaque equality hash with a
+    /// question that can actually be answered: does this host provide
+    /// everything the guest was told it had? A destination that does is
+    /// accepted even if its model differs; one that does not is refused with
+    /// the missing features named.
+    Aarch64FeaturesV1 {
+        /// Sorted, de-duplicated `FEAT_*` names the source guest could use.
+        features: Vec<String>,
+    },
 }
 
 /// Compatibility and payload metadata for a portable live checkpoint.
@@ -532,6 +551,10 @@ pub struct PackManifest {
     /// Working directory (from image config or override).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
+    /// User the workload runs as (name or `uid[:gid]`), when the machine was
+    /// given one; absent means the image's USER applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
 
     /// Default number of vCPUs.
     pub cpus: u8,
@@ -622,6 +645,11 @@ pub struct AssetInventory {
     /// this size via `ftruncate`, restoring the sparse skeleton the VM expects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay_logical_size: Option<u64>,
+    /// Contents of the machine's `/workspace` at pack time, as a tar the guest
+    /// unpacks onto a fresh storage disk on first boot. Absent from packs made
+    /// without `--include-workspace`, and from packs older than this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_seed: Option<AssetEntry>,
 }
 
 /// An asset file entry.
@@ -667,6 +695,7 @@ impl PackManifest {
             env: Vec::new(),
             secret_refs: std::collections::BTreeMap::new(),
             workdir: None,
+            user: None,
             cpus: 1,
             mem: 256,
             image_size: 0,
@@ -687,6 +716,7 @@ impl PackManifest {
                 storage_logical_size: None,
                 overlay_template: None,
                 overlay_logical_size: None,
+                workspace_seed: None,
             },
             checkpoint: None,
         }

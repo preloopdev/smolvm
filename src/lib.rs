@@ -82,6 +82,11 @@ pub mod dns_filter_listener;
 /// Language-neutral embedded runtime support shared by SDK adapters.
 pub mod embedded;
 pub mod image_store;
+/// Boots a VM from a written boot-config: the `_boot-vm` subprocess entry point.
+/// Lives in the library, not the CLI, so any binary that links the engine (the
+/// containerd shim) can serve `_boot-vm` from its own executable instead of
+/// needing a separate `_boot-vm`-capable helper on disk.
+pub mod internal_boot;
 pub mod log_rotation;
 pub mod network;
 /// Shared from-VM pack export used by every `pack create --from-vm` front-end.
@@ -96,6 +101,8 @@ pub mod remote_volume;
 pub mod secrets;
 pub mod settings;
 pub mod smolfile;
+/// Guest-local staged mount synchronization.
+pub mod staged_mount;
 pub mod storage;
 pub mod systemd_scope;
 pub mod util;

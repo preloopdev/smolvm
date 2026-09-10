@@ -62,19 +62,19 @@ pub struct MachineSpec {
 impl MachineSpec {
     /// Convert the embedded-machine spec into the canonical DB record.
     pub fn to_record(&self) -> VmRecord {
+        let (mounts, staged_mounts) = HostMount::split_storage_tuples(&self.mounts);
         let mut record = VmRecord::new(
             self.name.clone(),
             self.resources.cpus,
             self.resources.memory_mib,
-            self.mounts
-                .iter()
-                .map(HostMount::to_storage_tuple)
-                .collect(),
+            mounts,
             self.ports.iter().map(PortMapping::to_tuple).collect(),
             self.resources.network,
         );
+        record.staged_mounts = staged_mounts;
         record.storage_gb = self.resources.storage_gib;
         record.overlay_gb = self.resources.overlay_gib;
+        record.block_io = self.resources.block_io;
         record.allowed_cidrs = self.resources.allowed_cidrs.clone();
         record.dns_filter_hosts = if self.allowed_hosts.is_empty() {
             None
@@ -97,7 +97,7 @@ impl MachineSpec {
 
 /// Create a DB record for a new SDK machine.
 pub fn create_vm(db: &SmolvmDb, spec: &MachineSpec) -> Result<()> {
-    create_vm_with_workload(db, spec, Vec::new(), None)
+    create_vm_with_workload(db, spec, Vec::new(), None, None)
 }
 
 /// Create a DB record with the image workload configuration supplied by an
@@ -107,6 +107,7 @@ pub(crate) fn create_vm_with_workload(
     spec: &MachineSpec,
     env: Vec<(String, String)>,
     workdir: Option<String>,
+    user: Option<String>,
 ) -> Result<()> {
     validate_vm_name(&spec.name, "name")
         .map_err(|reason| Error::config("validate machine name", reason))?;
@@ -123,6 +124,7 @@ pub(crate) fn create_vm_with_workload(
     record.cmd = spec.command.clone();
     record.env = env;
     record.workdir = workdir;
+    record.user = user;
     if db.insert_vm_if_not_exists(&spec.name, &record)? {
         Ok(())
     } else {
@@ -360,7 +362,9 @@ fn boot_prepared_fork(
             // clone-local barrier only after identity reset succeeds, matching
             // the CLI and serve fork paths. Publishing a release marker is
             // harmless for an arbitrary checkpoint with no waiting helper.
-            if let Err(error) = crate::agent::fork::release_forkpoint(clone) {
+            if let Err(error) =
+                crate::agent::fork::release_forkpoint(clone, &prep.clone_record.fork_env)
+            {
                 let _ = handle.stop();
                 return Err(error);
             }
@@ -564,6 +568,10 @@ pub fn stop_vm(db: &SmolvmDb, name: &str) -> Result<()> {
     let manager = AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)
         .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
     manager.try_connect_existing();
+    if !record.staged_mounts.is_empty() {
+        let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
+        crate::staged_mount::sync_staged_mounts(&record, &mut client)?;
+    }
     manager.stop()?;
     // Detach the per-machine layers volume if a (possibly cross-tool) bundle start
     // left it mounted. Unconditional on purpose: the embedded record may carry no
@@ -817,12 +825,14 @@ mod tests {
             &spec,
             vec![("SESSION".into(), "golden".into())],
             Some("/workspace".into()),
+            Some("1000:1000".into()),
         )
         .unwrap();
         let record = get_record(&db, "workload").unwrap();
         assert_eq!(record.image.as_deref(), Some("example/service:latest"));
         assert_eq!(record.cmd, vec!["python", "-m", "service"]);
         assert_eq!(record.env, vec![("SESSION".into(), "golden".into())]);
+        assert_eq!(record.user.as_deref(), Some("1000:1000"));
         assert_eq!(record.workdir.as_deref(), Some("/workspace"));
     }
 

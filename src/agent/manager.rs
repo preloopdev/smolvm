@@ -44,6 +44,75 @@ const AGENT_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// Timeout when waiting for agent to stop.
 const WAIT_FOR_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How a manager opens a machine's disks.
+///
+/// Every command that merely reconnects, inspects, or stops a machine opens
+/// it to observe: nothing on disk may change. Only a launch may create a
+/// disk that does not exist yet, at the size the machine was created with,
+/// or grow one to an explicitly requested size. The distinction is the
+/// whole reason `machine status` on a never-started machine must not leave a
+/// default-sized disk behind that a later start then keeps.
+#[derive(Debug, Clone, Copy)]
+enum DiskAccess {
+    Observe,
+    Launch {
+        storage_gib: Option<u64>,
+        overlay_gib: Option<u64>,
+    },
+}
+
+fn open_storage_disk_for_manager(
+    path: &Path,
+    format: DiskFormat,
+    access: DiskAccess,
+) -> Result<StorageDisk> {
+    match (format, access) {
+        (DiskFormat::Qcow2, _) => StorageDisk::open_existing_with_format(path, format),
+        (DiskFormat::Raw, DiskAccess::Observe) if path.exists() => {
+            StorageDisk::open_existing_with_format(path, format)
+        }
+        (DiskFormat::Raw, DiskAccess::Observe) => Ok(StorageDisk::absent_at(path)),
+        (
+            DiskFormat::Raw,
+            DiskAccess::Launch {
+                storage_gib: None, ..
+            },
+        ) if path.exists() => StorageDisk::open_existing_with_format(path, format),
+        (DiskFormat::Raw, DiskAccess::Launch { storage_gib, .. }) => {
+            StorageDisk::open_or_overlay_at(
+                path,
+                storage_gib.unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GIB),
+            )
+        }
+    }
+}
+
+fn open_overlay_disk_for_manager(
+    path: &Path,
+    format: DiskFormat,
+    access: DiskAccess,
+) -> Result<OverlayDisk> {
+    match (format, access) {
+        (DiskFormat::Qcow2, _) => OverlayDisk::open_existing_with_format(path, format),
+        (DiskFormat::Raw, DiskAccess::Observe) if path.exists() => {
+            OverlayDisk::open_existing_with_format(path, format)
+        }
+        (DiskFormat::Raw, DiskAccess::Observe) => Ok(OverlayDisk::absent_at(path)),
+        (
+            DiskFormat::Raw,
+            DiskAccess::Launch {
+                overlay_gib: None, ..
+            },
+        ) if path.exists() => OverlayDisk::open_existing_with_format(path, format),
+        (DiskFormat::Raw, DiskAccess::Launch { overlay_gib, .. }) => {
+            OverlayDisk::open_or_overlay_at(
+                path,
+                overlay_gib.unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GIB),
+            )
+        }
+    }
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn should_retry_kvm_enomem(cpus: u8, forkable: bool, fork_clone: bool) -> bool {
     cpus == 1 || forkable || fork_clone
@@ -175,6 +244,7 @@ pub fn docker_config_mount() -> Option<HostMount> {
         source: docker_dir,
         target: PathBuf::from("/root/.docker"),
         read_only: true,
+        staged: false,
     })
 }
 
@@ -242,7 +312,8 @@ pub fn vm_data_dir(name: &str) -> PathBuf {
 /// unreachable and therefore never construct an [`AgentManager`] that can run
 /// normal lifecycle cleanup. Keeping this name-based entry point next to
 /// [`vm_data_dir`] makes those recovery paths clean the same exact directories.
-pub(crate) fn cleanup_dead_vm_runtime(name: &str) -> Result<()> {
+#[doc(hidden)]
+pub fn cleanup_dead_vm_runtime(name: &str) -> Result<()> {
     let db = crate::db::SmolvmDb::open()?;
     cleanup_dead_vm_runtime_in_db(name, &db)
 }
@@ -657,6 +728,19 @@ pub fn ensure_vm_dir(name: &str) -> std::io::Result<PathBuf> {
     ensure_vm_dir_at(&vm_data_dir(name), name)
 }
 
+/// The VM data directory for observation: verifies the `name → hash` binding
+/// when the directory exists, and otherwise just returns the path without
+/// creating anything. `machine status` on a name that was never created must
+/// not leave a directory behind.
+pub fn observe_vm_dir(name: &str) -> std::io::Result<PathBuf> {
+    let dir = vm_data_dir(name);
+    if dir.is_dir() {
+        ensure_vm_dir_at(&dir, name)
+    } else {
+        Ok(dir)
+    }
+}
+
 /// Lower-level form of [`ensure_vm_dir`] that operates on an explicit
 /// directory path. Factored out for testability — callers in production
 /// should use [`ensure_vm_dir`].
@@ -854,56 +938,55 @@ impl AgentManager {
         Self::for_vm("default")
     }
 
-    /// Get an agent manager for a named VM.
-    ///
-    /// Each named VM gets its own isolated storage and socket.
-    /// `storage_gb` and `overlay_gb` override the default disk sizes (20 GiB / 10 GiB).
+    /// Open a named VM for launch: creates its data directory and any disk
+    /// that does not exist yet, at `storage_gb` / `overlay_gb` or the defaults
+    /// (20 GiB / 10 GiB), and grows an existing raw disk to an explicit size.
     pub fn for_vm_with_sizes(
         name: impl Into<String>,
         storage_gb: Option<u64>,
         overlay_gb: Option<u64>,
     ) -> Result<Self> {
+        Self::open(
+            name,
+            DiskAccess::Launch {
+                storage_gib: storage_gb,
+                overlay_gib: overlay_gb,
+            },
+        )
+    }
+
+    fn open(name: impl Into<String>, access: DiskAccess) -> Result<Self> {
         let name = name.into();
         let rootfs_path = Self::default_rootfs_path()?;
-        let sg = storage_gb.unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GIB);
-        let og = overlay_gb.unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GIB);
-
-        // Named VMs get their own storage disk. `ensure_vm_dir` commits the
-        // name→hash binding on first call and detects collisions on
-        // subsequent calls (refusing to open a hash dir that belongs to a
-        // different name).
-        let storage_dir = ensure_vm_dir(&name)?;
+        // Named VMs get their own storage disk. A launch commits the name→hash
+        // binding on first call and detects collisions on subsequent calls
+        // (refusing to open a hash dir that belongs to a different name); an
+        // observation only verifies an existing binding.
+        let storage_dir = match access {
+            DiskAccess::Observe => observe_vm_dir(&name)?,
+            DiskAccess::Launch { .. } => ensure_vm_dir(&name)?,
+        };
 
         // A fork clone has a `.qcow2` copy-on-write overlay in place of the
         // `.raw` disk; detect it by file presence (the on-disk file is the
         // source of truth) and open it as-is rather than creating/formatting.
         let (storage_path, storage_format) =
             resolve_disk_image(&storage_dir, crate::storage::STORAGE_DISK_FILENAME);
-        let storage_disk = match storage_format {
-            DiskFormat::Qcow2 => {
-                StorageDisk::open_existing_with_format(&storage_path, storage_format)?
-            }
-            // Fresh disk: prefer an instant qcow2 CoW overlay over the template
-            // (Linux, default size) instead of a raw copy, to avoid per-boot
-            // host-disk thrash under concurrency. Falls back to raw otherwise.
-            DiskFormat::Raw => StorageDisk::open_or_overlay_at(&storage_path, sg)?,
-        };
+        let storage_disk = open_storage_disk_for_manager(&storage_path, storage_format, access)?;
 
         let (overlay_path, overlay_format) =
             resolve_disk_image(&storage_dir, crate::storage::OVERLAY_DISK_FILENAME);
-        let overlay_disk = match overlay_format {
-            DiskFormat::Qcow2 => {
-                OverlayDisk::open_existing_with_format(&overlay_path, overlay_format)?
-            }
-            DiskFormat::Raw => OverlayDisk::open_or_overlay_at(&overlay_path, og)?,
-        };
+        let overlay_disk = open_overlay_disk_for_manager(&overlay_path, overlay_format, access)?;
 
         Self::new_named(name, rootfs_path, storage_disk, overlay_disk)
     }
 
-    /// Get an agent manager for a named VM with default sizes.
+    /// Open a named VM to observe or reconnect to it: status, list, stop,
+    /// exec. Creates nothing on disk; a machine that was never started is
+    /// opened with absent disk handles, and launching from such a manager is
+    /// refused. Launch paths use [`Self::for_vm_with_sizes`].
     pub fn for_vm(name: impl Into<String>) -> Result<Self> {
-        Self::for_vm_with_sizes(name, None, None)
+        Self::open(name, DiskAccess::Observe)
     }
 
     /// Get the VM name if this is a named agent.
@@ -911,21 +994,15 @@ impl AgentManager {
         self.name.as_deref()
     }
 
-    /// Names of VMs forked from this one. Their block disks are copy-on-write
-    /// overlays backed by this VM's disks, so it must not be re-launched with
-    /// writable disks while they exist. Best-effort: on a registry read error,
-    /// returns empty rather than blocking the launch.
-    fn dependent_clones(&self) -> Vec<String> {
+    /// Names of clones whose older disk lineage requires this VM to stay
+    /// frozen. A fork-and-continue generation has already pivoted this source
+    /// onto a distinct writable overlay and is safe to restart.
+    fn restart_blocking_dependent_clones(&self) -> Result<Vec<String>> {
         let Some(name) = self.name() else {
-            return Vec::new(); // the unnamed/default manager is never a fork base
+            return Ok(Vec::new()); // the unnamed/default manager is never a fork base
         };
-        match crate::db::SmolvmDb::open().and_then(|db| db.dependent_clones(name)) {
-            Ok(clones) => clones,
-            Err(e) => {
-                tracing::warn!(vm = name, error = %e, "could not check for dependent clones");
-                Vec::new()
-            }
-        }
+        let db = crate::db::SmolvmDb::open()?;
+        crate::agent::fork::restart_blocking_dependent_clones(&db, name)
     }
 
     /// Get the default path for the agent rootfs.
@@ -974,6 +1051,33 @@ impl AgentManager {
             .ok_or_else(|| Error::storage("resolve path", "could not determine data directory"))?;
 
         Ok(data_dir.join("smolvm").join("agent-rootfs"))
+    }
+
+    /// Resolve the agent rootfs an operation should use, and insist it is real.
+    ///
+    /// `explicit` is a caller-supplied override (`--rootfs-dir`, a checkpoint's
+    /// `rootfs_dir`) and wins outright. Otherwise this is exactly what a machine
+    /// boots with — [`Self::default_rootfs_path`] — so `pack create`, checkpoints
+    /// and `machine run` can never disagree about which agent they mean.
+    ///
+    /// The result is checked for `sbin/init` via `symlink_metadata`: that entry
+    /// is a symlink to a guest-only path, so `exists()` would follow it and
+    /// wrongly report a perfectly good rootfs as missing.
+    pub fn resolve_rootfs_path(explicit: Option<PathBuf>, what: &str) -> Result<PathBuf> {
+        let dir = match explicit {
+            Some(dir) => dir,
+            None => Self::default_rootfs_path()?,
+        };
+        if std::fs::symlink_metadata(dir.join("sbin/init")).is_ok() {
+            return Ok(dir);
+        }
+        Err(Error::agent(
+            what,
+            format!(
+                "could not find agent rootfs at {}; set SMOLVM_AGENT_ROOTFS or reinstall",
+                dir.display()
+            ),
+        ))
     }
 
     /// Extract a bundled agent-rootfs tarball to a cache dir (idempotent) and
@@ -1295,6 +1399,32 @@ impl AgentManager {
     }
 
     /// Get the child PID if known.
+    /// How the VM process ended, if it has: the signal that killed it or its
+    /// exit code, with the last line of its startup log when there is one.
+    /// `None` while it is still running or when it was never spawned.
+    pub fn death_reason(&self) -> Option<String> {
+        let pid = self.child_pid()?;
+        // A request fails the instant the guest drops the connection, which
+        // can be a moment before the VM process itself is gone (the guest
+        // reboots on a panic, and the VMM exits with it). Give it that moment
+        // rather than reporting a live process and losing the reason.
+        let mut exit_code = None;
+        for _ in 0..30 {
+            exit_code = process::try_wait(pid);
+            if exit_code.is_some() || !process::is_alive(pid) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if exit_code.is_none() && process::is_alive(pid) {
+            return None;
+        }
+        let log = std::fs::read_to_string(&self.startup_error_log).ok();
+        let log = log.as_deref().map(str::trim).filter(|l| !l.is_empty());
+        Some(boot_failure_reason(exit_code, log))
+    }
+
+    /// The PID of the VM process this manager spawned, once it has.
     pub fn child_pid(&self) -> Option<i32> {
         self.inner.lock().child.as_ref().map(|c| c.pid())
     }
@@ -1621,7 +1751,7 @@ impl AgentManager {
         // process alive, so refusing is safe — delete the clones first to reuse
         // the name. Covers every launch path (CLI fork + subprocess) since both
         // funnel through here.
-        let clones = self.dependent_clones();
+        let clones = self.restart_blocking_dependent_clones()?;
         if !clones.is_empty() {
             return Err(Error::agent(
                 "start agent",
@@ -1702,6 +1832,21 @@ impl AgentManager {
                 inner.state = AgentState::Stopped;
                 return Err(e);
             }
+        }
+
+        // A manager opened to observe a never-started machine has no disks to
+        // boot from; creating them here would be creating them at a guessed
+        // size. Launches go through a manager opened with the machine's sizes.
+        if !self.storage_disk.exists() || !self.overlay_disk.exists() {
+            let mut inner = self.inner.lock();
+            inner.state = AgentState::Stopped;
+            return Err(Error::agent(
+                "verify disks",
+                format!(
+                    "machine '{}' has no disks yet; they are created by a start with the machine's configured sizes",
+                    self.name.as_deref().unwrap_or("default")
+                ),
+            ));
         }
 
         // Validate rootfs exists
@@ -2330,19 +2475,35 @@ impl AgentManager {
                 smolvm_protocol::guest_env::READY_MARKER,
                 self.ready_marker_name(),
             )
-            .stdin(std::process::Stdio::null())
-            // SMOLVM_BOOT_DEBUG=1 surfaces the boot subprocess's stdout/stderr so
-            // embedded-host launch failures can be diagnosed (normally silenced).
-            .stdout(if std::env::var_os("SMOLVM_BOOT_DEBUG").is_some() {
-                std::process::Stdio::inherit()
+            .stdin(std::process::Stdio::null());
+        // SMOLVM_BOOT_DEBUG=1 surfaces the boot subprocess's stdout/stderr so
+        // embedded-host launch failures can be diagnosed (normally silenced).
+        //
+        // On Windows the child is spawned DETACHED_PROCESS (below), which drops
+        // its console handles, so an inherited stdio pair reaches nothing and the
+        // flag looks like it does nothing at all. Write to `boot-debug.log` beside
+        // the VM's boot config there instead; every other platform still inherits.
+        {
+            let boot_debug = std::env::var_os("SMOLVM_BOOT_DEBUG").is_some();
+            let debug_log = if cfg!(windows) && boot_debug {
+                config_path.parent().map(|dir| dir.join("boot-debug.log"))
             } else {
-                std::process::Stdio::null()
-            })
-            .stderr(if std::env::var_os("SMOLVM_BOOT_DEBUG").is_some() {
-                std::process::Stdio::inherit()
-            } else {
-                std::process::Stdio::null()
-            });
+                None
+            };
+            let sink = |path: &Option<std::path::PathBuf>| -> std::process::Stdio {
+                match path {
+                    Some(path) => std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                        .map(std::process::Stdio::from)
+                        .unwrap_or_else(|_| std::process::Stdio::null()),
+                    None if boot_debug => std::process::Stdio::inherit(),
+                    None => std::process::Stdio::null(),
+                }
+            };
+            cmd.stdout(sink(&debug_log)).stderr(sink(&debug_log));
+        }
         // Own process group (pgid = child pid) so the VM is immune to SIGHUP from
         // the parent's terminal closing, without making it a session leader.
         // POSIX-only; Windows process groups have different semantics and the
@@ -3113,6 +3274,22 @@ impl Drop for AgentManager {
 /// mismatched/corrupt `krun.dll`/`libkrunfw.dll` or unavailable WHP, which is
 /// far more useful than whatever benign WARN happened to be logged last (on
 /// Windows the guest console isn't captured, so the log is often just that).
+/// The name of the fatal signal a `128 + signal` exit code stands for.
+fn fatal_signal_name(code: i32) -> Option<&'static str> {
+    Some(match code - 128 {
+        4 => "SIGILL",
+        6 => "SIGABRT",
+        7 => "SIGBUS",
+        8 => "SIGFPE",
+        9 => "SIGKILL",
+        11 => "SIGSEGV",
+        13 => "SIGPIPE",
+        15 => "SIGTERM",
+        31 => "SIGSYS",
+        _ => return None,
+    })
+}
+
 fn boot_failure_reason(exit_code: Option<i32>, startup_log: Option<&str>) -> String {
     let real_error = startup_log
         .and_then(|log| {
@@ -3164,6 +3341,12 @@ fn boot_failure_reason(exit_code: Option<i32>, startup_log: Option<&str>) -> Str
                      Hypervisor Platform (WHP) is unavailable; verify the DLLs match smolvm \
                      (checksums.txt) and that WHP is enabled"
                 )
+            } else if let Some(signal) = fatal_signal_name(code) {
+                // try_wait reports a signalled exit as 128 + signal. A VM
+                // killed by a signal never writes a message, and its process
+                // is not dumpable, so the signal name is the only trace the
+                // user gets of a crash in the VMM or a renderer library.
+                format!("boot process was killed by {signal} (a crash in the VMM or a library it loaded)")
             } else {
                 format!("boot process exited (code {code}) before the agent was ready")
             }
@@ -3179,7 +3362,111 @@ fn boot_failure_reason(exit_code: Option<i32>, startup_log: Option<&str>) -> Str
 
 #[cfg(test)]
 mod tests {
+    /// An explicit override must win even over a real default, and a rootfs
+    /// is only accepted when `sbin/init` is present — checked without following
+    /// the symlink, because in a real rootfs it points at a guest-only path.
+    #[test]
+    fn resolve_rootfs_path_honours_override_and_requires_init() {
+        let tmp = tempfile::tempdir().unwrap();
+        let good = tmp.path().join("good");
+        std::fs::create_dir_all(good.join("sbin")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/usr/local/bin/smolvm-agent", good.join("sbin/init")).unwrap();
+        #[cfg(not(unix))]
+        std::fs::write(good.join("sbin/init"), b"").unwrap();
+        let got = super::AgentManager::resolve_rootfs_path(Some(good.clone()), "test").unwrap();
+        assert_eq!(got, good);
+
+        let bare = tmp.path().join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        let err = super::AgentManager::resolve_rootfs_path(Some(bare.clone()), "test")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("could not find agent rootfs"), "{err}");
+        assert!(err.contains(&bare.display().to_string()), "{err}");
+    }
+
     use super::*;
+
+    #[test]
+    fn reconnecting_to_custom_raw_disks_never_resizes_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage_path = temp.path().join("storage.raw");
+        let overlay_path = temp.path().join("overlay.raw");
+        StorageDisk::open_or_create_at(&storage_path, 1).unwrap();
+        OverlayDisk::open_or_create_at(&overlay_path, 1).unwrap();
+
+        for access in [
+            DiskAccess::Observe,
+            DiskAccess::Launch {
+                storage_gib: None,
+                overlay_gib: None,
+            },
+        ] {
+            let storage =
+                open_storage_disk_for_manager(&storage_path, DiskFormat::Raw, access).unwrap();
+            let overlay =
+                open_overlay_disk_for_manager(&overlay_path, DiskFormat::Raw, access).unwrap();
+            assert_eq!(storage.size_gib(), 1);
+            assert_eq!(overlay.size_gib(), 1);
+        }
+        assert_eq!(std::fs::metadata(storage_path).unwrap().len(), 1 << 30);
+        assert_eq!(std::fs::metadata(overlay_path).unwrap().len(), 1 << 30);
+    }
+
+    /// `machine status` on a machine that was never started used to create a
+    /// default-sized disk that a later start then kept, ignoring the size the
+    /// machine was created with. Observation creates nothing; the launch does,
+    /// at the requested size.
+    #[test]
+    fn observing_a_never_started_machine_creates_no_disk() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage_path = temp.path().join("storage.raw");
+        let overlay_path = temp.path().join("overlay.raw");
+
+        let storage =
+            open_storage_disk_for_manager(&storage_path, DiskFormat::Raw, DiskAccess::Observe)
+                .unwrap();
+        let overlay =
+            open_overlay_disk_for_manager(&overlay_path, DiskFormat::Raw, DiskAccess::Observe)
+                .unwrap();
+        assert!(!storage.exists());
+        assert!(!overlay.exists());
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+
+        let storage = open_storage_disk_for_manager(
+            &storage_path,
+            DiskFormat::Raw,
+            DiskAccess::Launch {
+                storage_gib: Some(2),
+                overlay_gib: Some(1),
+            },
+        )
+        .unwrap();
+        assert!(storage.exists());
+        assert_eq!(storage.size_gib(), 2);
+    }
+
+    /// Observing a name that was never created leaves no directory behind;
+    /// observing an existing one still verifies its name binding.
+    #[test]
+    fn observing_a_vm_dir_never_creates_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("deadbeef");
+        // Same logic as `observe_vm_dir`, on an explicit path.
+        assert!(!dir.exists());
+        let resolved = if dir.is_dir() {
+            ensure_vm_dir_at(&dir, "ghost").unwrap()
+        } else {
+            dir.clone()
+        };
+        assert_eq!(resolved, dir);
+        assert!(!dir.exists());
+
+        ensure_vm_dir_at(&dir, "real").unwrap();
+        let err = ensure_vm_dir_at(&dir, "impostor").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    }
 
     #[test]
     fn restored_cuda_clones_fail_faster_than_other_boots() {
@@ -3413,6 +3700,22 @@ mod tests {
             "{reason}"
         );
         assert!(reason.contains("916b7f42b3b3"), "{reason}");
+    }
+
+    /// A signalled exit (128 + signal, as try_wait reports it) is named, since
+    /// a VM killed by a signal leaves no message and no core to look at.
+    #[test]
+    fn boot_failure_names_the_fatal_signal() {
+        let r = boot_failure_reason(Some(128 + 11), None);
+        assert!(r.contains("SIGSEGV"), "got: {r}");
+        let r = boot_failure_reason(Some(128 + 6), Some("virgl: something broke\n"));
+        assert!(
+            r.contains("SIGABRT") && r.contains("virgl: something broke"),
+            "got: {r}"
+        );
+        // Plain exit codes keep their existing wording.
+        let r = boot_failure_reason(Some(3), None);
+        assert!(r.contains("exited (code 3)"), "got: {r}");
     }
 
     #[test]

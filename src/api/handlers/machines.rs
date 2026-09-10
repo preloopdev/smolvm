@@ -75,6 +75,8 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
     } else {
         record.pid
     };
+    let stats = pid.and_then(crate::process::process_stats);
+    let memory_stats = pid.and_then(crate::process::process_memory_stats);
     MachineInfo {
         name: name.to_string(),
         state: actual_state.to_string(),
@@ -82,14 +84,15 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         mem: record.mem,
         pid,
         mounts: record
-            .mounts
+            .host_mounts()
             .iter()
             .enumerate()
-            .map(|(i, (source, target, readonly))| MountInfo {
+            .map(|(i, mount)| MountInfo {
                 tag: HostMount::mount_tag(i),
-                source: source.clone(),
-                target: target.clone(),
-                readonly: *readonly,
+                source: mount.source.to_string_lossy().into_owned(),
+                target: mount.target.to_string_lossy().into_owned(),
+                readonly: mount.read_only,
+                staged: mount.staged,
             })
             .collect(),
         ports: record
@@ -114,9 +117,14 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         // when unset.
         storage_gb: Some(record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB)),
         overlay_gb: Some(record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB)),
+        block_io: record.block_io,
+        branchable: record.forkable_on_start(),
         forkable: record.forkable_on_start(),
+        parent_machine: record.golden.clone(),
+        cuda_branch_pool_size: record.cuda_fork_pool_size,
         cuda_fork_pool_size: record.cuda_fork_pool_size,
         cuda_vram_limit_mib: record.cuda_vram_limit_mib,
+        branchpoint_held: record.forkpoint_held,
         forkpoint_held: record.forkpoint_held,
         // Cumulative egress, read from the per-VM telemetry file the subprocess
         // flushes. Surfaced here so the control plane reads it from the machine
@@ -126,19 +134,22 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         // (user+system CPU time). Resets on restart — the control plane treats it
         // as a monotonic-with-resets counter and accumulates the durable total.
         // `None` when stopped (pid cleared) or the process vanished mid-sample.
-        cpu_seconds: pid
-            .and_then(crate::process::process_stats)
-            .map(|s| s.cpu_time_ns / 1_000_000_000),
+        cpu_seconds: stats.map(|s| s.cpu_time_ns / 1_000_000_000),
         // Same consumed CPU in milliseconds — sub-second precision so consumers
         // don't quantize a barely-busy process up to a whole second.
-        cpu_millis: pid
-            .and_then(crate::process::process_stats)
-            .map(|s| s.cpu_time_ns / 1_000_000),
+        cpu_millis: stats.map(|s| s.cpu_time_ns / 1_000_000),
         // Current RSS (MiB) of the VMM process — an instantaneous gauge the
         // control plane integrates over time for active-memory billing.
-        rss_mb: pid
-            .and_then(crate::process::process_stats)
-            .map(|s| s.rss_bytes / (1024 * 1024)),
+        rss_mb: stats.map(|s| s.rss_bytes / (1024 * 1024)),
+        pss_mb: memory_stats
+            .and_then(|s| s.pss_bytes)
+            .map(|v| v / (1024 * 1024)),
+        private_memory_mb: memory_stats
+            .and_then(|s| s.private_bytes)
+            .map(|v| v / (1024 * 1024)),
+        shared_memory_mapped_mb: memory_stats
+            .and_then(|s| s.shared_mapped_bytes)
+            .map(|v| v / (1024 * 1024)),
         // Actual used disk (sparse-image blocks) — a gauge for active-disk billing,
         // measured from the data dir regardless of whether the VMM is running.
         disk_used_mb: crate::agent::disk_used_mb(name),
@@ -309,15 +320,7 @@ pub async fn restore_portable_checkpoint(
 /// or during registry repair. Centralizes the record→entry conversion
 /// so the two branches don't drift.
 fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> MachineEntry {
-    let mounts = record
-        .mounts
-        .iter()
-        .map(|(s, t, ro)| MountSpec {
-            source: s.clone(),
-            target: t.clone(),
-            readonly: *ro,
-        })
-        .collect();
+    let mounts = record.host_mounts().iter().map(MountSpec::from).collect();
     let ports = record
         .ports
         .iter()
@@ -345,6 +348,43 @@ fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> Machin
         cuda_vram_limit_mib: record.cuda_vram_limit_mib,
         forkpoint_held: record.forkpoint_held,
     }
+}
+
+/// Reconcile both control-plane representations after a VM process is confirmed dead.
+///
+/// `ApiState` keeps a long-lived `AgentManager` whose open `vm.lock` file owns the
+/// per-machine flock, while SQLite is shared with out-of-process CLI commands. A CLI
+/// stop or an unexpected process exit can therefore make the database truthful while
+/// leaving the serve process's cached manager in `Running`. Callers must hold the
+/// machine lifecycle and fork-source locks and must have confirmed process exit before
+/// entering here; releasing the cached flock for a live process would permit a second
+/// VMM to start with the same disks.
+async fn reconcile_confirmed_stopped_machine(
+    state: &Arc<ApiState>,
+    name: &str,
+    explicitly_stopped: bool,
+) -> Result<VmRecord, ApiError> {
+    if let Ok(entry) = state.get_machine(name) {
+        entry.lock().manager.mark_stopped();
+    }
+
+    state
+        .update_vm(name, move |record| {
+            record.state = RecordState::Stopped;
+            record.pid = None;
+            record.pid_start_time = None;
+            if explicitly_stopped {
+                // An explicit stop must suppress the restart supervisor even when
+                // the process had already exited before this request arrived.
+                record.restart.user_stopped = true;
+            }
+        })
+        .await?
+        .ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "machine '{name}' disappeared from database while reconciling its stopped state"
+            ))
+        })
 }
 
 /// Attempt graceful shutdown, then force-terminate if still running.
@@ -1053,6 +1093,7 @@ pub async fn create_machine(
         cuda: Some(req.cuda || req.auto_graph),
         storage_gb: restored_storage_gb,
         overlay_gb: restored_overlay_gb,
+        block_io: req.block_io,
         allowed_cidrs: normalized_cidrs,
         allowed_hosts: restored_allowed_hosts,
         network_backend: restored_network_backend,
@@ -1337,6 +1378,10 @@ pub async fn start_machine(
     // spawn_blocking). Linux: the guarded detach/mount are no-ops.
     let lifecycle = state.lifecycle_lock(&name);
     let _guard = lifecycle.lock().await;
+    // Cross-process serialization with CLI/API fork preparation. Lifecycle
+    // locks cover this server instance; the flock also prevents a direct CLI
+    // fork from racing a restart and binding to a superseded VMM identity.
+    let _source_lock = acquire_fork_source_lock(name.clone()).await?;
 
     // Get VM record from database (off the reactor)
     let mut record = state
@@ -1405,6 +1450,7 @@ pub async fn start_machine(
         )));
     }
 
+    let mut recovered_unreachable = false;
     if resolved == RecordState::Unreachable {
         // Zombie: verified-kill the VMM and clear the DB record
         // before falling through to a clean fresh start. Any stale
@@ -1413,7 +1459,7 @@ pub async fn start_machine(
         // cannot be confirmed dead, refuse the start instead of
         // booting on top of it.
         let name_recover = name.clone();
-        tokio::task::spawn_blocking(move || {
+        recovered_unreachable = tokio::task::spawn_blocking(move || {
             crate::agent::state_probe::recover_if_unreachable(&name_recover)
         })
         .await
@@ -1423,6 +1469,27 @@ pub async fn start_machine(
                 "machine '{name}' is unreachable and zombie cleanup failed: {e}"
             ))
         })?;
+        if !recovered_unreachable {
+            // Reachability changed between the two probes. Do not release the
+            // cached manager's flock based on an observation that is no longer
+            // true, and do not risk launching a second VMM over a recovered one.
+            return Err(ApiError::Conflict(format!(
+                "machine '{name}' changed state while unreachable recovery was in progress; retry start"
+            )));
+        }
+    }
+
+    // A successful unreachable recovery, a Running record resolved Stopped by
+    // PID+agent probing, or a durable Stopped record written by an out-of-process
+    // CLI stop all prove that no VMM should still own this machine. Reconcile the
+    // serve process's cached manager before constructing a fresh manager below.
+    // Without this, the cached manager retains vm.lock and every restart wedges
+    // until the API server itself is restarted (issue #1124).
+    if recovered_unreachable
+        || (record.state == RecordState::Running && resolved == RecordState::Stopped)
+        || record.state == RecordState::Stopped
+    {
+        record = reconcile_confirmed_stopped_machine(&state, &name, false).await?;
     }
 
     if let Some(pool_size) = query.fork_pool_size {
@@ -1460,6 +1527,18 @@ pub async fn start_machine(
             .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
     }
 
+    // Like forkPoolSize above, an explicit forkable start is a durable launch
+    // property rather than a one-process hint. Persist it before registering
+    // the in-memory entry so the response is truthful and an API-service
+    // restart preserves the machine's ability to fork.
+    if query.forkable && !record.forkable {
+        record.forkable = true;
+        state
+            .update_vm(&name, |r| r.forkable = true)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+    }
+
     let mounts = record.host_mounts();
     let ports = record.port_mappings();
     let resources = record.vm_resources();
@@ -1477,6 +1556,7 @@ pub async fn start_machine(
     let source_smolmachine = record.source_smolmachine.clone();
     let dns_filter_hosts = record.dns_filter_hosts.clone();
     let record_golden = record.golden.clone();
+    let record_fork_overlay_owner = record.fork_overlay_owner.clone();
     let cuda_fork_pool_size = record.cuda_fork_pool_size;
     let cuda_vram_limit_mib = record.cuda_vram_limit_mib;
     let restore_record = record.clone();
@@ -1497,8 +1577,11 @@ pub async fn start_machine(
         // explicitly — without it the clone claims a fresh uid that cannot
         // traverse the golden's 0700 dir to open its copy-on-write disk
         // backing, and the boot dies configuring virtio-blk.
-        if let Some(ref g) = record_golden {
-            features.uid_share_dir = Some(crate::agent::vm_data_dir(g));
+        if let Some(owner) = record_fork_overlay_owner
+            .as_deref()
+            .or(record_golden.as_deref())
+        {
+            features.uid_share_dir = Some(crate::agent::vm_data_dir(owner));
         }
         // Forkable start: memfd-back guest RAM and expose a control socket at the
         // machine's known path so it can later be forked via the fork endpoint.
@@ -1680,7 +1763,9 @@ pub async fn start_machine(
 fn classify_fork_error(e: SmolvmError) -> ApiError {
     let msg = e.to_string();
     let lc = msg.to_ascii_lowercase();
-    if lc.contains("cuda fork descendants") || lc.contains("fork lineage would exceed") {
+    if lc.contains("branch needs at least") && lc.contains("effective host headroom") {
+        ApiError::Unavailable(msg)
+    } else if lc.contains("cuda fork descendants") || lc.contains("fork lineage would exceed") {
         ApiError::BadRequest(msg)
     } else if lc.contains("already exists")
         || lc.contains("not running forkable")
@@ -1732,6 +1817,31 @@ pub async fn fork_machine(
     Json(req): Json<ForkRequest>,
 ) -> Result<Json<MachineInfo>, ApiError> {
     fork_machine_inner(state, golden, req).await.map(Json)
+}
+
+/// Branch a running, branchable source machine into a new independent child.
+#[utoipa::path(
+    post,
+    path = "/api/v1/machines/{name}/branches",
+    tag = "Machines",
+    params(
+        ("name" = String, Path, description = "Branch source machine name")
+    ),
+    request_body = ForkRequest,
+    responses(
+        (status = 200, description = "Child branched and running", body = MachineInfo),
+        (status = 400, description = "Invalid or unsupported branch request", body = ApiErrorResponse),
+        (status = 404, description = "Source machine not found", body = ApiErrorResponse),
+        (status = 409, description = "Source is not branchable, or child name already exists", body = ApiErrorResponse),
+        (status = 500, description = "Branch failed", body = ApiErrorResponse)
+    )
+)]
+pub async fn branch_machine(
+    State(state): State<Arc<ApiState>>,
+    Path(source): Path<String>,
+    Json(req): Json<ForkRequest>,
+) -> Result<Json<MachineInfo>, ApiError> {
+    fork_machine_inner(state, source, req).await.map(Json)
 }
 
 /// Internal fork entry point shared by the HTTP handler and pool reconciler.
@@ -1952,6 +2062,7 @@ pub(crate) async fn fork_held_machines_inner(
                 &golden_for_prep,
                 &specs,
                 retained_snapshot.as_ref(),
+                true,
                 true,
             )
         })
@@ -2176,7 +2287,7 @@ async fn boot_prepared_fork_inner(
         let _ = cuda_worker_ready_timeout;
         if wait_ready && !hold {
             crate::agent::fork::fail_closed_on_rejuvenation(
-                crate::agent::fork::release_forkpoint(&clone_b),
+                crate::agent::fork::release_forkpoint(&clone_b, &fork_env),
                 teardown,
             )
             .map_err(|e| format!("forkpoint release failed: {e}"))?;
@@ -2329,13 +2440,17 @@ pub async fn stop_machine(
 ) -> Result<Json<MachineInfo>, ApiError> {
     // Hold the per-machine lifecycle lock across the whole stop so the layers
     // volume detach below cannot race a concurrent start's acquire+mount+launch
-    // (review finding #3). Acquired before the DB read and actual_state() probe
+    // (review finding #3). Acquired before the DB read and liveness probe
     // so the liveness check and the detach act on the same held lock — without
     // it, stop could decide "running" off a snapshot a concurrent start has
     // already superseded, then detach a volume that start just mounted. Outermost
     // lock; the entry mutex is not taken here. Linux: detach is a no-op.
     let lifecycle = state.lifecycle_lock(&name);
     let _guard = lifecycle.lock().await;
+    // Cross-process serialization with CLI/API fork preparation. Lifecycle
+    // locks cover this server instance; the flock also prevents a direct CLI
+    // fork from racing source shutdown between checkpoint and clone commit.
+    let _source_lock = acquire_fork_source_lock(name.clone()).await?;
 
     // Get VM record from database (off the reactor)
     let record = state
@@ -2343,13 +2458,19 @@ pub async fn stop_machine(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
 
-    // A frozen fork base must outlive its clones: they CoW-map its guest RAM
-    // (memfd) and CoW-back their disks onto its disks, so stopping it — which
-    // kills the VMM and frees the memfd — corrupts every live clone. `actual_state`
-    // does not resolve the on-the-fly `Frozen` state, so a golden with clones
-    // looks `Running` here and would be torn down. Refuse, mirroring `delete` and
-    // the CLI stop guard.
-    {
+    // Resolve the control-plane state, not only PID liveness. A non-Linux fork
+    // base is genuinely Frozen and its source VMM owns the RAM backing, so it
+    // must outlive its clones. A Linux fork-and-continue source is Running:
+    // each clone has opened its RAM generation and its disk bases are retained
+    // on disk, so stopping that source is safe and must remain possible.
+    let name_probe = name.clone();
+    let record_probe = record.clone();
+    let resolved = tokio::task::spawn_blocking(move || {
+        crate::agent::state_probe::resolve_state(&name_probe, &record_probe)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("task error: {e}")))?;
+    if resolved == RecordState::Frozen {
         let db = state.db().clone();
         let golden = name.clone();
         let clones = tokio::task::spawn_blocking(move || db.dependent_clones(&golden))
@@ -2367,9 +2488,12 @@ pub async fn stop_machine(
         }
     }
 
-    // Check state
-    let actual_state = record.actual_state();
-    if actual_state != RecordState::Running {
+    // An unreachable process is still live and must go through the verified
+    // shutdown path below. Frozen-without-clones is also safe to terminate.
+    if !matches!(
+        resolved,
+        RecordState::Running | RecordState::Frozen | RecordState::Unreachable
+    ) {
         // Not running. If a prior start mounted the layers volume but the VM
         // then failed to boot (or the server crashed while running), the volume
         // could still be mounted — detach it so a stopped machine never holds a
@@ -2387,7 +2511,35 @@ pub async fn stop_machine(
             .await
             .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
         }
+        // The process is confirmed dead. This also handles an out-of-process
+        // CLI stop: SQLite already says Stopped, but the serve process may still
+        // cache the manager that owns vm.lock. Reconcile before the idempotent
+        // return so either this request or a later start repairs the lifecycle.
+        let record = if record.state == RecordState::Running || record.state == RecordState::Stopped
+        {
+            reconcile_confirmed_stopped_machine(&state, &name, true).await?
+        } else {
+            record
+        };
         return Ok(Json(record_to_info(&name, &record)));
+    }
+
+    // A staged mount makes its guest-local copy authoritative while the VM is
+    // running. Flush it before graceful shutdown; if synchronization fails,
+    // leave the VM alive so the caller can retry instead of silently losing
+    // the only current copy. An unreachable agent cannot be synchronized, but
+    // its persistent storage disk remains available for a later restart.
+    if !record.staged_mounts.is_empty() && resolved != RecordState::Unreachable {
+        let sync_name = name.clone();
+        let sync_record = record.clone();
+        tokio::task::spawn_blocking(move || {
+            let manager = AgentManager::for_vm(&sync_name)?;
+            let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
+            crate::staged_mount::sync_staged_mounts(&sync_record, &mut client)
+        })
+        .await
+        .map_err(|error| ApiError::internal(format!("task error: {error}")))?
+        .map_err(|error| ApiError::internal(format!("sync staged mounts: {error}")))?;
     }
 
     // Get PID and start time from database record - this is the source of truth
@@ -2433,31 +2585,55 @@ pub async fn stop_machine(
         )));
     }
 
-    // The VM process is confirmed dead, but the long-lived registry manager for
-    // this machine still holds the per-VM `vm.lock` flock in this serve process.
-    // Release it so a subsequent start can re-acquire the lock; otherwise start
-    // fails with "another process is already starting or running this VM".
-    if let Ok(entry) = state.get_machine(&name) {
-        entry.lock().manager.mark_stopped();
+    // Persist stopped state and release the long-lived registry manager's flock
+    // through the same path used for already-dead and out-of-process stops.
+    let record = reconcile_confirmed_stopped_machine(&state, &name, true).await?;
+
+    Ok(Json(record_to_info(&name, &record)))
+}
+
+/// Synchronize guest-local staged mounts without stopping the machine.
+#[utoipa::path(
+    post,
+    path = "/api/v1/machines/{name}/sync",
+    tag = "Machines",
+    params(("name" = String, Path, description = "Machine name")),
+    responses(
+        (status = 200, description = "Staged mounts synchronized", body = MachineInfo),
+        (status = 404, description = "Machine not found", body = ApiErrorResponse),
+        (status = 409, description = "Machine is not running", body = ApiErrorResponse)
+    )
+)]
+pub async fn sync_machine(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+) -> Result<Json<MachineInfo>, ApiError> {
+    let lifecycle = state.lifecycle_lock(&name);
+    let _guard = lifecycle.lock().await;
+    let _source_lock = acquire_fork_source_lock(name.clone()).await?;
+    let record = state
+        .lookup_vm(&name)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("machine '{name}' not found")))?;
+    if record.staged_mounts.is_empty() {
+        return Ok(Json(record_to_info(&name, &record)));
+    }
+    if crate::agent::state_probe::resolve_state(&name, &record) != RecordState::Running {
+        return Err(ApiError::Conflict(format!(
+            "machine '{name}' must be running to synchronize staged mounts"
+        )));
     }
 
-    // Persist state to database and get updated record — only after confirmed stop
-    let record = state
-        .update_vm(&name, |r| {
-            r.state = RecordState::Stopped;
-            r.pid = None;
-            r.pid_start_time = None;
-            // Record the explicit stop so the restart supervisor does not
-            // resurrect this machine (any policy) until an explicit start.
-            r.restart.user_stopped = true;
-        })
-        .await?
-        .ok_or_else(|| {
-            ApiError::NotFound(format!(
-                "machine '{}' disappeared from database during stop",
-                name
-            ))
-        })?;
+    let sync_name = name.clone();
+    let sync_record = record.clone();
+    tokio::task::spawn_blocking(move || {
+        let manager = AgentManager::for_vm(&sync_name)?;
+        let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
+        crate::staged_mount::sync_staged_mounts(&sync_record, &mut client)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("task error: {error}")))?
+    .map_err(|error| ApiError::internal(error.to_string()))?;
 
     Ok(Json(record_to_info(&name, &record)))
 }
@@ -2468,7 +2644,7 @@ pub async fn stop_machine(
 /// longer a side-effect of process shutdown — it's a deliberate decommission step.
 /// The control plane (autoscaler scale-in) calls this BEFORE terminating the host
 /// so VMs flush cleanly. Control-only by construction: the serve listener is mTLS-
-/// gated, and the loopback door is localhost. See docs/lossless-serve-restart.md.
+/// gated, and the loopback door is localhost.
 pub async fn drain_node(State(state): State<Arc<ApiState>>) -> axum::http::StatusCode {
     tracing::info!("drain requested via API (node decommission)");
     drain_machines(&state).await;
@@ -2482,11 +2658,10 @@ pub async fn drain_node(State(state): State<Arc<ApiState>>) -> axum::http::Statu
 /// the control plane can reschedule. Best-effort, concurrent, and bounded so it
 /// fits inside the host's termination grace period.
 pub async fn drain_machines(state: &Arc<ApiState>) {
-    let running: Vec<(String, Option<i32>, Option<u64>)> = match state.list_vm_records().await {
+    let running: Vec<(String, VmRecord)> = match state.list_vm_records().await {
         Ok(vms) => vms
             .into_iter()
             .filter(|(_, r)| r.actual_state() == RecordState::Running && r.is_process_alive())
-            .map(|(name, r)| (name, r.pid, r.pid_start_time))
             .collect(),
         Err(e) => {
             tracing::error!(error = ?e, "drain: failed to list machines");
@@ -2502,37 +2677,62 @@ pub async fn drain_machines(state: &Arc<ApiState>) {
     );
 
     let mut handles = Vec::with_capacity(running.len());
-    for (name, pid, pid_start_time) in running {
+    for (name, record) in running {
         let state = state.clone();
         handles.push(tokio::spawn(async move {
             let name_for_kill = name.clone();
             let entry = state.get_machine(&name).ok();
             let stopped = tokio::task::spawn_blocking(move || {
+                let _source_lock = match crate::agent::fork::lock_fork_source(&name_for_kill) {
+                    Ok(lock) => lock,
+                    Err(error) => {
+                        tracing::warn!(machine = %name_for_kill, error = %error, "drain: failed to lock machine");
+                        return false;
+                    }
+                };
+                if !record.staged_mounts.is_empty() {
+                    let sync_result = AgentManager::for_vm(&name_for_kill).and_then(|manager| {
+                        let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
+                        crate::staged_mount::sync_staged_mounts(&record, &mut client)
+                    });
+                    if let Err(error) = sync_result {
+                        tracing::warn!(machine = %name_for_kill, error = %error, "drain: staged mount sync failed; leaving machine running");
+                        return false;
+                    }
+                }
                 // Prefer the registered manager (holds the flock); fall back to a
                 // PID-verified signal — same path as the stop handler.
                 let via_manager = entry
                     .as_ref()
                     .map(|e| e.lock().manager.stop().is_ok())
                     .unwrap_or(false);
-                via_manager || shutdown_machine_process(&name_for_kill, pid, pid_start_time, true)
+                via_manager
+                    || shutdown_machine_process(
+                        &name_for_kill,
+                        record.pid,
+                        record.pid_start_time,
+                        true,
+                    )
             })
             .await
             .unwrap_or(false);
-            if let Ok(entry) = state.get_machine(&name) {
-                entry.lock().manager.mark_stopped();
+            if stopped {
+                if let Ok(entry) = state.get_machine(&name) {
+                    entry.lock().manager.mark_stopped();
+                }
+                let _ = state
+                    .update_vm(&name, |r| {
+                        r.state = RecordState::Stopped;
+                        r.pid = None;
+                        r.pid_start_time = None;
+                        // A drain is a deliberate decommission: mark the machine
+                        // user-stopped so the restart supervisor does not resurrect it
+                        // in the window before the host is terminated (or if drain is
+                        // used standalone). An explicit start elsewhere clears this.
+                        r.restart.user_stopped = true;
+                    })
+                    .await;
             }
-            let _ = state
-                .update_vm(&name, |r| {
-                    r.state = RecordState::Stopped;
-                    r.pid = None;
-                    r.pid_start_time = None;
-                    // A drain is a deliberate decommission: mark the machine
-                    // user-stopped so the restart supervisor does not resurrect it
-                    // in the window before the host is terminated (or if drain is
-                    // used standalone). An explicit start elsewhere clears this.
-                    r.restart.user_stopped = true;
-                })
-                .await;
             tracing::info!(machine = %name, stopped, "drain: machine stopped");
         }));
     }
@@ -2636,6 +2836,32 @@ pub(crate) async fn delete_one(
         }
     }
 
+    // A running staged mount owns state that is newer than its host source.
+    // Flush it before delete; on failure leave both the VM and its data dir
+    // intact so the caller can repair and retry.
+    if !record.staged_mounts.is_empty() {
+        match crate::agent::state_probe::resolve_state(&name, &record) {
+            RecordState::Running => {
+                let sync_name = name.clone();
+                let sync_record = record.clone();
+                tokio::task::spawn_blocking(move || {
+                    let manager = AgentManager::for_vm(&sync_name)?;
+                    let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
+                    crate::staged_mount::sync_staged_mounts(&sync_record, &mut client)
+                })
+                .await
+                .map_err(|error| ApiError::internal(format!("task error: {error}")))?
+                .map_err(|error| ApiError::internal(format!("sync staged mounts: {error}")))?;
+            }
+            RecordState::Unreachable => {
+                return Err(ApiError::Conflict(format!(
+                    "machine '{name}' has unsynchronized staged mounts but its agent is unreachable"
+                )));
+            }
+            _ => {}
+        }
+    }
+
     // Get PID and start time from database record
     let pid = record.pid;
     let pid_start_time = record.pid_start_time;
@@ -2693,6 +2919,28 @@ pub(crate) async fn delete_one(
         }
     }
 
+    // Free the machine's data BEFORE the registry write, not after — the same
+    // order `cli::vm_common::remove_vm_data_and_record` uses for the CLI path.
+    //
+    // The registry lives on a filesystem an operator may have sized to share
+    // with VM storage, and a workload that fills it leaves the database with no
+    // room to commit. Removing the record first then needs space the workload
+    // has already taken: the delete fails, the machine is stopped but
+    // undeletable, and every retry hits the same wall. Releasing the disk images
+    // first makes the delete self-financing — it frees far more than the record
+    // removal needs, so cleanup still works on a full disk.
+    let data_dir = vm_data_dir(&name);
+    if data_dir.exists() {
+        // Release this VM's per-VM uid (if any) back to the allocator before the
+        // dir holding its `.vm-uid` record is removed, so a high-churn cloud node
+        // doesn't leak the uid range. A fork clone has no uid of its own (it
+        // shares its golden's). See process::free_vm_uid.
+        crate::process::free_vm_uid(&crate::agent::vm_uid_registry_dir(), &data_dir);
+        if let Err(e) = std::fs::remove_dir_all(&data_dir) {
+            tracing::warn!(error = %e, "failed to remove VM data directory: {}", data_dir.display());
+        }
+    }
+
     // Remove from registry (in-memory + database) in a blocking task: the DB
     // delete is synchronous disk I/O and must not run on an async worker thread,
     // where it would starve the small per-node reactor under delete churn.
@@ -2722,16 +2970,21 @@ pub(crate) async fn delete_one(
     .await
     .map_err(|e| ApiError::internal(format!("task error: {}", e)))??;
 
-    // Remove VM data directory (disk images, sockets, etc.)
-    let data_dir = vm_data_dir(&name);
-    if data_dir.exists() {
-        // Release this VM's per-VM uid (if any) back to the allocator before the
-        // dir holding its `.vm-uid` record is removed, so a high-churn cloud node
-        // doesn't leak the uid range. A fork clone has no uid of its own (it
-        // shares its golden's). See process::free_vm_uid.
-        crate::process::free_vm_uid(&crate::agent::vm_uid_registry_dir(), &data_dir);
-        if let Err(e) = std::fs::remove_dir_all(&data_dir) {
-            tracing::warn!(error = %e, "failed to remove VM data directory: {}", data_dir.display());
+    if let Some(parent) = record.golden.clone() {
+        let db = state.db().clone();
+        let parent_for_log = parent.clone();
+        let cleanup = tokio::task::spawn_blocking(move || {
+            crate::agent::fork::collect_parent_generations_after_child_delete(&db, &parent)
+        })
+        .await;
+        match cleanup {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(parent = %parent_for_log, %error, "could not collect unreferenced fork generation")
+            }
+            Err(error) => {
+                tracing::warn!(parent = %parent_for_log, %error, "fork-generation cleanup task failed")
+            }
         }
     }
 
@@ -3437,6 +3690,10 @@ mod tests {
         // An unrelated fork failure stays a 500.
         let e = SmolvmError::agent("fork", "disk write failed");
         assert!(matches!(classify_fork_error(e), ApiError::Internal(_)));
+        let e = SmolvmError::vm_creation(
+            "branch needs at least 2048 MiB of effective host headroom for 8 children, but only 1024 MiB is available",
+        );
+        assert!(matches!(classify_fork_error(e), ApiError::Unavailable(_)));
     }
 
     #[test]
@@ -3506,6 +3763,8 @@ mod tests {
         );
         record.gpu = Some(true);
         record.cuda = true;
+        record.forkable = true;
+        record.golden = Some("parent-vm".to_string());
 
         let info = record_to_info("test-vm", &record);
 
@@ -3518,6 +3777,11 @@ mod tests {
         assert!(!info.network);
         assert!(info.gpu);
         assert!(info.cuda);
+        assert!(info.branchable);
+        assert!(info.forkable);
+        assert_eq!(info.parent_machine.as_deref(), Some("parent-vm"));
+        assert_eq!(info.cuda_branch_pool_size, info.cuda_fork_pool_size);
+        assert_eq!(info.branchpoint_held, info.forkpoint_held);
         assert!(info.pid.is_none());
     }
 
@@ -3625,6 +3889,7 @@ mod tests {
             docker_socket: false,
             storage_gb: None,
             overlay_gb: None,
+            block_io: None,
             allowed_cidrs: None,
             allowed_hosts: None,
             network_backend: None,

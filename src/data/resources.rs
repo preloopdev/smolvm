@@ -20,6 +20,33 @@ pub const DEFAULT_GPU_VRAM_MIB: u32 = 4096;
 
 use crate::network::NetworkBackend;
 
+/// Host engine used to service guest block-device requests.
+///
+/// Synchronous I/O is the compatibility default and has no asynchronous
+/// setup cost. The asynchronous engine is an explicit Linux optimization that
+/// overlaps queued raw-disk reads through a restricted io_uring; buffered
+/// writes stay inline.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    clap::ValueEnum,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum BlockIoEngine {
+    /// Service one request at a time on the virtio block worker.
+    #[default]
+    Sync,
+    /// Submit queued raw-disk reads through a restricted Linux io_uring.
+    Async,
+}
+
 /// Resources available to a micro vm.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VmResources {
@@ -52,6 +79,9 @@ pub struct VmResources {
     pub storage_gib: Option<u64>,
     /// Overlay disk size in GiB (None = default 10 GiB).
     pub overlay_gib: Option<u64>,
+    /// Host block I/O engine. Defaults to the historical synchronous path.
+    #[serde(default)]
+    pub block_io: BlockIoEngine,
     /// Allowed egress CIDR ranges. None = unrestricted, Some([]) = deny all.
     #[serde(default)]
     pub allowed_cidrs: Option<Vec<String>>,
@@ -82,6 +112,13 @@ impl VmResources {
     /// Validate resource values before starting a VM. Returns an error with
     /// a clear message for values that would cause an opaque hypervisor failure.
     pub fn validate(&self) -> Result<(), crate::Error> {
+        #[cfg(not(target_os = "linux"))]
+        if self.block_io == BlockIoEngine::Async {
+            return Err(crate::Error::config(
+                "validate resources",
+                "async block I/O is currently supported on Linux hosts only; use --block-io sync",
+            ));
+        }
         if self.cpus == 0 {
             return Err(crate::Error::config(
                 "validate resources",
@@ -136,6 +173,7 @@ impl Default for VmResources {
             rosetta: false,
             storage_gib: None,
             overlay_gib: None,
+            block_io: BlockIoEngine::Sync,
             allowed_cidrs: None,
             dns: None,
             network_name: None,

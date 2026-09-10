@@ -39,6 +39,10 @@ pub struct FromVmExportOptions {
     /// For artifact-sourced machines: rebuild base layers from `vm.image`
     /// (re-pull from the registry) instead of preserving imported layers.
     pub rebase_from_image: bool,
+    /// Also capture the machine's `/workspace` so a machine made from the pack
+    /// starts with those files. It lives on the storage disk, which container
+    /// packs otherwise never carry, so without this a pack silently loses it.
+    pub include_workspace: bool,
 }
 
 /// What the export decided about the machine, for the caller's manifest.
@@ -59,6 +63,11 @@ pub struct FromVmAssets {
     /// that path already copied the source manifest's env into the record, so the
     /// machine's own env is the complete set.
     pub image_env: Vec<String>,
+    /// The image's OCI `USER`, for the same reason as `image_env`: a running
+    /// machine takes it from the image config at exec time, and a pack has no
+    /// image config left, so the manifest has to carry who the workload runs
+    /// as when the machine itself named nobody.
+    pub image_user: Option<String>,
     /// Total bytes of the layer tars collected for this pack.
     ///
     /// Recorded as the manifest's `image_size` so the run-time storage
@@ -66,6 +75,20 @@ pub struct FromVmAssets {
     /// to the minimal default disk, which cannot hold the layers when the
     /// guest has to unpack staged tars onto it.
     pub layer_bytes: u64,
+}
+
+/// The persistent overlay a machine's rootfs writes live in. A branched or
+/// checkpoint-restored machine keeps its source's overlay rather than getting
+/// one named after itself, so the directory is a property of lineage, not of
+/// the machine's current name. Every other reader resolves it this way; export
+/// must too, or a restored machine flattens an empty overlay and silently
+/// loses every rootfs change made through exec.
+pub fn export_overlay_owner(vm_name: &str, vm: &VmRecord) -> String {
+    crate::workload::persistent_overlay_owner_with_lineage(
+        vm_name,
+        vm.golden.as_deref(),
+        vm.fork_overlay_owner.as_deref(),
+    )
 }
 
 /// Collect a stopped machine's pack assets into `collector` and report the
@@ -80,6 +103,7 @@ pub fn collect_from_vm_assets(
     staging_dir: &Path,
     opts: &FromVmExportOptions,
 ) -> crate::Result<FromVmAssets> {
+    let overlay_owner = export_overlay_owner(vm_name, vm);
     // A fork clone's disks are CoW qcow2 overlays that only the fork/resume
     // machinery can assemble — the export helper cold-boots them and libkrun
     // rejects the stack with an opaque -22 EINVAL (same class as clone
@@ -116,14 +140,17 @@ pub fn collect_from_vm_assets(
     // machine already carries the source manifest's env in its own record, and a
     // bare machine has no image at all.
     let mut image_env: Vec<String> = Vec::new();
+    let mut image_user: Option<String> = None;
 
     if is_artifact_sourced && !opts.rebase_from_image {
         export_flattened_from_artifact_sourced(
             collector,
             vm_name,
+            &overlay_owner,
             &vm_dir,
             staging_dir,
             vm.source_smolmachine.as_deref(),
+            opts.include_workspace,
         )?;
     } else if is_image_based {
         let image = vm.image.clone().unwrap();
@@ -137,10 +164,23 @@ pub fn collect_from_vm_assets(
             // reachable: an archive was flattened onto the machine's own storage
             // disk at boot, and a rootfs dir is still the host directory the
             // machine boots from. Either can be the lower layer.
-            export_flattened_from_local_image(collector, vm_name, &vm_dir, &image)?;
+            export_flattened_from_local_image(
+                collector,
+                vm_name,
+                &overlay_owner,
+                &vm_dir,
+                &image,
+                opts.include_workspace,
+            )?;
         } else {
-            image_env =
-                export_flattened_from_registry_image(collector, vm_name, &vm_dir, &image, opts)?;
+            (image_env, image_user) = export_flattened_from_registry_image(
+                collector,
+                vm_name,
+                &overlay_owner,
+                &vm_dir,
+                &image,
+                opts,
+            )?;
         }
     } else {
         // Bare VM: its state is the rootfs overlay disk. VM-mode restores boot
@@ -187,6 +227,7 @@ pub fn collect_from_vm_assets(
         },
         image: vm.image.clone(),
         image_env,
+        image_user,
         layer_bytes: collector.staged_layer_bytes(),
     })
 }
@@ -205,14 +246,19 @@ pub fn seed_manifest_from_vm(manifest: &mut PackManifest, vm: &VmRecord, assets:
     manifest.network = vm.network;
     manifest.gpu = vm.gpu.unwrap_or(false);
     manifest.cuda = vm.cuda;
-    manifest.entrypoint = if !vm.entrypoint.is_empty() {
-        vm.entrypoint.clone()
-    } else {
-        vec!["/bin/sh".to_string()]
-    };
+    // Carry the record's (entrypoint, cmd) through as-is. An empty entrypoint
+    // is meaningful: a machine created with trailing args stores them as `cmd`
+    // with no entrypoint, and an image machine with neither lets the agent use
+    // the image's own ENTRYPOINT+CMD. Synthesising `/bin/sh` here turned the
+    // former into `/bin/sh sh -c ...` (a shell trying to run a script named
+    // `sh`) and the latter into a bare shell instead of the image's service.
+    manifest.entrypoint = vm.entrypoint.clone();
     manifest.cmd = vm.cmd.clone();
     manifest.env = merge_env(&assets.image_env, &vm.env);
     manifest.workdir = vm.workdir.clone();
+    // The account the workload runs as, resolved the way a running machine
+    // resolves it: the machine's own user wins, else the image's USER.
+    manifest.user = vm.user.clone().or_else(|| assets.image_user.clone());
     manifest.secret_refs = vm.secret_refs.clone();
 }
 
@@ -280,7 +326,7 @@ impl ExportVm {
         let data_dir = vm_data_dir(&scratch_name);
 
         println!("Starting agent VM to export machine state...");
-        let manager = AgentManager::for_vm(&scratch_name)?;
+        let manager = AgentManager::for_vm_with_sizes(&scratch_name, None, None)?;
         let features = LaunchFeatures {
             extra_disks: vec![(storage_disk, false, storage_fmt)],
             packed_layers_dir,
@@ -306,6 +352,7 @@ impl ExportVm {
                 rosetta: false,
                 storage_gib: None,
                 overlay_gib: None,
+                block_io: Default::default(),
                 allowed_cidrs: None,
                 network_name: None,
             },
@@ -365,10 +412,11 @@ impl Drop for ExportVm {
 fn export_flattened_from_registry_image(
     collector: &mut AssetCollector,
     vm_name: &str,
+    overlay_owner: &str,
     vm_dir: &Path,
     image: &str,
     opts: &FromVmExportOptions,
-) -> crate::Result<Vec<String>> {
+) -> crate::Result<(Vec<String>, Option<String>)> {
     let export_vm = ExportVm::start(vm_name, vm_dir, None, true)?;
     let mut client = export_vm.connect()?;
     export_vm.mount_source_storage(&mut client)?;
@@ -392,8 +440,14 @@ fn export_flattened_from_registry_image(
         })
         .collect();
 
-    flatten_and_export(collector, &mut client, vm_name, &lowers)?;
-    Ok(image_info.env)
+    flatten_and_export(
+        collector,
+        &mut client,
+        overlay_owner,
+        &lowers,
+        opts.include_workspace,
+    )?;
+    Ok((image_info.env, image_info.user))
 }
 
 /// Artifact-sourced machine: its extracted layer dirs live in the host-side
@@ -419,8 +473,10 @@ fn export_flattened_from_registry_image(
 fn export_flattened_from_local_image(
     collector: &mut AssetCollector,
     vm_name: &str,
+    overlay_owner: &str,
     vm_dir: &Path,
     image: &str,
+    include_workspace: bool,
 ) -> crate::Result<()> {
     let host_dir = crate::data::image_source::packed_layers_dir_for_ref(image);
     let is_dir_source = image.starts_with("local-dir:");
@@ -477,7 +533,13 @@ fn export_flattened_from_local_image(
         ));
     }
 
-    flatten_and_export(collector, &mut client, vm_name, &[dst])
+    flatten_and_export(
+        collector,
+        &mut client,
+        overlay_owner,
+        &[dst],
+        include_workspace,
+    )
 }
 
 /// The flattened rootfs of a local *archive* image on the source machine's
@@ -532,9 +594,11 @@ fn locate_flattened_archive_rootfs(
 fn export_flattened_from_artifact_sourced(
     collector: &mut AssetCollector,
     vm_name: &str,
+    overlay_owner: &str,
     vm_dir: &Path,
     _staging_dir: &Path,
     source_smolmachine: Option<&str>,
+    include_workspace: bool,
 ) -> crate::Result<()> {
     let cache_dir = machine_layers_cache_dir(vm_name);
     let pack_content_dir = read_shared_pack_pointer(&cache_dir).unwrap_or(cache_dir.clone());
@@ -612,7 +676,13 @@ fn export_flattened_from_artifact_sourced(
         lowers.push(dst);
     }
 
-    flatten_and_export(collector, &mut client, vm_name, &lowers)
+    flatten_and_export(
+        collector,
+        &mut client,
+        overlay_owner,
+        &lowers,
+        include_workspace,
+    )
 }
 
 /// The cached layers of an imported pack, bottom -> top, as paths relative to
@@ -667,8 +737,9 @@ fn ordered_cached_layer_ids(pack_content_dir: &Path) -> Option<Vec<String>> {
 fn flatten_and_export(
     collector: &mut AssetCollector,
     client: &mut AgentClient,
-    vm_name: &str,
+    overlay_owner: &str,
     lowers: &[String],
+    include_workspace: bool,
 ) -> crate::Result<()> {
     if lowers.is_empty() {
         return Err(Error::agent("flatten layers", "no layers to flatten"));
@@ -679,7 +750,7 @@ fn flatten_and_export(
     // reversed — leaving it as-is makes the base layer win every conflict.
     // The agent drops the overlay if the machine never wrote to it, so it needs
     // no probe from here.
-    let upper = format!("/mnt/source-storage/overlays/persistent-{}/upper", vm_name);
+    let upper = format!("/mnt/source-storage/overlays/persistent-{overlay_owner}/upper");
     let mut stack: Vec<String> = vec![upper];
     stack.extend(lowers.iter().rev().cloned());
 
@@ -738,6 +809,63 @@ fn flatten_and_export(
         .register_layer(&digest)
         .map_err(|e| Error::agent("register flattened layer", e.to_string()))?;
     println!("  Flattened layer: {} bytes", total);
+    if include_workspace {
+        export_workspace_seed(collector, client)?;
+    }
+    Ok(())
+}
+
+/// Capture the source machine's `/workspace` as the pack's workspace seed.
+///
+/// The flattened layer above is the container's root filesystem; `/workspace`
+/// is a directory on the machine's storage disk, mounted at
+/// `/mnt/source-storage` in the helper, and is not part of any layer. Same
+/// mechanics as the layer: the agent tars it in the guest (so ownership is
+/// exactly what the machine had) and the host streams the result to disk. An
+/// empty workspace records nothing.
+fn export_workspace_seed(
+    collector: &mut AssetCollector,
+    client: &mut AgentClient,
+) -> crate::Result<()> {
+    const GUEST_WORKSPACE: &str = "/mnt/source-storage/workspace";
+    const GUEST_TAR: &str = "/storage/workspace-seed.tar";
+    let listing = client
+        .vm_exec(
+            vec![
+                "sh".into(),
+                "-c".into(),
+                format!("find {GUEST_WORKSPACE} -mindepth 1 -print -quit 2>/dev/null"),
+            ],
+            vec![],
+            None,
+            None,
+            None,
+        )
+        .map_err(|e| Error::agent("inspect workspace", e.to_string()))?;
+    if String::from_utf8_lossy(&listing.1).trim().is_empty() {
+        return Ok(());
+    }
+    println!("Capturing /workspace...");
+    client.flatten_layers(&[GUEST_WORKSPACE.to_string()], GUEST_TAR)?;
+    let tmp_file = collector
+        .layer_staging_path(&format!("sha256:{}", "0".repeat(64)))
+        .with_file_name("workspace-seed.tmp");
+    let total = client
+        .read_file_to_path_capped(
+            GUEST_TAR,
+            &tmp_file,
+            crate::agent::pack_export_max_total(),
+            |_| {},
+        )
+        .map_err(|e| Error::agent("export workspace", e.to_string()))?;
+    if total == 0 {
+        let _ = std::fs::remove_file(&tmp_file);
+        return Ok(());
+    }
+    collector
+        .add_workspace_seed(&tmp_file)
+        .map_err(|e| Error::agent("register workspace seed", e.to_string()))?;
+    println!("  Workspace seed: {} bytes", total);
     Ok(())
 }
 
@@ -770,7 +898,7 @@ fn flatten_qcow2_to_raw(qcow2_path: &Path, dest_raw: &Path) -> crate::Result<()>
     );
     let data_dir = vm_data_dir(&scratch_name);
     println!("Flattening qcow2 overlay to raw...");
-    let manager = AgentManager::for_vm(&scratch_name)?;
+    let manager = AgentManager::for_vm_with_sizes(&scratch_name, None, None)?;
     let features = LaunchFeatures {
         extra_disks: vec![
             (qcow2_path.to_path_buf(), true, DiskFormat::Qcow2),
@@ -793,6 +921,7 @@ fn flatten_qcow2_to_raw(qcow2_path: &Path, dest_raw: &Path) -> crate::Result<()>
             rosetta: false,
             storage_gib: None,
             overlay_gib: None,
+            block_io: Default::default(),
             allowed_cidrs: None,
             network_name: None,
         },
@@ -854,10 +983,41 @@ fn read_qcow2_virtual_size(path: &Path) -> crate::Result<u64> {
 
 #[cfg(test)]
 mod env_merge_tests {
-    use super::merge_env;
+    use super::{merge_env, seed_manifest_from_vm, FromVmAssets};
+    use crate::config::VmRecord;
+    use smolvm_pack::format::{PackManifest, PackMode};
 
     /// The image's `PATH` is what makes its binaries resolve, so a machine that
     /// set no env of its own must still carry the image's.
+    #[test]
+    fn packed_user_is_the_machine_user_or_else_the_image_user() {
+        let mut vm = VmRecord::new("m".to_string(), 1, 512, vec![], vec![], false);
+        let mut assets = FromVmAssets {
+            mode: PackMode::Container,
+            image: Some("nginx".to_string()),
+            image_env: vec![],
+            image_user: Some("nginx".to_string()),
+            layer_bytes: 0,
+        };
+        let mut manifest = PackManifest::new(
+            "vm://m".to_string(),
+            "none".to_string(),
+            "linux/arm64".to_string(),
+            "darwin/arm64".to_string(),
+        );
+        seed_manifest_from_vm(&mut manifest, &vm, &assets);
+        assert_eq!(manifest.user.as_deref(), Some("nginx"));
+
+        vm.user = Some("501:20".to_string());
+        seed_manifest_from_vm(&mut manifest, &vm, &assets);
+        assert_eq!(manifest.user.as_deref(), Some("501:20"));
+
+        vm.user = None;
+        assets.image_user = None;
+        seed_manifest_from_vm(&mut manifest, &vm, &assets);
+        assert!(manifest.user.is_none());
+    }
+
     #[test]
     fn image_env_survives_when_the_machine_adds_none() {
         let image = vec![
@@ -900,5 +1060,113 @@ mod env_merge_tests {
     fn machine_env_stands_alone_without_an_image() {
         let vm = vec![("FOO".to_string(), "bar".to_string())];
         assert_eq!(merge_env(&[], &vm), vec!["FOO=bar".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod from_vm_manifest_tests {
+    use super::{export_overlay_owner, seed_manifest_from_vm, FromVmAssets};
+    use crate::config::VmRecord;
+    use smolvm_pack::{PackManifest, PackMode};
+
+    fn record(name: &str) -> VmRecord {
+        VmRecord::new(name.to_string(), 1, 512, vec![], vec![], false)
+    }
+
+    fn assets() -> FromVmAssets {
+        FromVmAssets {
+            mode: PackMode::Container,
+            image: Some("alpine".to_string()),
+            image_env: vec![],
+            image_user: None,
+            layer_bytes: 0,
+        }
+    }
+
+    fn manifest() -> PackManifest {
+        PackManifest::new(
+            "vm://m".to_string(),
+            "none".to_string(),
+            "linux/amd64".to_string(),
+            "linux/amd64".to_string(),
+        )
+    }
+
+    /// A machine created with trailing args stores them as `cmd` with no
+    /// entrypoint. Export used to invent `/bin/sh` for the missing entrypoint,
+    /// so the pack launched `/bin/sh sh -c ...`: a shell trying to run a script
+    /// named `sh`, exiting at once. The record's split must survive as-is.
+    #[test]
+    fn a_missing_entrypoint_is_not_replaced_with_a_shell() {
+        let mut rec = record("m");
+        rec.image = Some("alpine".to_string());
+        rec.entrypoint = vec![];
+        rec.cmd = vec!["sh".into(), "-c".into(), "run-the-workload".into()];
+
+        let mut m = manifest();
+        seed_manifest_from_vm(&mut m, &rec, &assets());
+
+        assert!(
+            m.entrypoint.is_empty(),
+            "entrypoint was synthesised: {:?}",
+            m.entrypoint
+        );
+        assert_eq!(m.cmd, rec.cmd);
+
+        // What the runtime will actually exec: entrypoint + cmd.
+        let mut launched = m.entrypoint.clone();
+        launched.extend(m.cmd.clone());
+        assert_eq!(launched, vec!["sh", "-c", "run-the-workload"]);
+    }
+
+    /// An image machine with neither entrypoint nor cmd relies on the agent
+    /// using the image's own ENTRYPOINT+CMD; a synthesised shell would have
+    /// replaced a service image's process with a bare shell.
+    #[test]
+    fn an_image_default_entrypoint_is_left_to_the_image() {
+        let mut rec = record("m");
+        rec.image = Some("nginx".to_string());
+
+        let mut m = manifest();
+        seed_manifest_from_vm(&mut m, &rec, &assets());
+
+        assert!(m.entrypoint.is_empty() && m.cmd.is_empty());
+    }
+
+    /// A record that does carry an entrypoint keeps it verbatim.
+    #[test]
+    fn an_explicit_entrypoint_is_preserved() {
+        let mut rec = record("m");
+        rec.entrypoint = vec!["/app/server".into()];
+        rec.cmd = vec!["--port".into(), "8080".into()];
+
+        let mut m = manifest();
+        seed_manifest_from_vm(&mut m, &rec, &assets());
+
+        assert_eq!(m.entrypoint, vec!["/app/server"]);
+        assert_eq!(m.cmd, vec!["--port", "8080"]);
+    }
+
+    /// A branched or checkpoint-restored machine keeps writing to its source's
+    /// overlay. Export used to look up `persistent-<own-name>`, found nothing,
+    /// and flattened an empty overlay, silently dropping every exec-made change.
+    #[test]
+    fn export_reads_the_overlay_the_machine_actually_writes_to() {
+        let plain = record("orig");
+        assert_eq!(export_overlay_owner("orig", &plain), "orig");
+
+        let mut restored = record("restored");
+        restored.golden = Some("orig".to_string());
+        assert_eq!(
+            export_overlay_owner("restored", &restored),
+            "orig",
+            "a restored machine's changes live in its source's overlay"
+        );
+
+        // A fork clone records its overlay owner explicitly; that wins over golden.
+        let mut clone = record("clone");
+        clone.golden = Some("orig".to_string());
+        clone.fork_overlay_owner = Some("shared-owner".to_string());
+        assert_eq!(export_overlay_owner("clone", &clone), "shared-owner");
     }
 }

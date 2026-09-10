@@ -36,6 +36,9 @@ fn ensure_storage_mounted() -> bool {
                 "INFO",
                 &format!("storage disk mounted (duration_ms={})", uptime_ms() - t0),
             );
+            // Before anything reads /workspace: a pack made with
+            // --include-workspace seeds it onto this (fresh) storage disk.
+            storage::seed_workspace_from_pack();
         } else {
             boot_log(
                 "ERROR",
@@ -79,7 +82,9 @@ fn boot_log(level: &str, msg: &str) {
         }
     }
 }
+mod branchpoint;
 mod cuda;
+mod dirwatch;
 mod disk_trim;
 mod dns_proxy;
 mod docker_bridge;
@@ -427,12 +432,25 @@ fn main() {
         );
     }
 
+    // Staged mounts keep their working copy on the persistent storage disk.
+    // Mount it before volume initialization instead of using the normal
+    // post-ready overlap, otherwise the later /storage mount can hide a newly
+    // seeded working tree and lose it across restart.
+    if storage::staged_boot_mount_requested() && !ensure_storage_mounted() {
+        error!("staged volume mount requires the guest storage disk");
+        std::process::exit(1);
+    }
+
     // Initialize volume mounts from SMOLVM_MOUNT_* env vars.
     // MUST run before the /workspace symlink below — if the user passed
     // `-v host:/workspace`, the bind mount claims /workspace first and
     // the symlink's `!exists()` guard correctly skips creation.
     let t0 = uptime_ms();
     let boot_mounts = storage::init_volume_mounts();
+    if storage::staged_boot_mount_requested() && storage::boot_volume_mounts_failed() {
+        error!("failed to initialize staged volume mount");
+        std::process::exit(1);
+    }
     if !boot_mounts.is_empty() {
         info!(
             duration_ms = uptime_ms() - t0,
@@ -535,6 +553,9 @@ fn main() {
     // ensure_storage_mounted() also guards any concurrent call from a request
     // that races in the brief window on very fast hosts.
     ensure_storage_mounted();
+    if let Err(error) = storage::prune_staged_working_copies(storage::init_volume_mounts()) {
+        warn!(error = %error, "failed to clean stale staged working copies");
+    }
 
     // With the disks mounted, start reclaiming freed blocks back to the host
     // sparse files so disk footprint tracks live data (see disk_trim).
@@ -1406,12 +1427,57 @@ fn sync_and_unmount_storage() {
         libc::sync();
     }
 
-    // Note: We don't unmount /storage here because:
-    // 1. The overlay filesystem uses /storage/layers and /storage/overlays
-    // 2. Unmounting /storage while overlay is active causes issues
-    // 3. The sync() call ensures all pending writes are flushed to disk
-    // 4. When the VM terminates, the kernel will clean up mounts
+    // Flushing is not enough on its own: ext4 clears its recovery flag only
+    // when the filesystem is taken read-only or unmounted, so a machine that
+    // was merely synced leaves a journal for the next boot to replay. Replaying
+    // one that still holds metadata for recent writes can leave the image
+    // manifest unreadable, and the machine then starts with "image not found"
+    // even though nothing was lost.
+    //
+    // /storage cannot be unmounted -- the overlay sits on top of it -- but a
+    // read-only remount checkpoints the journal just the same and leaves the
+    // filesystem clean for the next mount.
+    remount_storage_read_only();
 }
+
+/// Takes /storage read-only so ext4 checkpoints its journal.
+#[cfg(target_os = "linux")]
+fn remount_storage_read_only() {
+    let Ok(target) = std::ffi::CString::new(paths::STORAGE_ROOT) else {
+        return;
+    };
+
+    // SAFETY: a remount needs only the target path; the source, filesystem type
+    // and options are unused and may be null.
+    let ret = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            target.as_ptr(),
+            std::ptr::null(),
+            libc::MS_REMOUNT | libc::MS_RDONLY,
+            std::ptr::null(),
+        )
+    };
+
+    if ret == 0 {
+        info!(
+            "remounted {} read-only; journal checkpointed",
+            paths::STORAGE_ROOT
+        );
+    } else {
+        // Something still holds it writable. The sync above already flushed the
+        // data, so the next boot replays the journal as it did before.
+        warn!(
+            "could not remount {} read-only: {}; the next boot will replay the journal instead",
+            paths::STORAGE_ROOT,
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+/// Stub for non-Linux platforms.
+#[cfg(not(target_os = "linux"))]
+fn remount_storage_read_only() {}
 
 /// Stub for non-Linux platforms.
 #[cfg(not(target_os = "linux"))]
@@ -2151,6 +2217,11 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             continue;
         }
 
+        if let AgentRequest::ArchiveDirectory { ref path } = request {
+            handle_streaming_archive_directory(stream, path)?;
+            continue;
+        }
+
         // Streaming file upload: Begin opens a session, Chunk appends
         // or finalizes. Any other request type closes the session
         // implicitly (Drop runs on the Option assignment to None).
@@ -2247,10 +2318,14 @@ fn handle_request(
     }
 
     match request {
-        AgentRequest::Ping => AgentResponse::Pong {
-            version: PROTOCOL_VERSION,
-            capabilities: vec![smolvm_protocol::forkpoint::WORKER_READY_CAPABILITY.to_string()],
-        },
+        AgentRequest::Ping => {
+            let capabilities =
+                vec![smolvm_protocol::forkpoint::TYPED_BRANCHPOINT_CAPABILITY.to_string()];
+            AgentResponse::Pong {
+                version: PROTOCOL_VERSION,
+                capabilities,
+            }
+        }
 
         AgentRequest::FsNotify { events } => handle_fsnotify(&events),
 
@@ -2273,6 +2348,56 @@ fn handle_request(
 
         AgentRequest::StorageStatus => handle_storage_status(),
 
+        AgentRequest::BranchpointWait { timeout_ms } => {
+            let markers = branchpoint::Markers::standard();
+            match branchpoint::wait_ready(&markers, std::time::Duration::from_millis(timeout_ms)) {
+                Ok(contents) => AgentResponse::Ok {
+                    data: Some(serde_json::json!({ "contents": contents })),
+                },
+                Err(e) => branchpoint_error(e),
+            }
+        }
+        AgentRequest::BranchpointArm => {
+            branchpoint_outcome(branchpoint::arm(&branchpoint::Markers::standard()))
+        }
+        AgentRequest::BranchpointPark => {
+            branchpoint_outcome(branchpoint::park(&branchpoint::Markers::standard()))
+        }
+        AgentRequest::BranchpointRelease { env_dotenv } => branchpoint_outcome(
+            branchpoint::release(&branchpoint::Markers::standard(), env_dotenv.as_deref()),
+        ),
+        AgentRequest::BranchpointActivate {
+            env_dotenv,
+            env_sourceable,
+            env_path,
+            branch_env_path,
+            require_dir,
+            env_dir,
+            activation_token,
+        } => match branchpoint::activate(
+            &branchpoint::Markers::standard(),
+            &env_dotenv,
+            &env_sourceable,
+            std::path::Path::new(&env_path),
+            std::path::Path::new(&branch_env_path),
+            require_dir.as_deref().map(std::path::Path::new),
+            std::path::Path::new(&env_dir),
+            &activation_token,
+        ) {
+            Ok(outcome) => AgentResponse::Ok {
+                data: Some(serde_json::json!({
+                    "already_done": matches!(outcome, branchpoint::Activation::AlreadyDone)
+                })),
+            },
+            Err(e) => branchpoint_error(e),
+        },
+        AgentRequest::BranchpointWaitWorkerReady { token, timeout_ms } => {
+            branchpoint_outcome(branchpoint::wait_worker_ready(
+                &branchpoint::Markers::standard(),
+                &token,
+                std::time::Duration::from_millis(timeout_ms),
+            ))
+        }
         AgentRequest::FlattenLayers { lowerdirs, output } => {
             handle_flatten_layers(&lowerdirs, &output)
         }
@@ -2467,10 +2592,12 @@ fn handle_request(
 
         // Streaming read goes through `handle_connection`'s explicit
         // dispatch so it can emit multiple responses per request.
-        AgentRequest::FileRead { .. } => AgentResponse::error(
-            "streaming file read must be handled at connection level",
-            error_codes::INTERNAL_ERROR,
-        ),
+        AgentRequest::FileRead { .. } | AgentRequest::ArchiveDirectory { .. } => {
+            AgentResponse::error(
+                "streaming read must be handled at connection level",
+                error_codes::INTERNAL_ERROR,
+            )
+        }
 
         // Pod-container lifecycle (containerd shim v2 datapath, see pod.rs).
         AgentRequest::PodCreate {
@@ -3152,6 +3279,26 @@ fn send_data_chunks<R: Read>(
     error_context: &str,
     error_code: &'static str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    send_data_chunks_body(stream, reader, chunk_size, error_context, error_code)?;
+    send_response(
+        stream,
+        &AgentResponse::DataChunk {
+            data: vec![],
+            done: true,
+        },
+    )?;
+    Ok(())
+}
+
+/// Send data chunks without the terminal frame so a producer can verify its
+/// final status before reporting a successful end-of-stream.
+fn send_data_chunks_body<R: Read>(
+    stream: &mut impl Write,
+    reader: &mut R,
+    chunk_size: usize,
+    error_context: &str,
+    error_code: &'static str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut buf = vec![0u8; chunk_size];
     loop {
         // Fill as much of the buffer as possible in one chunk.
@@ -3175,14 +3322,6 @@ fn send_data_chunks<R: Read>(
         }
 
         if pending == 0 {
-            // EOF — emit the terminator frame.
-            send_response(
-                stream,
-                &AgentResponse::DataChunk {
-                    data: vec![],
-                    done: true,
-                },
-            )?;
             return Ok(());
         }
 
@@ -3292,6 +3431,98 @@ fn handle_streaming_file_read(
     )
 }
 
+/// Stream a tar archive of a directory directly over vsock.
+///
+/// This deliberately runs in the agent namespace: boot-time staged mounts are
+/// visible there even when an image workload is active, and no temporary
+/// archive needs to traverse virtiofs or occupy the guest disk.
+fn handle_streaming_archive_directory(
+    stream: &mut impl ReadWrite,
+    path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Resolve through the same containment check single-file reads use, rather
+    // than trusting the requested path. `normalize_guest_path` alone is lexical:
+    // it rejects `..` but happily accepts a path whose final component is a
+    // symlink, and `tar -C` follows that symlink, so a workload could leave a
+    // link in its workspace and have a caller archive whatever it pointed at.
+    // The resolver maps the path under the workspace or overlay root and
+    // canonicalizes it, so a link out of those roots is refused here.
+    let resolved = match resolve_guest_io_path(path, FilePathAccess::Read) {
+        Ok(resolved) => resolved,
+        Err(response) => {
+            send_response(stream, &response)?;
+            return Ok(());
+        }
+    };
+    let directory = resolved.as_path();
+    if !directory.is_dir() {
+        send_response(
+            stream,
+            &AgentResponse::error(
+                format!("not a directory: {path}"),
+                error_codes::FILE_IO_FAILED,
+            ),
+        )?;
+        return Ok(());
+    }
+
+    let mut child = match std::process::Command::new("tar")
+        .args(["-cf", "-", "-C"])
+        .arg(directory)
+        .arg(".")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    format!("failed to start directory archive: {error}"),
+                    error_codes::FILE_IO_FAILED,
+                ),
+            )?;
+            return Ok(());
+        }
+    };
+    let mut stdout = child.stdout.take().expect("piped tar stdout");
+    let result = send_data_chunks_body(
+        stream,
+        &mut stdout,
+        smolvm_protocol::LAYER_CHUNK_SIZE,
+        "failed to read directory archive",
+        error_codes::FILE_IO_FAILED,
+    );
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    result?;
+    match child.wait() {
+        Ok(status) if status.success() => send_response(
+            stream,
+            &AgentResponse::DataChunk {
+                data: Vec::new(),
+                done: true,
+            },
+        ),
+        Ok(status) => send_response(
+            stream,
+            &AgentResponse::error(
+                format!("directory archive exited with {status}"),
+                error_codes::FILE_IO_FAILED,
+            ),
+        ),
+        Err(error) => send_response(
+            stream,
+            &AgentResponse::error(
+                format!("failed to wait for directory archive: {error}"),
+                error_codes::FILE_IO_FAILED,
+            ),
+        ),
+    }
+}
+
 /// Handle an interactive run session with streaming I/O.
 fn handle_interactive_run(
     stream: &mut impl ReadWrite,
@@ -3379,6 +3610,18 @@ fn handle_interactive_run(
         )?;
         return Ok(());
     }
+
+    // SSH agent forwarding: mirror `handle_run`'s injection. The #542 fix wired
+    // SSH_AUTH_SOCK into the exec/run env because the keep-alive `crun exec` path
+    // builds a fresh process env rather than inheriting the container's — but it
+    // only did so for the non-interactive handler. Interactive sessions reach the
+    // same keep-alive container (an ephemeral `machine run` also carries a
+    // persistent overlay id, so `-i`/`-t` joins it too), so without this the
+    // variable is silently absent for every interactive session and the
+    // container-spec injection alone never reaches it. No-op when forwarding is
+    // off; never overrides a user-supplied value.
+    let mut env = env;
+    ssh_agent::inject_into_env(&mut env);
 
     // Resolve the container's launch settings from the image's OCI config (with
     // request overrides). Required to call spawn_interactive_command, so the
@@ -3565,8 +3808,6 @@ fn write_oci_bundle(
     unprivileged: bool,
     container_init: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    use std::path::Path;
-
     let workdir_str = launch.workdir.as_deref().unwrap_or("/");
     let identity = oci::resolve_process_identity(rootfs_path, launch.user.as_deref())?;
     let mut spec = oci::OciSpec::new(
@@ -3601,7 +3842,7 @@ fn write_oci_bundle(
     }
 
     for (tag, container_path, read_only) in mounts {
-        let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
+        let virtiofs_mount = storage::volume_bind_source(tag);
         spec.add_bind_mount(
             &virtiofs_mount.to_string_lossy(),
             container_path,
@@ -3831,11 +4072,13 @@ fn handle_run_detached(
     match create_output {
         Ok(output) if output.status.success() => {}
         Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
             send_response(
                 stream,
                 &AgentResponse::error(
-                    format!("crun create failed: {}", stderr.trim()),
+                    format!(
+                        "crun create failed: {}",
+                        crun::create_failure_reason(&container_id, &output)
+                    ),
                     error_codes::SPAWN_FAILED,
                 ),
             )?;
@@ -4504,7 +4747,7 @@ fn ensure_main_container(
     if !create.status.success() {
         return Err(format!(
             "keep-alive crun create failed: {}",
-            String::from_utf8_lossy(&create.stderr).trim()
+            crun::create_failure_reason(&container_id, &create)
         )
         .into());
     }
@@ -4570,9 +4813,11 @@ fn spawn_interactive_command(
     // user) is rejected with "invalid USERSPEC specified". Resolve it against the
     // container rootfs /etc/passwd, consistent with the `crun run` path (#632).
     // (Harmless for the fresh-container path, which re-resolves via config.json.)
+    let mut exec_env = launch.env.clone();
+    oci::apply_process_env(Path::new(rootfs), launch.user.as_deref(), &mut exec_env);
     let launch_owned = ResolvedLaunch {
         command: launch.command.clone(),
-        env: launch.env.clone(),
+        env: exec_env,
         workdir: launch.workdir.clone(),
         user: oci::resolve_exec_user_spec(Path::new(rootfs), launch.user.as_deref())?,
     };
@@ -4811,7 +5056,7 @@ fn spawn_interactive_command(
     spec.add_gpu_devices_if_available();
 
     for (tag, container_path, read_only) in mounts {
-        let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
+        let virtiofs_mount = storage::volume_bind_source(tag);
         spec.add_bind_mount(
             &virtiofs_mount.to_string_lossy(),
             container_path,
@@ -5713,6 +5958,7 @@ fn run_background_in_keepalive(
 
     // `crun exec --user` needs a numeric uid[:gid]; resolve any username
     // against the container's /etc/passwd, same as the foreground path.
+    oci::apply_process_env(&rootfs, launch.user.as_deref(), &mut launch.env);
     launch.user = oci::resolve_exec_user_spec(&rootfs, launch.user.as_deref())
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
@@ -5915,6 +6161,7 @@ fn run_in_keepalive_container(
     // — a username (the image's `config.User`, e.g. `nobody`/`node`, or the
     // request user) is rejected with "invalid USERSPEC specified". Resolve it
     // against the container's /etc/passwd, matching the `crun run` path (#632).
+    oci::apply_process_env(&rootfs, launch.user.as_deref(), &mut launch.env);
     launch.user = oci::resolve_exec_user_spec(&rootfs, launch.user.as_deref())
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
@@ -7564,6 +7811,43 @@ mod tests {
         assert!(matches!(res, Err(AgentResponse::Error { .. })));
     }
 
+    /// A workload can leave a symlink in its own workspace pointing at a
+    /// directory outside it, and `tar -C` follows such a link — so archiving a
+    /// workspace path must be refused when it resolves outside the workspace.
+    ///
+    /// This covers the resolver for a DIRECTORY escape, the shape the archive
+    /// path passes it; the file cases above cover a file escape. It does not by
+    /// itself prove which resolver the archive handler calls — that is the
+    /// wiring this change makes, and it is visible at the call site.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_guest_read_rejects_a_symlinked_directory_escaping_the_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let merged = tmp.path().join("merged");
+        let workspace = tmp.path().join("workspace");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&merged).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"secret").unwrap();
+
+        // The workload plants a link in its workspace to a directory outside it.
+        symlink(&outside, workspace.join("results")).unwrap();
+
+        let res = resolve_guest_io_path_with_roots(
+            "/workspace/results",
+            FilePathAccess::Read,
+            Some(&merged),
+            &workspace,
+        );
+        assert!(
+            matches!(res, Err(AgentResponse::Error { .. })),
+            "archiving a workspace path that links outside the workspace must be refused"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn resolve_guest_write_rejects_symlink_escape_from_overlay() {
@@ -7643,5 +7927,20 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&line)
             .unwrap_or_else(|e| panic!("Invalid JSON: {}\nLine: {}", e, line));
         assert!(parsed["message"].as_str().unwrap().contains("\"device\""));
+    }
+}
+
+/// Map a typed branchpoint step's result onto the wire.
+fn branchpoint_outcome(result: Result<(), branchpoint::TypedError>) -> AgentResponse {
+    match result {
+        Ok(()) => AgentResponse::Ok { data: None },
+        Err(e) => branchpoint_error(e),
+    }
+}
+
+fn branchpoint_error(e: branchpoint::TypedError) -> AgentResponse {
+    AgentResponse::Error {
+        message: e.message,
+        code: Some(e.code.to_string()),
     }
 }

@@ -394,6 +394,12 @@ fn decompress_sparse(src: &Path, dest: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Subdirectory of `layers/` holding the workspace seed. Shared with the guest
+/// agent, which looks for exactly this path under `/packed_layers`.
+pub const WORKSPACE_SEED_DIR: &str = "workspace-seed";
+/// Name of the workspace seed tar inside [`WORKSPACE_SEED_DIR`].
+pub const WORKSPACE_SEED_FILE: &str = "workspace.tar";
+
 /// Asset collector for gathering runtime components.
 pub struct AssetCollector {
     staging_dir: PathBuf,
@@ -419,6 +425,7 @@ impl AssetCollector {
                 storage_logical_size: None,
                 overlay_template: None,
                 overlay_logical_size: None,
+                workspace_seed: None,
             },
         })
     }
@@ -854,6 +861,30 @@ impl AssetCollector {
             size: truncated_size,
         });
         self.inventory.storage_logical_size = Some(logical_size);
+        Ok(())
+    }
+
+    /// Record a tar of the source machine's `/workspace` as the pack's
+    /// workspace seed.
+    ///
+    /// It lives in its own subdirectory under `layers/` so the guest, which
+    /// treats every top-level `*.tar` there as an image layer, never mistakes
+    /// it for one.
+    pub fn add_workspace_seed(&mut self, tar: &Path) -> Result<()> {
+        if !tar.exists() {
+            return Err(PackError::AssetNotFound(format!(
+                "workspace seed not found: {}",
+                tar.display()
+            )));
+        }
+        let rel = format!("layers/{}/{}", WORKSPACE_SEED_DIR, WORKSPACE_SEED_FILE);
+        let dst = self.staging_dir.join(&rel);
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::rename(tar, &dst).or_else(|_| std::fs::copy(tar, &dst).map(|_| ()))?;
+        let size = std::fs::metadata(&dst)?.len();
+        self.inventory.workspace_seed = Some(AssetEntry { path: rel, size });
         Ok(())
     }
 

@@ -26,6 +26,9 @@ API ENDPOINTS:
   GET    /api/v1/machines             List machines
   GET    /api/v1/machines/:id         Get machine status
   POST   /api/v1/machines/:id/start   Start machine
+  POST   /api/v1/machines/:id/branches Create a copy-on-write child
+  POST   /api/v1/machines/:id/checkpoint Capture a durable checkpoint
+  POST   /api/v1/machines/:id/sync    Synchronize staged mounts
   POST   /api/v1/machines/:id/stop    Stop machine
   POST   /api/v1/machines/:id/exec    Execute command
   DELETE /api/v1/machines/:id         Delete machine
@@ -143,8 +146,7 @@ impl ServeStartCmd {
         //   or orphan it — the VM isn't in the service cgroup, so systemd won't hit
         //   `219/CGROUP` recreating the unit. Caps become scope properties. We do
         //   NOT set SMOLVM_CGROUP_ROOT here so the VM boot subprocess skips
-        //   self-placement; the parent adopts it instead. See
-        //   docs/lossless-serve-restart.md.
+        //   self-placement; the parent adopts it instead.
         // - non-systemd (dev/containers): fall back to a delegated cgroup root
         //   advertised via SMOLVM_CGROUP_ROOT so every VM boot subprocess places
         //   itself in a per-VM cgroup. No lossless restart there, which is fine.

@@ -9,7 +9,6 @@
 
 use clap::{Args, Subcommand};
 use smolvm::agent::{AgentClient, AgentManager, VmResources};
-use smolvm::data::resources::DEFAULT_MICROVM_CPU_COUNT;
 
 /// Default memory for packed VMs. Same as machine create — memory is elastic
 /// via virtio balloon, so the host only commits what the guest actually uses.
@@ -151,17 +150,23 @@ pub struct PackCreateCmd {
     #[arg(long = "rebase-from-image", requires = "from_vm")]
     pub rebase_from_image: bool,
 
+    /// Also capture the machine's /workspace, so a machine made from the pack starts with those files. It lives on the storage disk, which packs otherwise never carry.
+    #[arg(long = "include-workspace", requires = "from_vm")]
+    pub include_workspace: bool,
+
     /// Output file path for the packed binary
     #[arg(short = 'o', long, value_name = "PATH")]
     pub output: PathBuf,
 
-    /// Default number of vCPUs for the packed VM
-    #[arg(long, default_value_t = DEFAULT_MICROVM_CPU_COUNT, value_name = "N")]
-    pub cpus: u8,
+    /// Maximum vCPUs machines from this pack may use [default: 4, or the
+    /// Smolfile value]. A cap on consumption, not a reservation.
+    #[arg(long, value_name = "N")]
+    pub cpus: Option<u8>,
 
-    /// Default memory in MiB for the packed VM
-    #[arg(long, default_value_t = PACK_DEFAULT_MEMORY_MIB, value_name = "MiB")]
-    pub mem: u32,
+    /// Maximum memory in MiB machines from this pack may use [default: 8192,
+    /// or the Smolfile value]. Elastic: only touched memory is committed.
+    #[arg(long, value_name = "MiB")]
+    pub mem: Option<u32>,
 
     /// Target OCI platform for multi-arch images (e.g., linux/arm64, linux/amd64)
     ///
@@ -287,6 +292,32 @@ impl PackCreateCmd {
                 "no image specified. Provide IMAGE argument or set 'image' in Smolfile",
             )
         })?;
+
+        // `pack create` pulls directly from an OCI container registry. If a user passes
+        // a local file path, image archive, or rootfs directory, provide a helpful diagnostic
+        // rather than failing on OCI reference character validation.
+        let image_trimmed = image.trim();
+        if image_trimmed.starts_with("./")
+            || image_trimmed.starts_with("../")
+            || image_trimmed.starts_with('/')
+            || image_trimmed.starts_with('~')
+            || image_trimmed.ends_with(".tar")
+            || image_trimmed.ends_with(".tar.gz")
+            || image_trimmed.ends_with(".tar.zst")
+            || image_trimmed.ends_with(".tgz")
+            || std::path::Path::new(image_trimmed).exists()
+        {
+            return Err(Error::config(
+                "pack create",
+                format!(
+                    "'--image' accepts container registry references (e.g. 'alpine:latest'). \
+                     To create a packed executable from a local image archive or rootfs directory ('{image}'), \
+                     first create the machine with 'smolvm machine create --image {image}' and then pack it \
+                     with 'smolvm pack create --from-vm <name>'."
+                ),
+            ));
+        }
+
         info!(image = %image, output = %self.output.display(), "packing image");
 
         // Create temporary staging directory
@@ -365,7 +396,7 @@ impl PackCreateCmd {
         }
 
         println!("Starting agent VM...");
-        let manager = AgentManager::for_vm(&pack_vm_name)?;
+        let manager = AgentManager::for_vm_with_sizes(&pack_vm_name, None, None)?;
         manager.start_with_config(
             Vec::new(),
             VmResources {
@@ -379,6 +410,7 @@ impl PackCreateCmd {
                 cuda: false,
                 storage_gib: None,
                 overlay_gib: None,
+                block_io: Default::default(),
                 gpu_vram_mib: None,
                 rosetta: false,
                 allowed_cidrs: None,
@@ -543,6 +575,10 @@ impl PackCreateCmd {
         manifest.cmd = image_info.cmd.clone();
         manifest.env = image_info.env.clone();
         manifest.workdir = image_info.workdir.clone();
+        // The pack has no image config left to consult at run time, so the
+        // user travels in the manifest like the rest: the Smolfile's `user`
+        // when given, else the image's USER.
+        manifest.user = pack_config.user.clone().or_else(|| image_info.user.clone());
 
         // Layer Smolfile top-level env on top of image env
         if !pack_config.env.is_empty() {
@@ -634,6 +670,7 @@ impl PackCreateCmd {
             proxy: self.proxy_opts.resolved_proxy()?,
             no_proxy: self.proxy_opts.no_proxy(),
             rebase_from_image: self.rebase_from_image,
+            include_workspace: self.include_workspace,
         };
         let assets = smolvm::pack_export::collect_from_vm_assets(
             &mut collector,
@@ -937,36 +974,15 @@ impl PackCreateCmd {
     /// `target/agent-rootfs` is NOT checked — it can contain stale builds.
     /// Use `--rootfs-dir` or `SMOLVM_AGENT_ROOTFS` env var to override.
     fn find_rootfs_dir(&self) -> smolvm::Result<PathBuf> {
-        if let Some(ref dir) = self.rootfs_dir {
-            return Ok(dir.clone());
-        }
-
-        let candidates = [
-            // SMOLVM_AGENT_ROOTFS env var
-            std::env::var("SMOLVM_AGENT_ROOTFS").ok().map(PathBuf::from),
-            // Installed location (canonical)
-            dirs::data_dir().map(|d| d.join("smolvm/agent-rootfs")),
-            // Next to the executable (for distribution tarballs)
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.join("agent-rootfs"))),
-        ];
-
-        for candidate in candidates.into_iter().flatten() {
-            // Use symlink_metadata instead of exists() because sbin/init
-            // is a symlink to a guest-only path (/usr/local/bin/smolvm-agent)
-            // that doesn't exist on the host. exists() follows symlinks and
-            // returns false for broken symlinks.
-            if std::fs::symlink_metadata(candidate.join("sbin/init")).is_ok() {
-                debug!(rootfs_dir = %candidate.display(), "found agent rootfs");
-                return Ok(candidate);
-            }
-        }
-
-        Err(Error::agent(
+        // Same resolver a machine boots with, so the pack bundles the agent
+        // `machine run` would use, not whichever copy happened to sit in a
+        // stale data directory.
+        let dir = smolvm::agent::AgentManager::resolve_rootfs_path(
+            self.rootfs_dir.clone(),
             "find agent rootfs",
-            "could not find agent rootfs. Use --rootfs-dir to specify the location.",
-        ))
+        )?;
+        debug!(rootfs_dir = %dir.display(), "found agent rootfs");
+        Ok(dir)
     }
 
     /// Find the smolvm binary to embed as the packed runtime.
@@ -1432,16 +1448,36 @@ impl PackPullCmd {
             })
             .unwrap_or_default();
 
+        // A multi-gigabyte layer takes minutes, and without a bar the command
+        // looks hung for all of it. Terminal only: the throttled redraws rely on
+        // `\r`, which does nothing in a log file, so a CI run would collect
+        // hundreds of stacked lines instead of one.
+        let show_progress = std::io::IsTerminal::is_terminal(&std::io::stderr());
+        // The layer size is only known once the manifest is fetched, so the bar
+        // cannot be built until the first callback carries the total.
+        let mut bar: Option<crate::cli::ProgressBar> = None;
         let result = rt
-            .block_on(smolvm_registry::pull(
+            .block_on(smolvm_registry::pull_with_progress(
                 &client,
                 &repo,
                 tag_or_digest,
                 self.output.as_deref(),
                 &cache,
                 &blob_peers,
+                &mut |done, total| {
+                    if !show_progress {
+                        return;
+                    }
+                    bar.get_or_insert_with(|| {
+                        crate::cli::ProgressBar::new("Downloading", (total > 0).then_some(total))
+                    })
+                    .update(done);
+                },
             ))
             .map_err(|e| Error::agent("registry pull", e.to_string()))?;
+        if let Some(bar) = bar.take() {
+            bar.finish(result.size);
+        }
 
         if result.cached {
             eprintln!("Using cached blob ({})", result.digest);
@@ -1449,9 +1485,9 @@ impl PackPullCmd {
 
         let dest = self.output.unwrap_or(result.path);
         eprintln!(
-            "Pulled successfully -> {} ({} bytes)",
+            "Pulled successfully -> {} ({})",
             dest.display(),
-            result.size,
+            crate::cli::format_bytes(result.size),
         );
 
         // Warn if the artifact targets a different host platform.
@@ -1829,6 +1865,41 @@ mod tests {
             client.identity_token(),
             Some("eyJ_identity"),
             "identity_token must take precedence over password"
+        );
+    }
+
+    #[test]
+    fn pack_create_rejects_local_archive_paths_with_clear_diagnostic() {
+        let cmd = PackCreateCmd {
+            image: Some("./local-image.tar".to_string()),
+            from_vm: None,
+            rebase_from_image: false,
+            include_workspace: false,
+            output: PathBuf::from("test-output"),
+            cpus: Some(2),
+            mem: Some(1024),
+            oci_platform: None,
+            entrypoint: None,
+            no_sign: false,
+            single_file: false,
+            stub: None,
+            lib_dir: None,
+            rootfs_dir: None,
+            smolfile: None,
+            gpu: false,
+            staging_dir: None,
+            proxy_opts: crate::cli::proxy_opts::ProxyOpts::default(),
+        };
+
+        let err = cmd.run().expect_err("local archive path must be rejected");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("'--image' accepts container registry references"),
+            "Expected registry reference explanation, got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("pack create --from-vm"),
+            "Expected recommendation to use pack create --from-vm, got: {err_msg}"
         );
     }
 }
