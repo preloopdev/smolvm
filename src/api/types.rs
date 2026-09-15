@@ -683,6 +683,10 @@ pub struct MachineInfo {
     /// Machine name.
     #[schema(example = "my-vm")]
     pub name: String,
+    /// Resolved workload image, used to bind registry credentials to its host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "registry.example.com/team/app:latest")]
+    pub image: Option<String>,
     /// Current state ("created", "running", "stopped").
     #[schema(example = "running")]
     pub state: String,

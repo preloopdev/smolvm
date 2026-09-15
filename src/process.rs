@@ -469,14 +469,21 @@ pub fn setup_cgroup_delegation_root() -> Option<std::path::PathBuf> {
 /// Caps applied (best-effort, each independently):
 /// - `cpu.max` = `vcpus * 100ms / 100ms` → bounds CPU to ~`vcpus` cores.
 /// - `pids.max` = [`CGROUP_PIDS_MAX`] → caps host tasks (fork-bomb containment).
-/// - `memory.max` = guest RAM, CUDA mapping allowance, and fixed overhead.
+/// - `memory.high`/`memory.max` = guest RAM, unreclaimable-mapping allowance,
+///   and proportional overhead, with a reclaim stage below the ceiling.
 ///
 /// `root` must be a delegated root with `cpu`/`memory`/`pids` enabled in its
 /// `subtree_control` (see [`setup_cgroup_delegation_root`]); otherwise the limit
 /// files won't exist and the caps silently degrade while the process still runs.
 /// Never blocks boot.
 #[cfg(target_os = "linux")]
-pub fn place_in_cgroup(root: &std::path::Path, vcpus: u8, memory_mib: u32, cuda: bool) {
+pub fn place_in_cgroup(
+    root: &std::path::Path,
+    vcpus: u8,
+    memory_mib: u32,
+    cuda: bool,
+    memfd_backed: bool,
+) {
     let pid = unsafe { libc::getpid() };
     let vm = root.join(format!("vm-{pid}"));
     if let Err(e) = std::fs::create_dir(&vm) {
@@ -495,7 +502,10 @@ pub fn place_in_cgroup(root: &std::path::Path, vcpus: u8, memory_mib: u32, cuda:
         &format!("{quota_us} {CGROUP_CPU_PERIOD_US}"),
     );
     let _ = write_cgroup(&vm, "pids.max", &CGROUP_PIDS_MAX.to_string());
-    let memory_limit_bytes = vmm_memory_limit_bytes(memory_mib, cuda);
+    let budget = vmm_memory_budget(memory_mib, cuda, memfd_backed);
+    let memory_limit_bytes = budget.max_bytes;
+    // Establish the early throttle/reclaim threshold before the hard ceiling.
+    let _ = write_cgroup(&vm, "memory.high", &budget.high_bytes.to_string());
     let _ = write_cgroup(&vm, "memory.max", &memory_limit_bytes.to_string());
 
     // Join the leaf last; from here the caps above govern this process tree.
@@ -510,19 +520,51 @@ pub fn place_in_cgroup(root: &std::path::Path, vcpus: u8, memory_mib: u32, cuda:
     );
 }
 
+/// Host-memory budget for one VMM's cgroup: a reclaim threshold and a hard
+/// ceiling.
+///
+/// cgroup v2 charges anon + page cache + shmem to one counter, so the page
+/// cache the host faults in for a VM's own disks competes with the guest RAM
+/// the customer bought. `memory.max` also attempts reclaim before invoking
+/// OOM; `memory.high` starts throttling and reclaim earlier. Neither threshold
+/// makes resident unswappable shmem reclaimable. A `memory.events` max event
+/// records limit pressure, not an OOM kill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmmMemoryBudget {
+    /// `memory.high` — throttle and reclaim here, before anything is killed.
+    pub high_bytes: u64,
+    /// `memory.max` — the hard backstop for a genuine runaway.
+    pub max_bytes: u64,
+}
+
 /// Bound host memory for a VMM while leaving room beyond its configured guest
-/// RAM. CUDA device mappings and forkable memfd-backed guest pages can both be
-/// charged to the VMM cgroup, so CUDA needs room for one additional guest-sized
-/// mapping plus the fixed process overhead. CPU-only VMs retain the tighter
-/// historical guest-plus-overhead cap.
-pub fn vmm_memory_limit_bytes(guest_memory_mib: u32, cuda: bool) -> u64 {
+/// RAM, and leave a reclaim stage below the ceiling.
+///
+/// Overhead scales with the guest rather than being flat: page tables, virtio
+/// rings, virtiofs/virtio-net buffers and the disk page cache all grow with it,
+/// so a fixed allowance is generous at 2 GiB and negligible at 40 GiB.
+///
+/// Reserve a conservative extra guest-sized allowance for CUDA or forkable
+/// workloads. A memfd mapping does not itself double physical memory: private
+/// COW pages and retained generations can add charges. The branch lifecycle
+/// accounts for additional retained generations separately.
+pub fn vmm_memory_budget(guest_memory_mib: u32, cuda: bool, memfd_backed: bool) -> VmmMemoryBudget {
     let guest = u64::from(guest_memory_mib);
-    let limit_mib = if cuda {
-        guest.saturating_mul(2).saturating_add(VMM_MEM_OVERHEAD_MIB)
-    } else {
-        guest.saturating_add(VMM_MEM_OVERHEAD_MIB)
-    };
-    limit_mib.saturating_mul(1024 * 1024)
+    let overhead = VMM_MEM_OVERHEAD_MIB.max(guest / 4);
+    let unreclaimable = if cuda || memfd_backed { guest } else { 0 };
+    let max_mib = guest.saturating_add(unreclaimable).saturating_add(overhead);
+    // Start reclaiming once three quarters of the overhead is in use, keeping
+    // the last quarter as the hard backstop.
+    let high_mib = max_mib.saturating_sub(overhead / 4);
+    VmmMemoryBudget {
+        high_bytes: high_mib.saturating_mul(1024 * 1024),
+        max_bytes: max_mib.saturating_mul(1024 * 1024),
+    }
+}
+
+/// The hard ceiling alone, for callers doing their own arithmetic on it.
+pub fn vmm_memory_limit_bytes(guest_memory_mib: u32, cuda: bool, memfd_backed: bool) -> u64 {
+    vmm_memory_budget(guest_memory_mib, cuda, memfd_backed).max_bytes
 }
 
 #[cfg(target_os = "linux")]
@@ -542,7 +584,7 @@ fn cgroup_v2_process_dir(pid: Pid) -> Option<std::path::PathBuf> {
     Some(std::path::Path::new("/sys/fs/cgroup").join(rel))
 }
 
-/// Update `memory.max` only when `pid` is already inside a cgroup owned by
+/// Update both memory thresholds only when `pid` is already inside a cgroup owned by
 /// SmolVM. Returns `false` for ordinary CLI-launched/externally-capped
 /// processes, whose enclosing cgroup must never be modified by a guest action.
 ///
@@ -555,6 +597,7 @@ pub fn set_managed_vmm_memory_limit(
     machine: &str,
     pid: Pid,
     memory_max_bytes: u64,
+    memory_high_bytes: u64,
 ) -> Result<bool> {
     let Some(dir) = cgroup_v2_process_dir(pid) else {
         return Ok(false);
@@ -564,10 +607,16 @@ pub fn set_managed_vmm_memory_limit(
     };
     let scope = crate::systemd_scope::scope_name(machine);
     if leaf == scope {
-        crate::systemd_scope::set_scope_memory_max(machine, memory_max_bytes)?;
+        crate::systemd_scope::set_scope_memory_max(machine, memory_max_bytes, memory_high_bytes)?;
         return Ok(true);
     }
     if leaf == format!("vm-{pid}") {
+        write_cgroup(&dir, "memory.high", &memory_high_bytes.to_string()).map_err(|error| {
+            Error::agent(
+                "VM cgroup",
+                format!("update {} memory.high: {error}", dir.display()),
+            )
+        })?;
         write_cgroup(&dir, "memory.max", &memory_max_bytes.to_string()).map_err(|error| {
             Error::agent(
                 "VM cgroup",
@@ -588,6 +637,7 @@ pub fn set_managed_vmm_memory_limit(
     _machine: &str,
     _pid: Pid,
     _memory_max_bytes: u64,
+    _memory_high_bytes: u64,
 ) -> Result<bool> {
     Ok(false)
 }
@@ -1136,6 +1186,7 @@ pub fn allocate_vm_uid(
     vm_key: &str,
 ) -> std::io::Result<u32> {
     std::fs::create_dir_all(registry_dir)?;
+    let _registry_lock = lock_uid_registry(registry_dir)?;
     let cache = key_dir.join(".vm-uid");
     // Fast path: a cached uid whose marker still belongs to us.
     if let Some(uid) = std::fs::read_to_string(&cache)
@@ -1194,11 +1245,40 @@ pub fn allocate_vm_uid(
 /// shares its golden's uid and never claims its own). Linux-only.
 #[cfg(target_os = "linux")]
 pub fn free_vm_uid(registry_dir: &std::path::Path, key_dir: &std::path::Path) {
+    let Ok(_registry_lock) = lock_uid_registry(registry_dir) else {
+        tracing::warn!("unable to lock UID registry; retaining assignment");
+        return;
+    };
     if let Some(uid) = std::fs::read_to_string(key_dir.join(".vm-uid"))
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok())
     {
-        let _ = std::fs::remove_file(registry_dir.join(uid.to_string()));
+        if uid_marker_key(registry_dir, uid).as_deref()
+            == key_dir.file_name().and_then(|name| name.to_str())
+        {
+            let _ = std::fs::remove_file(registry_dir.join(uid.to_string()));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn lock_uid_registry(registry_dir: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(registry_dir.join(".allocation.lock"))?;
+    loop {
+        // Hold one transaction across lookup, claim, cache update and release.
+        // O_EXCL alone only makes UIDs unique, not assignments per machine.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(file);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
     }
 }
 
@@ -1206,25 +1286,58 @@ pub fn free_vm_uid(registry_dir: &std::path::Path, key_dir: &std::path::Path) {
 #[cfg(not(target_os = "linux"))]
 pub fn free_vm_uid(_registry_dir: &std::path::Path, _key_dir: &std::path::Path) {}
 
-/// The `(uid, gid)` a VM's VMM should drop to, allocated **collision-free** from
-/// `registry_dir`. Returns:
-/// - `None` — the drop doesn't apply (unprivileged launcher, or
-///   `SMOLVM_VM_UID_DROP=off`); boot proceeds without a drop.
-/// - `Some(Err(_))` — the drop is **active but allocation failed**; the caller
-///   MUST refuse to boot (fail closed — never silently run the VMM over-
-///   privileged, the same contract as `drop_privileges`).
-/// - `Some(Ok((uid, gid)))` — drop to this id.
-///
-/// A fork clone (`snapshot_dir` set, laid out as `<golden_dir>/s/<snapshot-id>`)
-/// resolves to the GOLDEN's uid so it can
-/// map the golden's memfd. gid mirrors uid (a per-VM group).
-///
-/// `share_uid_with` (when set) overrides the key resolution entirely: the VM
-/// resolves to THAT data dir's uid instead of claiming its own. Used by the
-/// pack-from-vm helper, which must read the source VM's 0700 disks — same trust
-/// domain, same uid (mirroring how a fork clone shares its golden's uid). The
-/// borrower never writes its own `.vm-uid`, so deleting it can't free the
-/// owner's uid.
+/// Find the registered owner of a directory's existing VM identity.
+#[cfg(target_os = "linux")]
+fn shared_uid_owner_dir(
+    registry_dir: &std::path::Path,
+    directory: &std::path::Path,
+    uid: u32,
+) -> std::io::Result<std::path::PathBuf> {
+    if !(VM_UID_BASE..VM_UID_BASE.saturating_add(VM_UID_SPAN)).contains(&uid) {
+        // A directory not yet assigned a VM uid follows normal allocation.
+        return Ok(directory.to_path_buf());
+    }
+    let key = uid_marker_key(registry_dir, uid).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "shared VM directory {} has UID {uid} without a registered owner",
+                directory.display()
+            ),
+        )
+    })?;
+    let mut components = std::path::Path::new(&key).components();
+    if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "shared VM UID registry contains an invalid owner key",
+        ));
+    }
+    let owner = registry_dir
+        .parent()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "UID registry has no parent",
+            )
+        })?
+        .join("vms")
+        .join(key);
+    if !owner.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("registered owner of shared VM UID {uid} no longer exists"),
+        ));
+    }
+    Ok(owner)
+}
+
+/// Allocate a VM identity, or borrow its snapshot/source directory's identity.
+/// Returns `None` when UID isolation is inactive; allocation errors must fail
+/// closed. Borrowers resolve to the registered owner, including when their
+/// source is itself a clone, and never claim or free an identity of their own.
 #[cfg(target_os = "linux")]
 pub fn vm_drop_ids(
     registry_dir: &std::path::Path,
@@ -1235,7 +1348,22 @@ pub fn vm_drop_ids(
     if !vm_uid_drop_active() {
         return None;
     }
-    let key_dir = match (share_uid_with, snapshot_dir) {
+    // A clone borrows its parent's uid and has no allocation of its own.
+    // Allocating against that clone's key would create a different identity
+    // for a helper that needs to read the clone's existing 0700 directory.
+    let shared_owner = match share_uid_with {
+        Some(directory) => {
+            use std::os::unix::fs::MetadataExt;
+            match std::fs::metadata(directory)
+                .and_then(|metadata| shared_uid_owner_dir(registry_dir, directory, metadata.uid()))
+            {
+                Ok(owner) => Some(owner),
+                Err(error) => return Some(Err(error)),
+            }
+        }
+        None => None,
+    };
+    let key_dir = match (shared_owner.as_deref(), snapshot_dir) {
         (Some(owner), _) => owner,
         (None, Some(snap)) => snap.parent().and_then(|p| p.parent()).unwrap_or(data_dir),
         (None, None) => data_dir,
@@ -1287,22 +1415,94 @@ pub fn ensure_traversable(dir: &std::path::Path) {
 #[cfg(not(target_os = "linux"))]
 pub fn ensure_traversable(_dir: &std::path::Path) {}
 
-/// Recursively `lchown` `path` to `(uid, gid)` (symlinks not followed). Used by
+/// Recursively `lchown` `path` to `(uid, gid)` (symlinks not followed), preserving
+/// root-owned mode-0444 data as immutable shared input. Used by
 /// the privileged launcher to hand a VM's data dir + disks + sockets to the uid
 /// its VMM will drop to. Linux-only; the caller is root.
 #[cfg(target_os = "linux")]
 pub fn chown_tree(path: &std::path::Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    chown_tree_except(path, uid, gid, None)
+}
+
+#[cfg(target_os = "linux")]
+const CHECKPOINT_BACKING_XATTR: &[u8] = b"user.smolvm.immutable-checkpoint-backing\0";
+
+/// Tag only verified, service-owned backing files. Unsupported filesystems
+/// retain the private-copy path rather than relying on a permission convention.
+#[cfg(target_os = "linux")]
+pub(crate) fn mark_checkpoint_backing(file: &std::fs::File) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    // The descriptor and both byte slices remain live for this syscall.
+    let result = unsafe {
+        libc::fsetxattr(
+            file.as_raw_fd(),
+            CHECKPOINT_BACKING_XATTR.as_ptr().cast(),
+            b"1".as_ptr().cast(),
+            1,
+            0,
+        )
+    };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::EOPNOTSUPP | libc::EPERM | libc::ENOSYS)
+    ) {
+        return Ok(false);
+    }
+    Err(error)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn chown_tree_except(
+    path: &std::path::Path,
+    uid: u32,
+    gid: u32,
+    excluded: Option<&std::path::Path>,
+) -> std::io::Result<()> {
+    if excluded == Some(path) {
+        return Ok(());
+    }
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path)?;
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // Service-owned immutable data may be shared by several restored VMs.
+    // Transferring its ownership would let one VM chmod a sibling's backing.
+    // Do not key this on link count: cache eviction/publication can change it.
+    if meta.is_file() && meta.uid() == 0 && meta.mode() & 0o7777 == 0o444 {
+        let mut marker = [0_u8; 1];
+        // lgetxattr does not follow a substituted symlink. Only explicitly
+        // tagged, root-owned immutable files keep shared ownership; unrelated
+        // read-only files still receive the ordinary per-machine owner.
+        let length = unsafe {
+            libc::lgetxattr(
+                c.as_ptr(),
+                CHECKPOINT_BACKING_XATTR.as_ptr().cast(),
+                marker.as_mut_ptr().cast(),
+                marker.len(),
+            )
+        };
+        if length == 1 && marker == *b"1" {
+            return Ok(());
+        }
+        if length < 0 {
+            let error = std::io::Error::last_os_error();
+            if !matches!(error.raw_os_error(), Some(libc::ENODATA | libc::EOPNOTSUPP)) {
+                return Err(error);
+            }
+        }
+    }
     if unsafe { libc::lchown(c.as_ptr(), uid, gid) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
     // Recurse into real directories only (not symlinked ones).
-    let meta = std::fs::symlink_metadata(path)?;
     if meta.file_type().is_dir() {
         for entry in std::fs::read_dir(path)? {
-            chown_tree(&entry?.path(), uid, gid)?;
+            chown_tree_except(&entry?.path(), uid, gid, excluded)?;
         }
     }
     Ok(())
@@ -1311,6 +1511,16 @@ pub fn chown_tree(path: &std::path::Path, uid: u32, gid: u32) -> std::io::Result
 /// No-op where chown isn't applicable (macOS dev).
 #[cfg(not(target_os = "linux"))]
 pub fn chown_tree(_path: &std::path::Path, _uid: u32, _gid: u32) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn chown_tree_except(
+    _: &std::path::Path,
+    _: u32,
+    _: u32,
+    _: Option<&std::path::Path>,
+) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -2952,11 +3162,17 @@ mod tests {
         let pid = unsafe { libc::getpid() };
         let vm = root.path().join(format!("vm-{pid}"));
         std::fs::create_dir(&vm).expect("create fake VM cgroup");
-        for file in ["cpu.max", "pids.max", "memory.max", "cgroup.procs"] {
+        for file in [
+            "cpu.max",
+            "pids.max",
+            "memory.high",
+            "memory.max",
+            "cgroup.procs",
+        ] {
             std::fs::write(vm.join(file), []).expect("create fake cgroup control");
         }
 
-        place_in_cgroup(root.path(), 2, 1024, true);
+        place_in_cgroup(root.path(), 2, 1024, true, false);
 
         assert_eq!(
             std::fs::read_to_string(vm.join("cpu.max")).expect("read boot CPU quota"),
@@ -2968,20 +3184,73 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(vm.join("memory.max")).expect("read memory limit"),
-            ((2 * 1024_u64 + VMM_MEM_OVERHEAD_MIB) * 1024 * 1024).to_string()
+            vmm_memory_budget(1024, true, false).max_bytes.to_string()
+        );
+        // The early reclaim threshold must be installed alongside the hard cap.
+        assert_eq!(
+            std::fs::read_to_string(vm.join("memory.high")).expect("read reclaim threshold"),
+            vmm_memory_budget(1024, true, false).high_bytes.to_string()
         );
     }
 
     #[test]
+    fn a_reclaim_threshold_always_sits_below_the_ceiling_and_above_the_guest() {
+        // The early threshold must sit above guest RAM, so the configured
+        // guest allocation alone cannot hold the cgroup in permanent reclaim.
+        for &mib in &[512_u32, 1024, 2048, 8192, 40960] {
+            for &(cuda, memfd) in &[(false, false), (false, true), (true, false)] {
+                let b = vmm_memory_budget(mib, cuda, memfd);
+                let guest = u64::from(mib) * 1024 * 1024;
+                assert!(
+                    b.high_bytes < b.max_bytes,
+                    "{mib} {cuda} {memfd}: high >= max"
+                );
+                assert!(
+                    b.high_bytes > guest,
+                    "{mib} {cuda} {memfd}: reclaim starts inside guest RAM"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_forkable_vm_gets_room_for_its_unreclaimable_memfd() {
+        // Preserve the conservative allowance for private COW pages in
+        // addition to the original shared backing.
+        let plain = vmm_memory_budget(2048, false, false);
+        let forkable = vmm_memory_budget(2048, false, true);
+        assert!(
+            forkable.max_bytes > plain.max_bytes + 1024 * 1024 * 1024,
+            "a forkable VM needs a guest-sized allowance beyond the plain cap"
+        );
+        // Keep reclaim headroom above the two-backing allowance.
+        let floor = 2048_u64 * 1024 * 1024 * 2;
+        assert!(
+            forkable.high_bytes > floor,
+            "no headroom above the shmem floor"
+        );
+    }
+
+    #[test]
+    fn overhead_scales_with_the_guest_instead_of_staying_flat() {
+        // A flat 768 MiB is 37% headroom at 2 GiB and 1.9% at 40 GiB; page
+        // tables, virtio rings and disk page cache all grow with the guest.
+        let small = vmm_memory_budget(2048, false, false).max_bytes - 2048 * 1024 * 1024;
+        let large = vmm_memory_budget(40960, false, false).max_bytes - 40960 * 1024 * 1024;
+        assert!(large > small * 4, "overhead did not scale with guest size");
+    }
+
+    #[test]
     fn cuda_vmm_memory_limit_allows_device_and_memfd_mappings() {
-        assert_eq!(
-            vmm_memory_limit_bytes(8192, true),
-            (2 * 8192_u64 + VMM_MEM_OVERHEAD_MIB) * 1024 * 1024
-        );
-        assert_eq!(
-            vmm_memory_limit_bytes(8192, false),
-            (8192_u64 + VMM_MEM_OVERHEAD_MIB) * 1024 * 1024
-        );
+        // CUDA device mappings are charged to this cgroup, so a CUDA VM needs
+        // room for a second guest-sized mapping. Asserted as a property rather
+        // than a literal: the overhead term is proportional now, so pinning the
+        // exact byte count would just re-encode the formula.
+        let guest = 8192_u64 * 1024 * 1024;
+        let with_cuda = vmm_memory_limit_bytes(8192, true, false);
+        let plain = vmm_memory_limit_bytes(8192, false, false);
+        assert!(with_cuda >= plain + guest, "no room for the device mapping");
+        assert!(plain > guest, "no overhead above the guest allocation");
     }
 
     #[test]
@@ -3251,6 +3520,38 @@ mod tests {
         std::fs::create_dir_all(&reg).unwrap();
         std::fs::create_dir_all(&vms).unwrap();
         (base, reg, vms)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_clone_uid_resolves_to_owner_without_claiming_a_new_uid() {
+        let (base, reg, vms) = tmp_uid_dirs("shared-clone");
+        let owner = vms.join("owner");
+        let clone = vms.join("clone");
+        std::fs::create_dir_all(&owner).unwrap();
+        std::fs::create_dir_all(&clone).unwrap();
+        let uid = allocate_vm_uid(&reg, &owner, "owner").unwrap();
+        let resolved = shared_uid_owner_dir(&reg, &clone, uid).unwrap();
+        assert_eq!(resolved, owner);
+        assert_eq!(allocate_vm_uid(&reg, &resolved, "owner").unwrap(), uid);
+        assert!(!clone.join(".vm-uid").exists());
+        assert_eq!(registered_uid(&reg, "clone"), None);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_uid_requires_a_live_registered_owner() {
+        let (base, reg, vms) = tmp_uid_dirs("shared-invalid");
+        let clone = vms.join("clone");
+        std::fs::create_dir_all(&clone).unwrap();
+        assert!(shared_uid_owner_dir(&reg, &clone, VM_UID_BASE).is_err());
+        std::fs::write(reg.join(VM_UID_BASE.to_string()), "missing").unwrap();
+        assert!(shared_uid_owner_dir(&reg, &clone, VM_UID_BASE).is_err());
+        std::fs::write(reg.join(VM_UID_BASE.to_string()), "../clone").unwrap();
+        assert!(shared_uid_owner_dir(&reg, &clone, VM_UID_BASE).is_err());
+        assert_eq!(shared_uid_owner_dir(&reg, &clone, 0).unwrap(), clone);
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[cfg(target_os = "linux")]

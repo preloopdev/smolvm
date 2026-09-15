@@ -33,6 +33,7 @@
 
 use crate::queues::WakePipe;
 use crate::PortMapping;
+use polling::{Event, Events, Poller};
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,7 +42,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(25);
 /// Maximum number of accepted published sockets queued for the poll loop.
 pub const DEFAULT_PUBLISH_QUEUE_CAPACITY: usize = 64;
 
@@ -60,7 +61,37 @@ pub struct AcceptedTcpConnection {
 /// Running published-port listener set for one guest NIC.
 pub struct TcpPortListeners {
     shutdown: Arc<AtomicBool>,
-    handles: Vec<JoinHandle<()>>,
+    handles: Vec<ListenerThread>,
+}
+
+struct ListenerThread {
+    handle: JoinHandle<()>,
+    poller: Arc<Poller>,
+}
+
+// Deregister before closing the socket, including on spawn failure and unwind.
+struct ReadyListener {
+    listener: TcpListener,
+    poller: Arc<Poller>,
+}
+
+impl ReadyListener {
+    fn new(listener: TcpListener) -> io::Result<Self> {
+        listener.set_nonblocking(true)?;
+        let poller = Arc::new(Poller::new()?);
+        // SAFETY: ReadyListener owns the socket and removes it in Drop before
+        // the socket closes. No borrowed source outlives its registration.
+        unsafe {
+            poller.add(&listener, Event::readable(0))?;
+        }
+        Ok(Self { listener, poller })
+    }
+}
+
+impl Drop for ReadyListener {
+    fn drop(&mut self) {
+        let _ = self.poller.delete(&self.listener);
+    }
 }
 
 impl TcpPortListeners {
@@ -99,7 +130,13 @@ impl TcpPortListeners {
                 Ok(listener) => listener,
                 Err(err) => {
                     shutdown_all(&shutdown, &mut handles);
-                    return Err(err);
+                    return Err(io::Error::new(
+                        err.kind(),
+                        format!(
+                            "cannot publish host TCP {publish_addr}:{} to guest TCP {}: {err}",
+                            mapping.host, mapping.guest,
+                        ),
+                    ));
                 }
             };
             let listener_v6 = match TcpListener::bind((publish_v6, mapping.host)) {
@@ -115,10 +152,10 @@ impl TcpPortListeners {
             };
 
             for listener in std::iter::once(listener).chain(listener_v6) {
-                if let Err(err) = listener.set_nonblocking(true) {
+                let listener = ReadyListener::new(listener).inspect_err(|_| {
                     shutdown_all(&shutdown, &mut handles);
-                    return Err(err);
-                }
+                })?;
+                let poller = listener.poller.clone();
 
                 let tcp_sender = tcp_sender.clone();
                 let publish_wake = publish_wake.clone();
@@ -144,7 +181,7 @@ impl TcpPortListeners {
                             "failed to spawn published-port listener thread for {host_port}: {err}"
                         ))
                     })?;
-                handles.push(handle);
+                handles.push(ListenerThread { handle, poller });
             }
         }
 
@@ -158,27 +195,31 @@ impl Drop for TcpPortListeners {
     }
 }
 
-fn shutdown_all(shutdown: &Arc<AtomicBool>, handles: &mut Vec<JoinHandle<()>>) {
+fn shutdown_all(shutdown: &Arc<AtomicBool>, handles: &mut Vec<ListenerThread>) {
     shutdown.store(true, Ordering::SeqCst);
-    for handle in handles.drain(..) {
-        let _ = handle.join();
+    for listener in handles.iter() {
+        let _ = listener.poller.notify();
+    }
+    for listener in handles.drain(..) {
+        let _ = listener.handle.join();
     }
 }
 
 fn run_tcp_port_listener(
-    listener: TcpListener,
+    listener: ReadyListener,
     host_port: u16,
     guest_port: u16,
     tcp_sender: SyncSender<AcceptedTcpConnection>,
     publish_wake: WakePipe,
     shutdown: Arc<AtomicBool>,
 ) {
+    let mut events = Events::new();
     loop {
         if shutdown.load(Ordering::SeqCst) {
             return;
         }
 
-        match listener.accept() {
+        match listener.listener.accept() {
             Ok((stream, peer_addr)) => {
                 let accepted = AcceptedTcpConnection {
                     stream,
@@ -201,8 +242,24 @@ fn run_tcp_port_listener(
                 }
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(ACCEPT_POLL_INTERVAL);
+                // Rearm after draining. Readiness arriving between accept and
+                // modify is retained; shutdown also wakes this wait explicitly.
+                if let Err(err) = listener
+                    .poller
+                    .modify(&listener.listener, Event::readable(0))
+                {
+                    tracing::warn!(host_port, error = %err, "published port readiness failed");
+                    return;
+                }
+                events.clear();
+                if let Err(err) = listener.poller.wait(&mut events, None) {
+                    if err.kind() != io::ErrorKind::Interrupted {
+                        tracing::warn!(host_port, error = %err, "published port readiness failed");
+                        return;
+                    }
+                }
             }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(err) => {
                 tracing::warn!(
                     host_port,
@@ -210,7 +267,7 @@ fn run_tcp_port_listener(
                     error = %err,
                     "published port listener accept failed"
                 );
-                thread::sleep(ACCEPT_POLL_INTERVAL);
+                thread::sleep(ACCEPT_ERROR_BACKOFF);
             }
         }
     }
@@ -226,4 +283,91 @@ pub fn create_tcp_channel() -> (
     mpsc::Receiver<AcceptedTcpConnection>,
 ) {
     mpsc::sync_channel(DEFAULT_PUBLISH_QUEUE_CAPACITY)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    fn listener_fixture(
+        capacity: usize,
+    ) -> (TcpPortListeners, u16, mpsc::Receiver<AcceptedTcpConnection>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ready = ReadyListener::new(listener).unwrap();
+        let poller = ready.poller.clone();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let flag = shutdown.clone();
+        let (sender, receiver) = mpsc::sync_channel(capacity);
+        let handle = thread::spawn(move || {
+            run_tcp_port_listener(ready, port, 8080, sender, WakePipe::new(), flag)
+        });
+        (
+            TcpPortListeners {
+                shutdown,
+                handles: vec![ListenerThread { handle, poller }],
+            },
+            port,
+            receiver,
+        )
+    }
+
+    #[test]
+    fn idle_listener_accepts_repeated_connections_and_shutdown_wakes_it() {
+        let (listeners, port, receiver) = listener_fixture(4);
+        for _ in 0..32 {
+            let client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+            let accepted = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(accepted.host_port, port);
+            assert_eq!(accepted.guest_port, 8080);
+            assert_eq!(accepted.peer_addr, client.local_addr().unwrap());
+        }
+        let (done, completion) = mpsc::channel();
+        thread::spawn(move || {
+            drop(listeners);
+            done.send(()).unwrap();
+        });
+        completion.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Accepted sockets may leave TIME_WAIT on this port (notably on
+        // Windows); partial_bind_failure below checks release without traffic.
+    }
+
+    #[test]
+    fn full_accept_queue_closes_excess_connections_without_blocking_shutdown() {
+        let (listeners, port, receiver) = listener_fixture(0);
+        let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        assert_eq!(client.read(&mut [0]).unwrap(), 0);
+        drop(listeners);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn partial_bind_failure_stops_prior_listeners_and_releases_their_ports() {
+        let available = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let first = available.local_addr().unwrap().port();
+        let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let second = occupied.local_addr().unwrap().port();
+        drop(available);
+        let (sender, _receiver) = mpsc::sync_channel(4);
+        let result = TcpPortListeners::start(
+            &[
+                PortMapping {
+                    host: first,
+                    guest: 8080,
+                },
+                PortMapping {
+                    host: second,
+                    guest: 8081,
+                },
+            ],
+            sender,
+            WakePipe::new(),
+        );
+        assert!(result.is_err());
+        assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, first)).is_ok());
+    }
 }

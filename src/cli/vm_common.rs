@@ -499,6 +499,8 @@ pub struct CreateVmParams {
     /// Expose the guest's Docker daemon socket to the host as a Unix socket.
     pub docker_socket: bool,
     /// Enable GPU acceleration (virtio-gpu with Venus/Vulkan).
+    /// Expose host virtualization extensions so the guest can run KVM.
+    pub nested_virt: bool,
     pub gpu: bool,
     /// GPU VRAM size in MiB (None = default). Ignored when gpu is false.
     pub gpu_vram_mib: Option<u32>,
@@ -724,6 +726,10 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     record.dns = params.dns;
     record.network_name = params.network_name.clone();
     record.gpu = if params.gpu { Some(true) } else { None };
+    // Persist nesting the same way: `machine start` rebuilds resources from the
+    // record, so a flag that only reaches the create-time launch is silently
+    // dropped on every later start.
+    record.nested_virt = if params.nested_virt { Some(true) } else { None };
     record.rosetta = if params.rosetta { Some(true) } else { None };
     // Same invariant the CLI enforces, applied again here because
     // Smolfile values arrive through `params.gpu_vram_mib` without
@@ -1657,11 +1663,7 @@ fn start_vm_named_with_db(
         // A fork clone shares its golden's uid; resolve it explicitly so a
         // cold (re)start can open the golden's CoW disk backing behind its
         // 0700 data dir.
-        uid_share_dir: record
-            .fork_overlay_owner
-            .as_deref()
-            .or(record.golden.as_deref())
-            .map(smolvm::agent::vm_data_dir),
+        uid_share_dir: record.vm_uid_owner().map(smolvm::agent::vm_data_dir),
         ..Default::default()
     }
     .with_packed_layers(
@@ -2746,6 +2748,7 @@ where
     if manager.try_connect_existing().is_some() {
         let pid_suffix = crate::cli::format_pid_suffix(manager.child_pid());
         println!("Machine '{}': running{}", label, pid_suffix);
+        print_memory_usage(&manager);
         extra(&manager);
         manager.detach();
     } else if let Some(ref n) = name {
@@ -2769,6 +2772,38 @@ where
     }
 
     Ok(())
+}
+
+/// Print what the machine is actually using, asked of the guest.
+///
+/// Deliberately not taken from the host: macOS charges the VMM's
+/// `phys_footprint` as `internal + compressed` with the compressed part counted
+/// at the pages' uncompressed size, so an idle machine whose memory has been
+/// compressed appears to be using several times what it occupies. The guest's
+/// allocator is the only thing that knows.
+///
+/// Silent when the machine's agent predates the request: a `status` that still
+/// reports state is more useful than one that fails over a detail.
+fn print_memory_usage(manager: &AgentManager) {
+    let Ok(mut client) = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())
+    else {
+        return;
+    };
+    let Ok(status) = client.memory_status() else {
+        return;
+    };
+    if status.total_bytes == 0 {
+        return;
+    }
+    let gib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let percent = status.used_bytes() as f64 * 100.0 / status.total_bytes as f64;
+    println!(
+        "  memory: {:.2} GiB of {:.2} GiB used ({:.0}%), {:.2} GiB available",
+        gib(status.used_bytes()),
+        gib(status.total_bytes),
+        percent,
+        gib(status.available_bytes),
+    );
 }
 
 /// Build the per-machine JSON object shared by `machine list --json` and

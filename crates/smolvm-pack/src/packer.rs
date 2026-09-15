@@ -4,11 +4,12 @@
 //! manifest, and footer into a self-contained `.smolmachine` package.
 //! See [`crate::format`] for the binary format specification.
 
+use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use crate::assets::{crc32_file_range, AssetCollector};
+use crate::assets::{crc32_file_range, crc32_reader_range, AssetCollector};
 use crate::format::{PackFooter, PackManifest, FOOTER_SIZE, SIDECAR_EXTENSION};
 use crate::Result;
 
@@ -16,11 +17,186 @@ use crate::Result;
 /// from causing excessive memory allocation.
 const MAX_MANIFEST_SIZE: u64 = 16 * 1024 * 1024;
 
+struct DigestWriter<W> {
+    inner: W,
+    sha256: Option<DigestWorker>,
+    digest_error: Option<std::io::Error>,
+}
+
+struct DigestWorker {
+    sender: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+    worker: Option<std::thread::JoinHandle<Sha256>>,
+}
+
+impl DigestWorker {
+    fn spawn() -> std::io::Result<Self> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<u8>>(2);
+        let worker = std::thread::Builder::new()
+            .name("checkpoint-sha256".into())
+            .spawn(move || {
+                let mut digest = Sha256::new();
+                for bytes in receiver {
+                    digest.update(&bytes);
+                }
+                digest
+            })?;
+        Ok(Self {
+            sender: Some(sender),
+            worker: Some(worker),
+        })
+    }
+
+    fn update(&self, bytes: &[u8]) -> std::io::Result<()> {
+        // Two queued chunks, one producer chunk, and one consumer chunk bound
+        // additional payload memory to 4 MiB, irrespective of artifact size.
+        for chunk in bytes.chunks(1024 * 1024) {
+            self.sender
+                .as_ref()
+                .expect("live digest sender")
+                .send(chunk.to_vec())
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "checkpoint digest worker stopped",
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> std::io::Result<String> {
+        drop(self.sender.take());
+        let digest = self
+            .worker
+            .take()
+            .expect("live digest worker")
+            .join()
+            .map_err(|_| std::io::Error::other("checkpoint digest worker failed"))?;
+        Ok(format!("{:x}", digest.finalize()))
+    }
+}
+
+impl Drop for DigestWorker {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl<W: Write> Write for DigestWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if let Some(error) = &self.digest_error {
+            return Err(std::io::Error::new(error.kind(), error.to_string()));
+        }
+        let written = self.inner.write(bytes)?;
+        if let Some(digest) = &mut self.sha256 {
+            // Once the file accepted bytes, report that progress accurately.
+            // A digest failure poisons subsequent writes and flush/publication.
+            if let Err(error) = digest.update(&bytes[..written]) {
+                self.digest_error = Some(error);
+            }
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(error) = &self.digest_error {
+            return Err(std::io::Error::new(error.kind(), error.to_string()));
+        }
+        self.inner.flush()
+    }
+}
+
+/// A digest produced by this process while writing an artifact, never supplied
+/// by an upload, a cache key, or an on-disk marker. The descriptor pins its inode.
+pub struct PackedArtifactIdentity {
+    file: File,
+    digest: String,
+    #[cfg(unix)]
+    identity: PackedInode,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PackedInode {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+#[cfg(unix)]
+impl PackedInode {
+    fn of(file: &File) -> std::io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata()?;
+        Ok(Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            len: meta.len(),
+            modified: (meta.mtime(), meta.mtime_nsec()),
+            changed: (meta.ctime(), meta.ctime_nsec()),
+        })
+    }
+}
+
+impl PackedArtifactIdentity {
+    /// Conservative, request-local reuse: both the pinned descriptor and the
+    /// current path must still name the exact bytes written by the packer.
+    pub(crate) fn digest_for(&self, path: &Path) -> Option<&str> {
+        #[cfg(unix)]
+        {
+            let current = File::open(path).ok()?;
+            (PackedInode::of(&self.file).ok()? == self.identity
+                && PackedInode::of(&current).ok()? == self.identity)
+                .then_some(self.digest.as_str())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (path, &self.file, &self.digest);
+            None
+        }
+    }
+}
+
+struct ChecksummedWriter<W> {
+    inner: W,
+    hasher: crc32fast::Hasher,
+    bytes: u64,
+}
+
+impl<W> ChecksummedWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hasher: crc32fast::Hasher::new(),
+            bytes: 0,
+        }
+    }
+}
+
+impl<W: Write> Write for ChecksummedWriter<W> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let count = self.inner.write(data)?;
+        self.hasher.update(&data[..count]);
+        self.bytes += count as u64;
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Binary packer for creating self-contained executables.
 pub struct Packer {
     stub_path: Option<std::path::PathBuf>,
     manifest: PackManifest,
     asset_collector: Option<AssetCollector>,
+    direct_artifact_io: bool,
 }
 
 /// Error type for try_pack_embedded_macho (internal).
@@ -39,7 +215,15 @@ impl Packer {
             stub_path: None,
             manifest,
             asset_collector: None,
+            direct_artifact_io: false,
         }
+    }
+
+    /// Prefer bounded direct writes for bulk artifacts on Linux; other hosts
+    /// and unsupported filesystems retain buffered writes and final syncing.
+    pub fn with_direct_artifact_io(mut self) -> Self {
+        self.direct_artifact_io = true;
+        self
     }
 
     /// Set the path to the stub executable.
@@ -166,35 +350,53 @@ impl Packer {
     /// libraries in the compressed assets. It is used for portable checkpoints,
     /// which are consumed by an installed smolvm rather than executed directly.
     pub fn pack_artifact(self, output: impl AsRef<Path>) -> Result<PackedInfo> {
-        let output = output.as_ref();
+        self.pack_artifact_inner(output.as_ref(), false)
+            .map(|(info, _)| info)
+    }
+
+    /// Compute the complete artifact digest, including its footer, as it is
+    /// written. Other pack callers pay no SHA-256 cost.
+    pub fn pack_artifact_with_identity(
+        self,
+        output: impl AsRef<Path>,
+    ) -> Result<(PackedInfo, PackedArtifactIdentity)> {
+        self.pack_artifact_inner(output.as_ref(), true)
+            .map(|(info, identity)| (info, identity.expect("digest requested")))
+    }
+
+    fn pack_artifact_inner(
+        self,
+        output: &Path,
+        compute_digest: bool,
+    ) -> Result<(PackedInfo, Option<PackedArtifactIdentity>)> {
         let parent = output.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent)?;
         let temp = tempfile::NamedTempFile::new_in(parent)?;
         let temp_path = temp.into_temp_path();
-        let assets_temp = tempfile::NamedTempFile::new_in(parent)?;
-        let assets_path = assets_temp.into_temp_path();
-
-        let assets_size = if let Some(collector) = &self.asset_collector {
-            collector.compress(&assets_path, false)?
+        let artifact = ChecksummedWriter::new(DigestWriter {
+            inner: crate::artifact_writer::ArtifactWriter::create(
+                &temp_path,
+                self.direct_artifact_io,
+            )?,
+            sha256: compute_digest.then(DigestWorker::spawn).transpose()?,
+            digest_error: None,
+        });
+        let mut artifact = if let Some(collector) = &self.asset_collector {
+            collector.compress_to(artifact, false)?
         } else {
-            let empty_file = File::create(&assets_path)?;
-            let encoder = zstd::stream::Encoder::new(empty_file, 1)?;
+            let encoder = zstd::stream::Encoder::new(artifact, 1)?;
             let tar_builder = tar::Builder::new(encoder);
             let encoder = tar_builder.into_inner()?;
-            encoder.finish()?;
-            fs::metadata(&assets_path)?.len()
+            encoder.finish()?
         };
-
-        let mut artifact = File::create(&temp_path)?;
-        std::io::copy(&mut File::open(&assets_path)?, &mut artifact)?;
+        let assets_size = artifact.bytes;
         let manifest_json = self.manifest.to_json()?;
         let manifest_offset = assets_size;
         let manifest_size = manifest_json.len() as u64;
         artifact.write_all(&manifest_json)?;
         artifact.flush()?;
-        drop(artifact);
-
-        let checksum = crc32_file_range(&temp_path, 0, assets_size + manifest_size)?;
+        let checksum = artifact.hasher.finalize();
+        let mut artifact = artifact.inner;
         let footer = PackFooter {
             stub_size: 0,
             assets_offset: 0,
@@ -203,22 +405,36 @@ impl Packer {
             manifest_size,
             checksum,
         };
-        let mut artifact = fs::OpenOptions::new().append(true).open(&temp_path)?;
         artifact.write_all(&footer.to_bytes())?;
-        artifact.sync_all()?;
-        drop(artifact);
+        artifact.flush()?;
+        let file = artifact.inner.finish()?;
+        file.sync_all()?;
+        let digest = artifact.sha256.map(DigestWorker::finish).transpose()?;
 
         temp_path
             .persist_noclobber(output)
             .map_err(|error| error.error)?;
-        Ok(PackedInfo {
-            stub_size: 0,
-            assets_size,
-            manifest_size,
-            total_size: assets_size + manifest_size + FOOTER_SIZE as u64,
-            checksum,
-            sidecar_path: Some(output.to_path_buf()),
-        })
+        let identity = digest
+            .map(|digest| {
+                Ok::<_, std::io::Error>(PackedArtifactIdentity {
+                    #[cfg(unix)]
+                    identity: PackedInode::of(&file)?,
+                    file,
+                    digest,
+                })
+            })
+            .transpose()?;
+        Ok((
+            PackedInfo {
+                stub_size: 0,
+                assets_size,
+                manifest_size,
+                total_size: assets_size + manifest_size + FOOTER_SIZE as u64,
+                checksum,
+                sidecar_path: Some(output.to_path_buf()),
+            },
+            identity,
+        ))
     }
 
     /// Pack everything into a single executable file (embedded format).
@@ -552,6 +768,11 @@ pub struct PackedInfo {
 /// the actual file size and within safe limits.
 pub fn read_footer_from_sidecar(sidecar_path: impl AsRef<Path>) -> Result<PackFooter> {
     let mut file = File::open(sidecar_path.as_ref())?;
+    read_footer_from_file(&mut file)
+}
+
+/// Read and bounds-check the footer of an already-open sidecar.
+pub fn read_footer_from_file(file: &mut File) -> Result<PackFooter> {
     let file_size = file.metadata()?.len();
 
     if file_size < FOOTER_SIZE as u64 {
@@ -666,6 +887,12 @@ pub fn verify_sidecar_checksum(
     sidecar_path: impl AsRef<Path>,
     footer: &PackFooter,
 ) -> Result<bool> {
+    let mut file = File::open(sidecar_path.as_ref())?;
+    verify_sidecar_checksum_file(&mut file, footer)
+}
+
+/// [`verify_sidecar_checksum`] over an already-open sidecar descriptor.
+pub fn verify_sidecar_checksum_file(file: &mut File, footer: &PackFooter) -> Result<bool> {
     let checksum_size = footer
         .assets_size
         .checked_add(footer.manifest_size)
@@ -675,7 +902,7 @@ pub fn verify_sidecar_checksum(
                 "assets_size + manifest_size overflow",
             ))
         })?;
-    let actual = crc32_file_range(sidecar_path.as_ref(), 0, checksum_size)?;
+    let actual = crc32_reader_range(file, 0, checksum_size)?;
     Ok(actual == footer.checksum)
 }
 
@@ -1011,6 +1238,160 @@ mod tests {
             read_manifest_from_sidecar(&output).unwrap().image,
             "vm://saved"
         );
+    }
+
+    #[test]
+    fn checksummed_writer_tracks_only_successful_short_writes() {
+        struct ShortWriter(Vec<u8>);
+        impl Write for ShortWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.0.len() == 6 {
+                    return Err(std::io::Error::other("injected write failure"));
+                }
+                let count = bytes.len().min(3);
+                self.0.extend_from_slice(&bytes[..count]);
+                Ok(count)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writer = ChecksummedWriter::new(ShortWriter(Vec::new()));
+        assert!(writer.write_all(b"123456789").is_err());
+        assert_eq!(writer.bytes, 6);
+        assert_eq!(writer.hasher.finalize(), crc32fast::hash(b"123456"));
+        assert_eq!(writer.inner.0, b"123456");
+
+        let mut writer = DigestWriter {
+            inner: ShortWriter(Vec::new()),
+            sha256: Some(DigestWorker::spawn().unwrap()),
+            digest_error: None,
+        };
+        assert!(writer.write_all(b"123456789").is_err());
+        assert_eq!(writer.inner.0, b"123456");
+        assert_eq!(
+            writer.sha256.take().unwrap().finish().unwrap(),
+            format!("{:x}", Sha256::digest(b"123456"))
+        );
+    }
+
+    #[test]
+    fn failed_digest_worker_cannot_publish_a_digest() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(2);
+        drop(receiver);
+        let worker = std::thread::spawn(|| -> Sha256 { panic!("test digest worker failure") });
+        let digest = DigestWorker {
+            sender: Some(sender),
+            worker: Some(worker),
+        };
+        assert!(digest.update(b"bytes").is_err());
+        assert!(digest.finish().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_artifact_keeps_exact_footer_checksum_and_digest() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("direct.smolcheckpoint");
+        let manifest = PackManifest::new(
+            "vm://saved".into(),
+            "none".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        let (info, identity) = Packer::new(manifest)
+            .with_direct_artifact_io()
+            .pack_artifact_with_identity(&output)
+            .unwrap();
+        let bytes = fs::read(&output).unwrap();
+        assert_eq!(info.total_size, bytes.len() as u64);
+        let expected = format!("{:x}", Sha256::digest(&bytes));
+        assert_eq!(identity.digest_for(&output), Some(expected.as_str()));
+        assert!(
+            verify_sidecar_checksum(&output, &read_footer_from_sidecar(&output).unwrap()).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn packed_identity_covers_footer_and_rejects_changed_inputs() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("local.smolcheckpoint");
+        let manifest = PackManifest::new(
+            "vm://saved".into(),
+            "none".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        let (info, identity) = Packer::new(manifest)
+            .pack_artifact_with_identity(&output)
+            .unwrap();
+        let bytes = fs::read(&output).unwrap();
+        let expected = format!("{:x}", Sha256::digest(&bytes));
+        assert_eq!(identity.digest_for(&output), Some(expected.as_str()));
+        assert_eq!(info.total_size, bytes.len() as u64);
+        assert!(
+            verify_sidecar_checksum(&output, &read_footer_from_sidecar(&output).unwrap()).unwrap()
+        );
+        // A downloaded/copied file has no local provenance, even when equal.
+        let copy = temp.path().join("download.smolcheckpoint");
+        fs::write(&copy, &bytes).unwrap();
+        assert!(identity.digest_for(&copy).is_none());
+        // A replacement at the original name cannot inherit its proof.
+        fs::rename(&copy, &output).unwrap();
+        assert!(identity.digest_for(&output).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn packed_identity_rejects_same_length_mutation_with_restored_mtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("local.smolcheckpoint");
+        let manifest = PackManifest::new(
+            "vm://saved".into(),
+            "none".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        let (_, identity) = Packer::new(manifest)
+            .pack_artifact_with_identity(&output)
+            .unwrap();
+        let modified = fs::metadata(&output).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let mut bytes = fs::read(&output).unwrap();
+        bytes[0] ^= 1;
+        fs::write(&output, bytes).unwrap();
+        File::options()
+            .write(true)
+            .open(&output)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert!(identity.digest_for(&output).is_none());
+    }
+
+    #[test]
+    fn standalone_artifact_without_assets_roundtrips() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("empty.smolcheckpoint");
+        let manifest = PackManifest::new(
+            "vm://empty".into(),
+            "none".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        let info = Packer::new(manifest).pack_artifact(&output).unwrap();
+        let footer = read_footer_from_sidecar(&output).unwrap();
+        assert_eq!(info.total_size, fs::metadata(&output).unwrap().len());
+        assert!(verify_sidecar_checksum(&output, &footer).unwrap());
+        crate::extract::extract_sidecar(
+            &output,
+            &directory.path().join("out"),
+            &footer,
+            false,
+            false,
+        )
+        .unwrap();
     }
 
     #[test]

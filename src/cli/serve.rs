@@ -438,7 +438,10 @@ impl ServeStartCmd {
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
             .unwrap_or(false);
         if drain {
-            smolvm::api::handlers::machines::drain_machines(&drain_state).await;
+            if !smolvm::api::handlers::machines::drain_machines(&drain_state).await {
+                tracing::warn!("drain incomplete; preserving remaining VMs for retry");
+            }
+            drain_state.detach_all();
         } else {
             // Non-draining shutdown (a binary-upgrade restart): VMs must survive
             // for the next `serve` process to reconnect to. Skipping drain isn't

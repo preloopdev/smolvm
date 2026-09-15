@@ -97,8 +97,33 @@ fn configured_credential(
     settings: &crate::settings::SmolSettings,
     registry: &str,
 ) -> Option<ProbeCredential> {
+    configured_credential_with(settings, registry, docker_credential)
+}
+
+/// [`configured_credential`] with the host Docker lookup injected, so tests
+/// stay independent of whatever `docker login` left on the machine.
+fn configured_credential_with(
+    settings: &crate::settings::SmolSettings,
+    registry: &str,
+    docker: impl Fn(&str) -> Option<ProbeCredential>,
+) -> Option<ProbeCredential> {
     credential_from(&settings.machines, registry)
         .or_else(|| credential_from(&settings.images, registry))
+        .or_else(|| docker(registry))
+}
+
+/// The credential `docker login` stored for `registry` on this host, when
+/// smolvm's own config has none. Identity tokens need an OAuth exchange the
+/// probe client does not implement, so they are left to the in-guest pull.
+fn docker_credential(registry: &str) -> Option<ProbeCredential> {
+    let cred = crate::docker_config::credential_for(registry)?;
+    if cred.is_identity_token() {
+        return None;
+    }
+    Some(ProbeCredential::Basic {
+        username: cred.username,
+        password: cred.secret,
+    })
 }
 
 /// Whether a registry error means "you are not authorized" rather than
@@ -372,7 +397,7 @@ mod tests {
         // Configured under `machines` — the section a pack probe expects.
         let s = settings_with_credential(|s| &mut s.machines, REG, "from-machines");
         assert!(matches!(
-            configured_credential(&s, REG),
+            configured_credential_with(&s, REG, |_| None),
             Some(ProbeCredential::Bearer(t)) if t == "from-machines"
         ));
 
@@ -382,7 +407,7 @@ mod tests {
         // naming nothing useful.
         let s = settings_with_credential(|s| &mut s.images, REG, "from-images");
         assert!(matches!(
-            configured_credential(&s, REG),
+            configured_credential_with(&s, REG, |_| None),
             Some(ProbeCredential::Bearer(t)) if t == "from-images"
         ));
 
@@ -397,7 +422,7 @@ mod tests {
             },
         );
         assert!(matches!(
-            configured_credential(&s, REG),
+            configured_credential_with(&s, REG, |_| None),
             Some(ProbeCredential::Bearer(t)) if t == "from-machines"
         ));
     }
@@ -407,9 +432,32 @@ mod tests {
         // The fallback crosses SECTIONS, never HOSTS: a credential for one
         // registry must not be presented to a different one.
         let s = settings_with_credential(|s| &mut s.images, "ghcr.io", "ghcr-secret");
-        assert!(configured_credential(&s, "registry.smolmachines.com").is_none());
-        assert!(configured_credential(&s, "docker.io").is_none());
-        assert!(configured_credential(&s, "ghcr.io").is_some());
+        assert!(configured_credential_with(&s, "registry.smolmachines.com", |_| None).is_none());
+        assert!(configured_credential_with(&s, "docker.io", |_| None).is_none());
+        assert!(configured_credential_with(&s, "ghcr.io", |_| None).is_some());
+    }
+
+    #[test]
+    fn docker_credentials_are_the_last_resort_and_host_scoped() {
+        let s = settings_with_credential(|s| &mut s.images, "ghcr.io", "ghcr-secret");
+        let docker = |registry: &str| {
+            (registry == "docker.io").then(|| ProbeCredential::Basic {
+                username: "hub-user".into(),
+                password: "hub-secret".into(),
+            })
+        };
+        // smolvm's own config wins for the registry it names…
+        assert!(matches!(
+            configured_credential_with(&s, "ghcr.io", docker),
+            Some(ProbeCredential::Bearer(t)) if t == "ghcr-secret"
+        ));
+        // …Docker's credential covers a registry smolvm has nothing for…
+        assert!(matches!(
+            configured_credential_with(&s, "docker.io", docker),
+            Some(ProbeCredential::Basic { username, .. }) if username == "hub-user"
+        ));
+        // …and neither leaks to a registry nobody has logged in to.
+        assert!(configured_credential_with(&s, "registry.smolmachines.com", docker).is_none());
     }
 
     #[test]

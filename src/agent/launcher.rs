@@ -786,6 +786,39 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
+        // Expose the host's virtualization extensions so the guest can run KVM
+        // (smolvm, QEMU, anything needing /dev/kvm). Refuse up front when the
+        // host cannot offer it: the alternative is a VM that boots fine and then
+        // fails deep inside the guest with a confusing "KVM not available".
+        if resources.nested_virt {
+            let set_nested = krun.set_nested_virt.ok_or_else(|| {
+                Error::agent(
+                    "nested virtualization",
+                    "this libkrun build has no krun_set_nested_virt; update the bundled library"
+                        .to_string(),
+                )
+            })?;
+            if let Some(check) = krun.check_nested_virt {
+                let supported = check();
+                if supported != 1 {
+                    return Err(Error::agent(
+                        "nested virtualization",
+                        format!(
+                            "the host cannot expose virtualization extensions (check returned {supported}).                              On Apple silicon this needs an M3 or newer and macOS 15+; on Linux it needs                              nested KVM enabled (kvm_intel.nested=1 or kvm_amd nested=1)."
+                        ),
+                    ));
+                }
+            }
+            let rc = set_nested(ctx, true);
+            if rc < 0 {
+                return Err(Error::agent(
+                    "nested virtualization",
+                    format!("krun_set_nested_virt failed (rc={rc})"),
+                ));
+            }
+            tracing::info!("nested virtualization enabled for the guest");
+        }
+
         // Enable GPU if requested (virgl for OpenGL + Venus for Vulkan via virtio-gpu).
         // Requires libkrun built with `gpu` feature and host virglrenderer.
         // On macOS, also requires MoltenVK (Vulkan → Metal translation).
@@ -1692,6 +1725,34 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
 
         // Fork clone: boot from a snapshot dir (CoW-map a golden VM's RAM +
         // restore state) instead of cold-booting, when SMOLVM_SNAPSHOT_DIR is set.
+        #[cfg(target_os = "linux")]
+        if let Some(raw) = std::env::var_os("SMOLVM_READONLY_RESTORE_FD") {
+            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+            std::env::remove_var("SMOLVM_READONLY_RESTORE_FD");
+            let fd: i32 = try_or_free_ctx!(
+                raw.to_string_lossy().parse(),
+                "restore RAM",
+                "invalid input descriptor"
+            );
+            if fd < 3 {
+                krun_free_ctx(ctx);
+                return Err(Error::agent("restore RAM", "invalid input descriptor"));
+            }
+            let input = OwnedFd::from_raw_fd(fd);
+            let set_memory = try_or_free_ctx!(
+                krun.set_snapshot_memory_fd.ok_or(()),
+                "restore RAM",
+                "libkrun lacks read-only snapshot memory support"
+            );
+            let result = set_memory(ctx, input.as_raw_fd());
+            if result < 0 {
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "restore RAM",
+                    format!("libkrun rejected read-only input: {result}"),
+                ));
+            }
+        }
         if let Ok(snap_dir) = std::env::var("SMOLVM_SNAPSHOT_DIR") {
             if !snap_dir.is_empty() {
                 match krun.set_snapshot {

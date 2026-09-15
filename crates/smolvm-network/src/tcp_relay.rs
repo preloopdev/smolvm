@@ -211,6 +211,14 @@ impl TcpRelayTable {
         }
     }
 
+    /// Start fresh stacks at different points in the ephemeral range. The guest
+    /// may still have connections from the stack saved in its checkpoint.
+    pub(crate) fn with_published_port_seed(mut self, seed: u16) -> Self {
+        self.next_published_port =
+            PUBLISHED_PORT_START + seed % (PUBLISHED_PORT_END - PUBLISHED_PORT_START + 1);
+        self
+    }
+
     /// Number of guest TCP flows currently occupying relay table entries.
     pub(crate) fn active_connections(&self) -> usize {
         self.connections.len()
@@ -921,6 +929,33 @@ fn flush_proxy_data(socket: &mut tcp::Socket<'_>, connection: &mut TrackedConnec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seeded_published_ports_wrap_without_reusing_live_ports() {
+        let mut table = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![], None)
+            .with_published_port_seed(u16::MAX);
+        assert_eq!(table.allocate_published_port(), Some(PUBLISHED_PORT_END));
+        assert_eq!(table.allocate_published_port(), Some(PUBLISHED_PORT_START));
+        for expected in PUBLISHED_PORT_START + 1..PUBLISHED_PORT_END {
+            assert_eq!(table.allocate_published_port(), Some(expected));
+        }
+        assert_eq!(table.allocate_published_port(), None);
+        table.used_published_ports.remove(&PUBLISHED_PORT_END);
+        assert_eq!(table.allocate_published_port(), Some(PUBLISHED_PORT_END));
+        assert_eq!(table.allocate_published_port(), None);
+    }
+
+    #[test]
+    fn different_port_seeds_do_not_restart_at_the_same_port() {
+        let mut first = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![], None)
+            .with_published_port_seed(123);
+        let mut second = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![], None)
+            .with_published_port_seed(456);
+        assert_ne!(
+            first.allocate_published_port(),
+            second.allocate_published_port()
+        );
+    }
 
     fn test_connection(to_proxy: SyncSender<Vec<u8>>) -> TrackedConnection {
         let (_from_proxy_tx, from_proxy) = mpsc::sync_channel(CHANNEL_CAPACITY);

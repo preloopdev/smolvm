@@ -28,6 +28,16 @@ const MAX_FORK_LINEAGE_DEPTH: usize = 32;
 
 type ForkDisk = (&'static str, PathBuf, crate::data::disk::DiskFormat);
 
+#[cfg(target_os = "linux")]
+fn prepare_isolated_snapshot_permissions(root: &Path, snapshot: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    // The service owns the index directory; the VMM owns only its generation.
+    // Explicit modes avoid a restrictive service umask blocking the VMM's path
+    // traversal, without exposing other generations' names or contents.
+    std::fs::set_permissions(snapshot, std::fs::Permissions::from_mode(0o700))?;
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o711))
+}
+
 /// Cross-process guard for one source machine's fork or checkpoint transaction.
 ///
 /// The in-process API/SDK lifecycle locks cannot serialize a separate CLI
@@ -343,6 +353,12 @@ fn branch_client(machine: &str, what: &str) -> Result<AgentClient> {
     Ok(client)
 }
 
+/// A portable restore releases the inherited branchpoint through this same
+/// protocol, even when the source did not declare a workload branch barrier.
+pub(crate) fn validate_checkpoint_agent(machine: &str) -> Result<()> {
+    branch_client(machine, "checkpoint machine").map(drop)
+}
+
 /// Wait until the golden workload reaches the standard live-fork boundary.
 ///
 /// The workload signals this by calling `smolvm-fork-ready`, which writes the
@@ -450,13 +466,15 @@ enum LiveBranchRamMode {
 }
 
 fn select_live_branch_ram_mode(
-    clone_count: usize,
     userfaultfd_available: bool,
     requested: Option<&str>,
 ) -> Result<LiveBranchRamMode> {
     match requested.unwrap_or("auto") {
-        "auto" if clone_count > 1 => Ok(LiveBranchRamMode::Shared),
-        "auto" if userfaultfd_available => Ok(LiveBranchRamMode::Paged),
+        // Every child can become active, including a held pool slot after it is
+        // leased. Compilers, browsers, and other dense workloads can turn a
+        // later generation into minutes of serialized fault delivery, so auto
+        // always selects the sparse materialized generation. Demand paging is
+        // retained as an explicit operator/debugging choice.
         "auto" => Ok(LiveBranchRamMode::Shared),
         "shared" => Ok(LiveBranchRamMode::Shared),
         "paged" if userfaultfd_available => Ok(LiveBranchRamMode::Paged),
@@ -610,6 +628,11 @@ fn fork_continue_snapshot(_snapshot_dir: &Path) -> bool {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn atomic_write_snapshot_file(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::agent("publish snapshot metadata", "metadata path has no parent"))?;
     let partial = path.with_extension(format!(
         "{}.partial",
         path.extension()
@@ -621,8 +644,15 @@ fn atomic_write_snapshot_file(path: &Path, contents: &[u8]) -> Result<()> {
         let mut file = std::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
+            .mode(0o600)
             .open(&partial)
             .map_err(|error| Error::agent("create snapshot metadata", error.to_string()))?;
+        // The service writes metadata after handing the generation to the VMM.
+        // Keep it private, but readable by that generation's owner.
+        let owner = std::fs::metadata(parent)
+            .map_err(|error| Error::agent("inspect snapshot owner", error.to_string()))?;
+        crate::process::chown_tree(&partial, owner.uid(), owner.gid())
+            .map_err(|error| Error::agent("hand snapshot metadata to VMM", error.to_string()))?;
         file.write_all(contents)
             .map_err(|error| Error::agent("write snapshot metadata", error.to_string()))?;
         file.sync_all()
@@ -631,9 +661,6 @@ fn atomic_write_snapshot_file(path: &Path, contents: &[u8]) -> Result<()> {
             .map_err(|error| Error::agent("publish snapshot metadata", error.to_string()))?;
         published = true;
         let _ = std::fs::remove_file(&partial);
-        let parent = path.parent().ok_or_else(|| {
-            Error::agent("publish snapshot metadata", "metadata path has no parent")
-        })?;
         File::open(parent)
             .and_then(|directory| directory.sync_all())
             .map_err(|error| Error::agent("sync snapshot directory", error.to_string()))
@@ -856,6 +883,17 @@ fn prepare_running_disk_generation(
         return Err(error);
     }
     if let Some((uid, gid)) = vm_ids {
+        #[cfg(target_os = "linux")]
+        if let Err(error) =
+            prepare_isolated_snapshot_permissions(&gdir.join("d"), &generation_disk_dir)
+                .and_then(|()| crate::process::chown_tree(&generation_disk_dir, uid, gid))
+        {
+            rollback_prepared_disk_generation(&overlays, &rotations, &generation_disk_dir);
+            return Err(Error::agent(
+                "hand disk generation to source VMM",
+                error.to_string(),
+            ));
+        }
         for (active, _, _) in &overlays {
             if let Err(error) = crate::process::chown_tree(active, uid, gid) {
                 rollback_prepared_disk_generation(&overlays, &rotations, &generation_disk_dir);
@@ -1406,7 +1444,7 @@ fn fork_lineage_memory_limit_bytes(record: &VmRecord, additional_ram_units: u64)
     let guest_bytes = u64::from(record.mem)
         .checked_mul(1024 * 1024)
         .ok_or_else(|| Error::agent("fork memory accounting", "guest memory size overflow"))?;
-    crate::process::vmm_memory_limit_bytes(record.mem, record.cuda)
+    crate::process::vmm_memory_limit_bytes(record.mem, record.cuda, true)
         .checked_add(
             additional_ram_units
                 .checked_mul(guest_bytes)
@@ -1415,6 +1453,19 @@ fn fork_lineage_memory_limit_bytes(record: &VmRecord, additional_ram_units: u64)
                 })?,
         )
         .ok_or_else(|| Error::agent("fork memory accounting", "lineage memory limit overflow"))
+}
+
+#[cfg(target_os = "linux")]
+fn fork_lineage_memory_budget(
+    record: &VmRecord,
+    additional_ram_units: u64,
+) -> Result<crate::process::VmmMemoryBudget> {
+    let base = crate::process::vmm_memory_budget(record.mem, record.cuda, true);
+    let max_bytes = fork_lineage_memory_limit_bytes(record, additional_ram_units)?;
+    Ok(crate::process::VmmMemoryBudget {
+        high_bytes: max_bytes - (base.max_bytes - base.high_bytes),
+        max_bytes,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -1434,8 +1485,10 @@ fn set_fork_lineage_memory_limit(
     if !crate::process::is_our_process_strict(pid, record.pid_start_time) {
         return Ok(false);
     }
-    let limit = fork_lineage_memory_limit_bytes(record, generations)?;
-    let updated = crate::process::set_managed_vmm_memory_limit(golden, pid, limit)?;
+    let budget = fork_lineage_memory_budget(record, generations)?;
+    let limit = budget.max_bytes;
+    let updated =
+        crate::process::set_managed_vmm_memory_limit(golden, pid, limit, budget.high_bytes)?;
     if updated {
         tracing::debug!(%golden, generations, memory_max_bytes = limit, "sized live-branch lineage cgroup");
     }
@@ -1464,7 +1517,7 @@ fn reconcile_fork_lineage_memory_limit(
 /// the source's persistent private-over-memfd backing, then reconcile it on
 /// drop after success or rollback.
 #[cfg(target_os = "linux")]
-struct ForkLineageMemoryReservation {
+pub(crate) struct ForkLineageMemoryReservation {
     golden: String,
     record: VmRecord,
     snapshot_dir: PathBuf,
@@ -1475,6 +1528,36 @@ struct ForkLineageMemoryReservation {
 
 #[cfg(target_os = "linux")]
 impl ForkLineageMemoryReservation {
+    /// Caller must hold the source lock until the memory worker has finished
+    /// or been cancelled; otherwise another operation could resize this scope.
+    pub(crate) fn checkpoint(golden: &str, snapshot_dir: &Path) -> Result<Self> {
+        let db = SmolvmDb::open()?;
+        let record = db
+            .get_vm(golden)?
+            .ok_or_else(|| Error::vm_not_found(golden))?;
+        let retained = db.retained_fork_snapshot(golden)?;
+        let generations = referenced_fork_generation_count(
+            &db,
+            golden,
+            &vm_data_dir(golden).join("s"),
+            retained.as_ref(),
+        )?;
+        Self::reserve(golden, &record, snapshot_dir, generations)
+    }
+
+    pub(crate) fn checkpoint_prepared(&mut self) -> Result<()> {
+        self.mark_source_rebased();
+        let db = SmolvmDb::open()?;
+        let identity = self.record.pid_start_time;
+        db.update_vm(&self.golden, |record| {
+            // Do not carry an allowance into a replacement VMM.
+            if record.pid == self.record.pid && record.pid_start_time == identity {
+                record.fork_lineage_pid_start_time = identity;
+            }
+        })?;
+        Ok(())
+    }
+
     fn reserve(
         golden: &str,
         record: &VmRecord,
@@ -1927,6 +2010,7 @@ pub(crate) fn prepare_forks_reusing(
     persist_snapshot: bool,
     reuse_live_snapshot: bool,
 ) -> Result<PreparedForkBatch> {
+    let preparation_started = std::time::Instant::now();
     if specs.is_empty() {
         return Err(Error::config("fork", "at least one clone is required"));
     }
@@ -2013,17 +2097,12 @@ pub(crate) fn prepare_forks_reusing(
         ));
     }
     let golden_was_paused = fork_base_already_paused(&status);
+    tracing::info!(%golden, phase = "source_ready", elapsed_ms = preparation_started.elapsed().as_millis() as u64, "fork preparation progress");
     let fork_continue = fork_continue_enabled();
     let userfaultfd_available = kernel_fault_userfaultfd_available();
     let requested_ram_mode = std::env::var("SMOLVM_BRANCH_RAM_MODE").ok();
     let live_ram_mode = fork_continue
-        .then(|| {
-            select_live_branch_ram_mode(
-                specs.len(),
-                userfaultfd_available,
-                requested_ram_mode.as_deref(),
-            )
-        })
+        .then(|| select_live_branch_ram_mode(userfaultfd_available, requested_ram_mode.as_deref()))
         .transpose()?;
 
     let gdir = vm_data_dir(golden);
@@ -2107,11 +2186,7 @@ pub(crate) fn prepare_forks_reusing(
             .transpose()
             .map_err(|e| Error::agent("create snapshot dir", e.to_string()))?
             .ok_or_else(|| Error::agent("create snapshot dir", "could not allocate a unique id"))?;
-        let uid_owner = golden_rec
-            .fork_overlay_owner
-            .as_deref()
-            .or(golden_rec.golden.as_deref())
-            .unwrap_or(golden);
+        let uid_owner = golden_rec.vm_uid_owner().unwrap_or(golden);
         let uid_owner_dir = vm_data_dir(uid_owner);
         let vm_ids = crate::process::vm_drop_ids(
             &crate::agent::vm_uid_registry_dir(),
@@ -2122,6 +2197,9 @@ pub(crate) fn prepare_forks_reusing(
         .transpose()
         .map_err(|e| Error::agent("fork: resolve golden uid", e.to_string()))?;
         if let Some((uid, gid)) = vm_ids {
+            #[cfg(target_os = "linux")]
+            prepare_isolated_snapshot_permissions(&snapshot_root, &snapshot_dir)
+                .map_err(|e| Error::agent("fork: prepare snapshot permissions", e.to_string()))?;
             crate::process::chown_tree(&snapshot_dir, uid, gid)
                 .map_err(|e| Error::agent("fork: chown snapshot dir", e.to_string()))?;
         }
@@ -2130,6 +2208,7 @@ pub(crate) fn prepare_forks_reusing(
             let _ = std::fs::remove_dir_all(&snapshot_dir);
             return Err(error);
         }
+        tracing::info!(%golden, phase = "guest_synced", elapsed_ms = preparation_started.elapsed().as_millis() as u64, "fork preparation progress");
 
         let forkpoint_armed = match arm_forkpoint_for_capture(golden) {
             Ok(armed) => armed,
@@ -2154,6 +2233,7 @@ pub(crate) fn prepare_forks_reusing(
             }
         }
 
+        tracing::info!(%golden, phase = "disk_generation_ready", elapsed_ms = preparation_started.elapsed().as_millis() as u64, "fork preparation progress");
         #[cfg(target_os = "linux")]
         let mut lineage_memory_reservation = if fork_continue {
             let reservation =
@@ -2184,22 +2264,15 @@ pub(crate) fn prepare_forks_reusing(
         };
 
         let t_snap = std::time::Instant::now();
-        // A batch maps one materialized memfd generation so siblings share
-        // every clean physical page. For a single sparse child, demand paging
-        // avoids materializing untouched source RAM when userfaultfd is usable.
-        // The environment override is an operator/debugging escape hatch; auto
-        // is the user-facing behavior.
+        tracing::info!(%golden, phase = "memory_reserved", elapsed_ms = preparation_started.elapsed().as_millis() as u64, "fork preparation progress");
+        // Active children map one sparse materialized memfd generation so CPU-
+        // and I/O-heavy work never serializes behind page-by-page delivery.
+        // Held pool slots use the same shared generation because they may run a
+        // dense workload as soon as they are leased. The environment override
+        // remains an operator and debugging escape hatch.
         let fork_verb = if fork_continue {
             match live_ram_mode.expect("fork-continue mode selected before capture") {
-                LiveBranchRamMode::Shared => {
-                    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-                    if specs.len() == 1 && !userfaultfd_available {
-                        tracing::warn!(
-                            "kernel-fault userfaultfd unavailable; using a shared materialized RAM generation (grant the service read/write access to /dev/userfaultfd to make sparse single-child branches lazy)"
-                        );
-                    }
-                    "FORK_CONTINUE"
-                }
+                LiveBranchRamMode::Shared => "FORK_CONTINUE",
                 LiveBranchRamMode::Paged => "FORK_CONTINUE_PAGED",
             }
         } else {
@@ -3524,26 +3597,54 @@ fn host_random_hex(hex_len: usize) -> Result<String> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn isolated_snapshot_permissions_allow_traversal_but_keep_contents_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("s");
+        let snapshot = root.join("generation");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        let payload = snapshot.join("memory.bin");
+        std::fs::write(&payload, b"private state").unwrap();
+        std::fs::set_permissions(&payload, std::fs::Permissions::from_mode(0o600)).unwrap();
+        for original_mode in [0o700, 0o755] {
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(original_mode))
+                .unwrap();
+            std::fs::set_permissions(&snapshot, std::fs::Permissions::from_mode(original_mode))
+                .unwrap();
+            prepare_isolated_snapshot_permissions(&root, &snapshot).unwrap();
+            assert_eq!(
+                std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+                0o711
+            );
+            assert_eq!(
+                std::fs::metadata(&snapshot).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&payload).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
     #[test]
     fn live_branch_ram_auto_shares_active_sibling_pages() {
         assert_eq!(
-            select_live_branch_ram_mode(2, true, None).unwrap(),
+            select_live_branch_ram_mode(true, None).unwrap(),
             LiveBranchRamMode::Shared
         );
         assert_eq!(
-            select_live_branch_ram_mode(100, false, Some("auto")).unwrap(),
+            select_live_branch_ram_mode(false, Some("auto")).unwrap(),
             LiveBranchRamMode::Shared
         );
     }
 
     #[test]
-    fn live_branch_ram_auto_pages_only_one_sparse_child() {
+    fn live_branch_ram_auto_shares_single_children_and_pool_slots() {
         assert_eq!(
-            select_live_branch_ram_mode(1, true, None).unwrap(),
-            LiveBranchRamMode::Paged
-        );
-        assert_eq!(
-            select_live_branch_ram_mode(1, false, None).unwrap(),
+            select_live_branch_ram_mode(true, None).unwrap(),
             LiveBranchRamMode::Shared
         );
     }
@@ -3551,11 +3652,11 @@ mod tests {
     #[test]
     fn live_branch_ram_override_is_validated() {
         assert_eq!(
-            select_live_branch_ram_mode(8, true, Some("paged")).unwrap(),
+            select_live_branch_ram_mode(true, Some("paged")).unwrap(),
             LiveBranchRamMode::Paged
         );
-        assert!(select_live_branch_ram_mode(8, false, Some("paged")).is_err());
-        assert!(select_live_branch_ram_mode(8, true, Some("copy-everything")).is_err());
+        assert!(select_live_branch_ram_mode(false, Some("paged")).is_err());
+        assert!(select_live_branch_ram_mode(true, Some("copy-everything")).is_err());
     }
 
     #[test]
@@ -4145,7 +4246,7 @@ mod tests {
         let mut record = VmRecord::new("golden".into(), 2, 1024, vec![], vec![], false);
         assert_eq!(
             fork_lineage_memory_limit_bytes(&record, 2).unwrap(),
-            3840 * 1024 * 1024
+            4864 * 1024 * 1024
         );
 
         record.cuda = true;
@@ -4153,6 +4254,19 @@ mod tests {
             fork_lineage_memory_limit_bytes(&record, 2).unwrap(),
             4864 * 1024 * 1024
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lineage_reclaim_threshold_tracks_growth_and_collection() {
+        let record = VmRecord::new("golden".into(), 2, 1024, vec![], vec![], false);
+        let base = fork_lineage_memory_budget(&record, 0).unwrap();
+        for generations in [1, 2, 8, 32, 8, 2, 0] {
+            let budget = fork_lineage_memory_budget(&record, generations).unwrap();
+            let retained = generations * 1024 * 1024 * 1024;
+            assert_eq!(budget.high_bytes, base.high_bytes + retained);
+            assert_eq!(budget.max_bytes, base.max_bytes + retained);
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -4217,7 +4331,42 @@ mod tests {
         let error = atomic_write_snapshot_file(&path, b"second\n").unwrap_err();
         assert!(error.to_string().contains("snapshot metadata"));
         assert_eq!(std::fs::read(&path).unwrap(), b"first\n");
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = std::fs::metadata(&path).unwrap();
+        let parent = std::fs::metadata(temp.path()).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(metadata.uid(), parent.uid());
+        assert_eq!(metadata.gid(), parent.gid());
         assert!(!temp.path().join("generation-disks.tsv.partial").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires root to verify isolated VMM ownership"]
+    fn snapshot_metadata_is_readable_only_by_its_isolated_owner() {
+        use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
+        let root = temp.path().join("s");
+        let generation = root.join("generation");
+        std::fs::create_dir_all(&generation).unwrap();
+        prepare_isolated_snapshot_permissions(&root, &generation).unwrap();
+        crate::process::chown_tree(&generation, 2_000_000, 2_000_000).unwrap();
+        let metadata = generation.join("block-pivots.tsv");
+        atomic_write_snapshot_file(&metadata, b"storage\t/private/disk\n").unwrap();
+        let read = |uid| {
+            std::process::Command::new("/bin/cat")
+                .arg(&metadata)
+                .uid(uid)
+                .gid(uid)
+                .output()
+                .unwrap()
+        };
+        let owner = read(2_000_000);
+        assert!(owner.status.success(), "{:?}", owner.stderr);
+        assert_eq!(owner.stdout, b"storage\t/private/disk\n");
+        assert!(!read(2_000_001).status.success());
     }
 
     #[test]

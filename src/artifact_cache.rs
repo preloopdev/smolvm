@@ -257,6 +257,142 @@ pub fn materialize_shared_pack_lease(
     Ok(lease)
 }
 
+/// Publish capture-owned prepared state without racing explicit cache pruning.
+pub fn retain_prepared_checkpoint(sidecar: &Path, prepared: &Path) -> io::Result<()> {
+    retain_prepared_checkpoint_with_identity(sidecar, prepared, None)
+}
+
+/// Retain service-owned capture state with a digest produced by the packer.
+pub fn retain_prepared_checkpoint_with_identity(
+    sidecar: &Path,
+    prepared: &Path,
+    identity: Option<&smolvm_pack::packer::PackedArtifactIdentity>,
+) -> io::Result<()> {
+    let file = fs::symlink_metadata(sidecar)?;
+    let parent = fs::metadata(
+        sidecar
+            .parent()
+            .ok_or_else(|| io::Error::other("capture has no parent"))?,
+    )?;
+    if !file.is_file() || file.uid() != 0 || parent.uid() != 0 || parent.mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "prepared retention requires a service-owned capture in a private directory",
+        ));
+    }
+    let _lock = lock_artifact_cache(&vm_cache_root(), false)?;
+    smolvm_pack::extract::retain_prepared_checkpoint_with_identity(
+        sidecar,
+        prepared,
+        &shared_pack_cache_root(),
+        identity,
+    )
+}
+
+/// A prepared input pinned against cache pruning for the duration of import.
+pub struct PreparedCheckpoint {
+    /// Service-owned artifact retaining the capture's verified identity.
+    pub path: PathBuf,
+    _lock: ArtifactCacheLock,
+}
+
+/// Select prepared state only for the exact retained artifact, while excluding pruning.
+pub fn open_prepared_checkpoint_for_sidecar(sidecar: &Path) -> io::Result<PreparedCheckpoint> {
+    let lock = lock_artifact_cache(&vm_cache_root(), false)?;
+    let reference = prepared_checkpoint_reference(sidecar)?;
+    let key = reference
+        .strip_prefix("checkpoint://")
+        .expect("generated reference");
+    let (crc, _) = key.split_once('-').expect("generated reference");
+    let shared = shared_pack_cache_root().join(crc);
+    if !smolvm_pack::extract::is_extracted(&shared) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "prepared checkpoint unavailable",
+        ));
+    }
+    Ok(PreparedCheckpoint {
+        path: shared.with_extension("prepared.smolcheckpoint"),
+        _lock: lock,
+    })
+}
+
+/// Return the node-local reference for a retained capture, if still available.
+pub fn prepared_checkpoint_reference(sidecar: &Path) -> io::Result<String> {
+    let footer =
+        smolvm_pack::packer::read_footer_from_sidecar(sidecar).map_err(io::Error::other)?;
+    let shared = smolvm_pack::extract::shared_pack_dir(&shared_pack_cache_root(), footer.checksum);
+    let digest = read_artifact_digest(&shared)?;
+    let source = fs::metadata(sidecar)?;
+    let retained = fs::metadata(shared.with_extension("prepared.smolcheckpoint"))?;
+    if !retained.is_file() || source.dev() != retained.dev() || source.ino() != retained.ino() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "this capture has no retained prepared checkpoint",
+        ));
+    }
+    Ok(format!("checkpoint://{:08x}-{digest}", footer.checksum))
+}
+
+/// Publish a cache alias while preserving verified local capture provenance.
+pub fn link_checkpoint_artifact(
+    source: &Path,
+    destination: &Path,
+    replace: bool,
+) -> io::Result<()> {
+    smolvm_pack::extract::link_checkpoint_artifact(
+        source,
+        destination,
+        &shared_pack_cache_root(),
+        replace,
+    )
+}
+
+/// Finish a private transfer alias; stale identities retain full verification.
+pub fn release_checkpoint_artifact_alias(artifact: &Path) {
+    #[cfg(target_os = "linux")]
+    let _ = smolvm_pack::extract::release_checkpoint_artifact_alias(
+        artifact,
+        &shared_pack_cache_root(),
+    );
+    #[cfg(not(target_os = "linux"))]
+    let _ = artifact;
+}
+
+/// Pin a node-local capture through import so pruning cannot remove its inputs.
+pub fn open_prepared_checkpoint(reference: &str) -> io::Result<PreparedCheckpoint> {
+    let key = reference.strip_prefix("checkpoint://").unwrap_or("");
+    let (crc, digest) = key.split_once('-').unwrap_or(("", ""));
+    if crc.len() != 8
+        || digest.len() != 64
+        || !crc
+            .bytes()
+            .chain(digest.bytes())
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid prepared checkpoint reference",
+        ));
+    }
+    let lock = lock_artifact_cache(&vm_cache_root(), false)?;
+    let shared = shared_pack_cache_root().join(crc);
+    if read_artifact_digest(&shared)? != digest {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "prepared checkpoint identity mismatch",
+        ));
+    }
+    let path = shared.with_extension("prepared.smolcheckpoint");
+    if !path.is_file() || !smolvm_pack::extract::is_extracted(&shared) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "prepared checkpoint evicted; use the durable artifact",
+        ));
+    }
+    Ok(PreparedCheckpoint { path, _lock: lock })
+}
+
 /// Copy a golden machine's shared artifact lease to a fork clone atomically.
 ///
 /// Returns `None` when the golden uses a private extraction rather than the
@@ -412,6 +548,7 @@ fn metadata_paths_for_shared(shared_dir: &Path) -> Vec<PathBuf> {
         digest.clone(),
         digest.with_extension("artifact-sha256.lock"),
         shared_dir.with_extension("artifact-source.json"),
+        shared_dir.with_extension("prepared.smolcheckpoint"),
     ]
 }
 
@@ -646,6 +783,70 @@ pub fn prune_artifact_caches(keep: usize, dry_run: bool) -> io::Result<ArtifactC
     prune_artifact_caches_in(&vm_cache_root(), keep, dry_run)
 }
 
+/// Bound unused prepared state without removing inputs leased by machines.
+pub fn prune_prepared_checkpoints(max_bytes: u64) -> io::Result<()> {
+    prune_prepared_checkpoints_in(&vm_cache_root(), max_bytes)
+}
+
+fn prune_prepared_checkpoints_in(vm_root: &Path, max_bytes: u64) -> io::Result<()> {
+    let _lock = lock_artifact_cache(vm_root, true)?;
+    let shared = vm_root.join("_shared");
+    let (digests, leases) = collect_machine_leases(vm_root, &shared)?;
+    // Interrupted publication may leave metadata without a prepared tree.
+    // The exclusive cache lock excludes captures and imports while reclaiming it.
+    if shared.exists() {
+        validate_real_cache_root(&shared)?;
+        for entry in fs::read_dir(&shared)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(crc) = name
+                .to_str()
+                .and_then(|name| name.strip_suffix(".prepared.smolcheckpoint"))
+            else {
+                continue;
+            };
+            if is_lower_hex(crc, 8) && !shared.join(crc).exists() {
+                for path in metadata_paths_for_shared(&shared.join(crc)) {
+                    match fs::remove_file(path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+        }
+    }
+    let candidates = inventory_candidates(&shared, &vm_root.join("_cow-bases"), &leases)?;
+    let mut unused: Vec<_> = candidates
+        .into_values()
+        .filter(|candidate| {
+            candidate
+                .shared_dirs
+                .iter()
+                .any(|dir| dir.with_extension("prepared.smolcheckpoint").is_file())
+                && !candidate
+                    .digest
+                    .as_ref()
+                    .is_some_and(|digest| digests.contains(digest))
+                && !candidate.shared_dirs.iter().any(|dir| leases.contains(dir))
+        })
+        .collect();
+    unused.sort_by(|a, b| {
+        b.modified
+            .cmp(&a.modified)
+            .then_with(|| a.artifact.cmp(&b.artifact))
+    });
+    let mut retained = 0_u64;
+    for candidate in unused {
+        if candidate.allocated_bytes <= max_bytes.saturating_sub(retained) {
+            retained = retained.saturating_add(candidate.allocated_bytes);
+        } else {
+            remove_candidate(&candidate)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,6 +877,71 @@ mod tests {
     fn publish_test_lease(machine: &Path, shared: &Path) {
         fs::create_dir_all(machine.join("pack")).unwrap();
         atomic_publish_pointer(&machine.join(SHARED_PACK_POINTER), shared).unwrap();
+    }
+
+    #[test]
+    fn prepared_budget_evicts_only_unleased_prepared_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("vms");
+        let (prepared, cow) = install_artifact(&root, "deadbeef", DIGEST_A);
+        let (ordinary, ordinary_cow) = install_artifact(&root, "12345678", DIGEST_B);
+        fs::write(
+            prepared.with_extension("prepared.smolcheckpoint"),
+            b"artifact",
+        )
+        .unwrap();
+        let machine = machine_dir(&root, "01");
+        publish_test_lease(&machine, &prepared);
+        prune_prepared_checkpoints_in(&root, 0).unwrap();
+        assert!(prepared.exists() && cow.exists());
+        fs::remove_dir_all(machine).unwrap();
+        prune_prepared_checkpoints_in(&root, u64::MAX).unwrap();
+        assert!(prepared.exists());
+        prune_prepared_checkpoints_in(&root, 0).unwrap();
+        assert!(!prepared.exists() && !cow.exists());
+        assert!(!prepared.with_extension("prepared.smolcheckpoint").exists());
+        assert!(ordinary.exists() && ordinary_cow.exists());
+    }
+
+    #[test]
+    fn prepared_budget_waits_for_active_reader() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("vms");
+        let (prepared, _) = install_artifact(&root, "deadbeef", DIGEST_A);
+        fs::write(
+            prepared.with_extension("prepared.smolcheckpoint"),
+            b"artifact",
+        )
+        .unwrap();
+        let pin = lock_artifact_cache(&root, false).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let root = &root;
+            scope.spawn(move || {
+                prune_prepared_checkpoints_in(root, 0).unwrap();
+                tx.send(()).unwrap();
+            });
+            assert!(rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err());
+            assert!(prepared.exists());
+            drop(pin);
+            rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        });
+        assert!(!prepared.exists());
+    }
+
+    #[test]
+    fn prepared_budget_cleans_interrupted_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("vms");
+        let shared = root.join("_shared");
+        fs::create_dir_all(&shared).unwrap();
+        fs::write(shared.join("deadbeef.prepared.smolcheckpoint"), b"orphan").unwrap();
+        fs::write(shared.join("deadbeef.artifact-sha256"), DIGEST_A).unwrap();
+        prune_prepared_checkpoints_in(&root, u64::MAX).unwrap();
+        assert!(!shared.join("deadbeef.prepared.smolcheckpoint").exists());
+        assert!(!shared.join("deadbeef.artifact-sha256").exists());
     }
 
     #[test]
@@ -896,4 +1162,26 @@ mod tests {
         assert_eq!(report.entries[0].artifact, "shared:deadbeef");
         assert!(!shared.exists());
     }
+}
+#[test]
+fn prepared_reference_rejects_paths_and_incomplete_digests() {
+    for reference in [
+        "checkpoint://../x",
+        "checkpoint://12345678-x",
+        "checkpoint://12345678/abc",
+        "not-a-checkpoint",
+    ] {
+        assert!(open_prepared_checkpoint(reference).is_err());
+    }
+}
+
+#[test]
+fn prepared_retention_rejects_nonprivate_capture_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    let artifact = dir.path().join("capture.smolcheckpoint");
+    fs::write(&artifact, b"unchanged").unwrap();
+    let error = retain_prepared_checkpoint(&artifact, dir.path()).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(fs::read(artifact).unwrap(), b"unchanged");
 }

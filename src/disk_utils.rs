@@ -604,16 +604,17 @@ fn sparse_copy_windows(src: &Path, dst: &Path) -> std::io::Result<u64> {
 /// Copy only data regions of a sparse file via SEEK_HOLE/SEEK_DATA.
 #[cfg(target_os = "linux")]
 fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<u64> {
+    use std::io::{Seek, SeekFrom};
     use std::os::unix::io::AsRawFd;
 
-    let src_file = std::fs::File::open(src)?;
+    let mut src_file = std::fs::File::open(src)?;
     let src_len = src_file.metadata()?.len();
     if src_len == 0 {
         std::fs::File::create(dst)?;
         return Ok(0);
     }
 
-    let dst_file = std::fs::OpenOptions::new()
+    let mut dst_file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
@@ -621,7 +622,6 @@ fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<u64> {
     dst_file.set_len(src_len)?;
 
     let src_fd = src_file.as_raw_fd();
-    let dst_fd = dst_file.as_raw_fd();
     let mut total: u64 = 0;
     let mut offset: i64 = 0;
     let mut buf = vec![0u8; 256 * 1024];
@@ -635,38 +635,98 @@ fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<u64> {
             return Err(std::io::Error::last_os_error());
         }
         let hole_start = unsafe { libc::lseek(src_fd, data_start, libc::SEEK_HOLE) };
-        let data_end = if hole_start < 0 {
-            src_len as i64
-        } else {
-            hole_start
-        };
-
-        let mut pos = data_start;
-        while pos < data_end {
-            let to_read = std::cmp::min((data_end - pos) as usize, buf.len());
-            let n =
-                unsafe { libc::pread(src_fd, buf.as_mut_ptr() as *mut libc::c_void, to_read, pos) };
-            if n <= 0 {
-                break;
-            }
-            let written = unsafe {
-                libc::pwrite(dst_fd, buf.as_ptr() as *const libc::c_void, n as usize, pos)
-            };
-            if written <= 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            pos += n as i64;
-            total += n as u64;
+        if hole_start < 0 {
+            return Err(std::io::Error::last_os_error());
         }
+        let data_end = hole_start.min(src_len as i64);
+        if data_start >= data_end {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "sparse source extent changed during copy",
+            ));
+        }
+        src_file.seek(SeekFrom::Start(data_start as u64))?;
+        dst_file.seek(SeekFrom::Start(data_start as u64))?;
+        let length = (data_end - data_start) as u64;
+        copy_extent_exact(&mut src_file, &mut dst_file, length, &mut buf)?;
+        total += length;
         offset = data_end;
     }
     Ok(total)
+}
+
+#[cfg(target_os = "linux")]
+fn copy_extent_exact(
+    source: &mut impl std::io::Read,
+    destination: &mut impl std::io::Write,
+    mut remaining: u64,
+    buffer: &mut [u8],
+) -> std::io::Result<()> {
+    while remaining > 0 {
+        let count = remaining.min(buffer.len() as u64) as usize;
+        source.read_exact(&mut buffer[..count])?;
+        destination.write_all(&buffer[..count])?;
+        remaining -= count as u64;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{Seek, SeekFrom, Write};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sparse_extent_copy_retries_partial_writes_and_interruptions() {
+        struct ShortWriter {
+            bytes: Vec<u8>,
+            interrupt: bool,
+        }
+        impl Write for ShortWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if std::mem::take(&mut self.interrupt) {
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                let count = bytes.len().min(3);
+                self.bytes.extend_from_slice(&bytes[..count]);
+                Ok(count)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let input = b"every byte in this extent must survive";
+        let mut source = &input[..];
+        let mut destination = ShortWriter {
+            bytes: Vec::new(),
+            interrupt: true,
+        };
+        copy_extent_exact(
+            &mut source,
+            &mut destination,
+            input.len() as u64,
+            &mut [0; 8],
+        )
+        .unwrap();
+        assert_eq!(destination.bytes, input);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sparse_extent_copy_rejects_truncated_input() {
+        let error =
+            copy_extent_exact(&mut &b"short"[..], &mut Vec::new(), 6, &mut [0; 8]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sparse_extent_copy_rejects_stalled_output() {
+        let error =
+            copy_extent_exact(&mut &b"data"[..], &mut &mut [][..], 4, &mut [0; 8]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WriteZero);
+    }
 
     /// `clone_or_copy_file` must reproduce a sparse file byte-for-byte on every
     /// platform — including the Windows sparse-copy path, which skips zero runs.
@@ -705,6 +765,16 @@ mod tests {
         );
         assert_eq!(&dst_bytes[..head.len()], head);
         assert_eq!(&dst_bytes[dst_bytes.len() - tail.len()..], tail);
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            // Exercise the fallback even on a filesystem supporting reflinks.
+            let sparse_dst = dir.path().join("sparse.img");
+            sparse_copy(&src, &sparse_dst).unwrap();
+            assert_eq!(std::fs::read(&sparse_dst).unwrap(), src_bytes);
+            assert!(std::fs::metadata(&sparse_dst).unwrap().blocks() * 512 < logical_len / 2);
+        }
 
         // On Windows the whole point is that the clone stays sparse — the 8 MiB
         // hole must NOT be allocated on disk. GetCompressedFileSizeW reports the

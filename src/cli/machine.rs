@@ -337,6 +337,9 @@ pub enum MachineCmd {
     /// Save a running machine, including RAM, as a portable checkpoint
     Checkpoint(super::pack::CheckpointCmd),
 
+    /// Remove unused objects from a checkpoint store
+    CheckpointPrune(super::pack::PruneCheckpointStoreCmd),
+
     /// Assign parameters and release one held branch-pool slot
     #[command(name = "branch-release", visible_alias = "fork-release")]
     BranchRelease(ForkReleaseCmd),
@@ -418,6 +421,7 @@ impl MachineCmd {
             MachineCmd::Start(cmd) => cmd.run(),
             MachineCmd::Branch(cmd) => cmd.run(),
             MachineCmd::Checkpoint(cmd) => cmd.run(),
+            MachineCmd::CheckpointPrune(cmd) => cmd.run(),
             MachineCmd::BranchRelease(cmd) => cmd.run(),
             MachineCmd::Stop(cmd) => cmd.run(),
             MachineCmd::Delete(cmd) => cmd.run(),
@@ -600,6 +604,13 @@ pub struct RunCmd {
     #[arg(long, help_heading = "Resources")]
     pub gpu: bool,
 
+    /// Expose the host's virtualization extensions so the guest can run KVM --
+    /// i.e. run smolvm, QEMU or Docker Desktop's hypervisor inside the machine.
+    /// Off by default: nesting turns work the guest would do natively into
+    /// vmexits, so a nested guest runs far slower.
+    #[arg(long = "nested", help_heading = "Resources")]
+    pub nested_virt: bool,
+
     /// GPU shared-memory region size in MiB. Ignored without --gpu.
     /// Default 4096 (4 GiB). Must be > 0.
     #[arg(
@@ -667,7 +678,9 @@ pub struct RunCmd {
     #[arg(long, help_heading = "Network")]
     pub docker_socket: bool,
 
-    /// Mount ~/.docker/ config into VM for registry authentication
+    /// Mount ~/.docker/ into the VM. Registry credentials from `docker login`
+    /// (credential helpers included) are resolved on the host for every pull,
+    /// so this is only needed for other contents of the directory.
     #[arg(long, help_heading = "Registry")]
     pub docker_config: bool,
 
@@ -1242,6 +1255,9 @@ impl RunCmd {
         )?;
 
         let mut params = params;
+        // `build_create_params` fills resources from the Smolfile, so a CLI-only
+        // flag has to be merged here or it never reaches the record.
+        params.nested_virt = params.nested_virt || self.nested_virt;
         params.allow_system_mounts = self.allow_system_mounts;
         if self.auto_graph {
             smolvm::util::enable_cuda_auto_graph_env_specs(&mut params.env);
@@ -1374,8 +1390,9 @@ impl RunCmd {
             // or serving a cached bake. A private image the caller cannot pull is
             // rejected here — the same registry-authorization gate the cloud path
             // uses, so caching never bypasses pull authorization. `FromConfig`
-            // reads the local docker-config credentials (so `docker login`ed
-            // private images resolve); anonymous is the fallback for public ones.
+            // reads smolvm's registry config, then the host's Docker credentials
+            // (so `docker login`ed private images resolve, credential helpers
+            // included); anonymous is the fallback for public ones.
             //
             // The resolved digest also becomes part of the cache key, so the entry
             // tracks the image's CONTENT: when a mutable tag moves upstream the key
@@ -1554,6 +1571,7 @@ impl RunCmd {
             network_name: params.network_name.clone(),
             // CLI --gpu wins; Smolfile gpu = true also enables it.
             gpu: self.gpu || params.gpu,
+            nested_virt: self.nested_virt,
             gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
             cuda: self.cuda || params.cuda,
             rosetta: self.rosetta || params.rosetta,
@@ -3285,6 +3303,12 @@ pub struct CreateCmd {
     #[arg(long)]
     pub gpu: bool,
 
+    /// Expose the host's virtualization extensions so the guest can run KVM --
+    /// i.e. run smolvm, QEMU or another hypervisor inside the machine. Off by
+    /// default: nesting turns work the guest would do natively into vmexits.
+    #[arg(long = "nested")]
+    pub nested_virt: bool,
+
     /// GPU shared-memory region size in MiB. Ignored without --gpu.
     /// Default 4096 (4 GiB). Must be > 0.
     #[arg(
@@ -3459,6 +3483,9 @@ impl CreateCmd {
             smolvm::util::parse_labels(&self.labels)?,
         )?;
         let mut params = params;
+        // `build_create_params` fills resources from the Smolfile, so a CLI-only
+        // flag has to be merged here or it never reaches the record.
+        params.nested_virt = params.nested_virt || self.nested_virt;
 
         // Resolve the image source on the host now, AFTER the CLI flag and the
         // Smolfile have been merged, so both take the same path: a registry
@@ -3503,6 +3530,7 @@ impl CreateCmd {
             dns: params.dns,
             network_name: params.network_name.clone(),
             gpu: params.gpu,
+            nested_virt: params.nested_virt,
             gpu_vram_mib: params.gpu_vram_mib,
             cuda: params.cuda,
             rosetta: params.rosetta,
@@ -3554,8 +3582,21 @@ impl CreateCmd {
         }
 
         // Read manifest from the sidecar to get image metadata.
-        let manifest = smolvm_pack::packer::read_manifest_from_sidecar(sidecar_path)
-            .map_err(|e| smolvm::Error::agent("read .smolmachine", e.to_string()))?;
+        let stored = sidecar_path.is_dir();
+        let footer = if stored {
+            None
+        } else {
+            Some(smolvm::portable_checkpoint::verified_sidecar_footer(
+                sidecar_path,
+            )?)
+        };
+        let manifest = if stored {
+            smolvm::checkpoint_store::read_manifest(sidecar_path)
+                .map_err(|e| smolvm::Error::agent("read stored checkpoint", e.to_string()))?
+        } else {
+            smolvm_pack::packer::read_manifest_from_sidecar(sidecar_path)
+                .map_err(|e| smolvm::Error::agent("read .smolmachine", e.to_string()))?
+        };
         let checkpoint = manifest.checkpoint.clone();
         if let Some(ref checkpoint) = checkpoint {
             smolvm::portable_checkpoint::validate_compatibility(checkpoint)?;
@@ -3591,12 +3632,6 @@ impl CreateCmd {
         // native binaries and cannot boot under a different-arch guest kernel. Only
         // the guest arch must match — the host OS does not (see the fn's docs).
         smolvm::platform::ensure_artifact_arch_matches_host(&manifest.platform)?;
-
-        // Read the footer now; the bundle is extracted into the machine's own
-        // data dir after `create_vm` succeeds (below), so a duplicate-name create
-        // cannot clobber an existing machine's layers.
-        let footer = smolvm_pack::packer::read_footer_from_sidecar(sidecar_path)
-            .map_err(|e| smolvm::Error::agent("read sidecar footer", e.to_string()))?;
 
         // A VM-mode pack (`--from-vm`) carries the source VM's overlay+storage
         // DISKS (the real rootfs), not OCI layers. Capture the templates before
@@ -3716,6 +3751,7 @@ impl CreateCmd {
             None => None,
         };
         let params = vm_common::CreateVmParams {
+            nested_virt: self.nested_virt,
             secret_refs: manifest.secret_refs,
             name,
             // A VM-mode pack is a VM, not a container: its synthetic `vm://<name>`
@@ -3830,6 +3866,7 @@ impl CreateCmd {
             dns: params.dns,
             network_name: params.network_name.clone(),
             gpu: params.gpu,
+            nested_virt: params.nested_virt,
             gpu_vram_mib: params.gpu_vram_mib,
             cuda: params.cuda,
             rosetta: params.rosetta,
@@ -3847,6 +3884,7 @@ impl CreateCmd {
 
         let mut record = vm_common::build_vm_record(&params)?;
         if checkpoint.is_some() {
+            record.host_uid_owner = Some(record.name.clone());
             // The restored RAM already contains the initialized guest and its
             // running workload. Re-running image pull/init after resume would
             // duplicate side effects and violate checkpoint semantics.
@@ -3886,12 +3924,16 @@ impl CreateCmd {
             }
 
             println!("Extracting .smolmachine assets...");
-            let result = if smolvm_pack::extract::shared_extract_enabled() {
+            let result = if stored {
+                smolvm::checkpoint_store::materialize(sidecar_path, &cache_dir)
+                    .map_err(|e| smolvm::Error::agent("materialize checkpoint", e.to_string()))?;
+                Ok((cache_dir.clone(), None))
+            } else if smolvm_pack::extract::shared_extract_enabled() {
                 #[cfg(target_os = "linux")]
                 {
                     let lease = smolvm::artifact_cache::materialize_shared_pack_lease(
                         sidecar_path,
-                        &footer,
+                        footer.as_ref().expect("file artifact has a footer"),
                         &cache_dir,
                         false,
                     )
@@ -3904,7 +3946,7 @@ impl CreateCmd {
                 smolvm_pack::extract::extract_sidecar(
                     sidecar_path,
                     &cache_dir,
-                    &footer,
+                    footer.as_ref().expect("file artifact has a footer"),
                     false,
                     false,
                 )

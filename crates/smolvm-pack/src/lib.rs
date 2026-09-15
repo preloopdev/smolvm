@@ -8,6 +8,7 @@
 
 #![deny(missing_docs)]
 
+mod artifact_writer;
 pub mod assets;
 pub mod detect;
 pub mod extract;

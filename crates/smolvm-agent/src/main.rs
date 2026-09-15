@@ -19,6 +19,8 @@ use std::sync::OnceLock;
 use tracing::{debug, error, info, warn};
 
 mod crun;
+mod shutdown;
+mod shutdown_freeze;
 
 /// Ensures storage disk is mounted exactly once. The mount happens either during
 /// deferred init (the common case) or on the first request that needs storage
@@ -315,6 +317,13 @@ fn main() {
     if std::env::var(guest_env::GPU).as_deref() == Ok(guest_env::VALUE_ON) {
         setup_gpu_dev_nodes();
     }
+
+    // Deliberately NOT under the GPU condition above: nesting and the GPU are
+    // independent, and gating this on --gpu would leave a --nested machine with
+    // no /dev/kvm. Cheap when unused — it returns immediately unless the kernel
+    // registered KVM.
+    #[cfg(target_os = "linux")]
+    setup_kvm_dev_node();
 
     // Set up persistent rootfs overlay (if /dev/vdb exists).
     // This does overlayfs + pivot_root before anything else touches the filesystem.
@@ -966,6 +975,46 @@ fn setup_gpu_dev_nodes() {
     }
 }
 
+/// Create `/dev/kvm` when the guest kernel registered it.
+///
+/// With nested virtualization the kernel brings KVM up and registers its misc
+/// device, but a workload container's `/dev` is not devtmpfs, so no node ever
+/// appears and anything needing a hypervisor fails with the misleading "KVM not
+/// available. Ensure KVM kernel module is loaded" -- the module IS there. Same
+/// gap the DRM nodes above work around, and the minor is read the same way.
+#[cfg(target_os = "linux")]
+fn setup_kvm_dev_node() {
+    if std::path::Path::new("/dev/kvm").exists() {
+        return;
+    }
+    let Ok(misc) = std::fs::read_to_string("/proc/misc") else {
+        return; // no kernel support: nothing to expose, and that is not an error
+    };
+    // /proc/misc lines are "<minor> <name>"; KVM is always misc major 10.
+    let Some(minor) = misc.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let minor = parts.next()?.parse::<u32>().ok()?;
+        (parts.next()? == "kvm").then_some(minor)
+    }) else {
+        return;
+    };
+    let Ok(path) = std::ffi::CString::new("/dev/kvm") else {
+        return;
+    };
+    // SAFETY: mknod a character device with KVM's fixed major and the minor the
+    // kernel just reported. 0666 so an unprivileged workload can use it too.
+    let rc = unsafe {
+        libc::mknod(
+            path.as_ptr(),
+            libc::S_IFCHR | 0o666,
+            libc::makedev(10, minor),
+        )
+    };
+    if rc == 0 {
+        tracing::info!(minor, "created /dev/kvm for nested virtualization");
+    }
+}
+
 /// Start the seatd seat manager daemon.
 ///
 /// seatd provides the seat management API that Wayland compositors (Weston, sway)
@@ -1415,78 +1464,8 @@ fn setup_persistent_rootfs() {
     // No-op on non-Linux platforms
 }
 
-/// Sync filesystem caches before shutdown.
-/// This prevents ext4 corruption when the VM is terminated.
-#[cfg(target_os = "linux")]
-fn sync_and_unmount_storage() {
-    info!("syncing filesystems before shutdown");
-
-    // Sync all filesystem caches to disk
-    // SAFETY: sync() is always safe to call
-    unsafe {
-        libc::sync();
-    }
-
-    // Flushing is not enough on its own: ext4 clears its recovery flag only
-    // when the filesystem is taken read-only or unmounted, so a machine that
-    // was merely synced leaves a journal for the next boot to replay. Replaying
-    // one that still holds metadata for recent writes can leave the image
-    // manifest unreadable, and the machine then starts with "image not found"
-    // even though nothing was lost.
-    //
-    // /storage cannot be unmounted -- the overlay sits on top of it -- but a
-    // read-only remount checkpoints the journal just the same and leaves the
-    // filesystem clean for the next mount.
-    remount_storage_read_only();
-}
-
-/// Takes /storage read-only so ext4 checkpoints its journal.
-#[cfg(target_os = "linux")]
-fn remount_storage_read_only() {
-    let Ok(target) = std::ffi::CString::new(paths::STORAGE_ROOT) else {
-        return;
-    };
-
-    // SAFETY: a remount needs only the target path; the source, filesystem type
-    // and options are unused and may be null.
-    let ret = unsafe {
-        libc::mount(
-            std::ptr::null(),
-            target.as_ptr(),
-            std::ptr::null(),
-            libc::MS_REMOUNT | libc::MS_RDONLY,
-            std::ptr::null(),
-        )
-    };
-
-    if ret == 0 {
-        info!(
-            "remounted {} read-only; journal checkpointed",
-            paths::STORAGE_ROOT
-        );
-    } else {
-        // Something still holds it writable. The sync above already flushed the
-        // data, so the next boot replays the journal as it did before.
-        warn!(
-            "could not remount {} read-only: {}; the next boot will replay the journal instead",
-            paths::STORAGE_ROOT,
-            std::io::Error::last_os_error()
-        );
-    }
-}
-
-/// Stub for non-Linux platforms.
-#[cfg(not(target_os = "linux"))]
-fn remount_storage_read_only() {}
-
-/// Stub for non-Linux platforms.
-#[cfg(not(target_os = "linux"))]
-fn sync_and_unmount_storage() {
-    // No-op on non-Linux platforms
-}
-
 /// Set up signal handlers to sync filesystem on SIGTERM/SIGINT.
-/// This prevents ext4 corruption when the VM is forcefully stopped.
+/// Best effort only; graceful host shutdown requires confirmed quiescence.
 #[cfg(target_os = "linux")]
 fn setup_signal_handlers() {
     // SAFETY: Signal handler that calls sync() - sync is async-signal-safe
@@ -2144,6 +2123,19 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             continue;
         }
 
+        if let AgentRequest::Shutdown { progress } = request {
+            shutdown::respond(stream, progress, || {
+                // Serialize shutdown requests without blocking progress for a
+                // second caller waiting for the first flush to finish.
+                static FLUSH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+                let _guard = FLUSH
+                    .lock()
+                    .map_err(|_| std::io::Error::other("storage synchronization lock poisoned"))?;
+                shutdown_freeze::freeze_internal_filesystems()
+            })?;
+            return Ok(());
+        }
+
         // Check if this is an interactive run request
         if let AgentRequest::Run {
             interactive: true, ..
@@ -2219,6 +2211,15 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
 
         if let AgentRequest::ArchiveDirectory { ref path } = request {
             handle_streaming_archive_directory(stream, path)?;
+            continue;
+        }
+
+        if let AgentRequest::FlattenLayers {
+            ref lowerdirs,
+            output: None,
+        } = request
+        {
+            handle_streaming_flatten_layers(stream, lowerdirs)?;
             continue;
         }
 
@@ -2311,7 +2312,7 @@ fn handle_request(
         AgentRequest::Ping
         | AgentRequest::NetworkTest { .. }
         | AgentRequest::VmExec { .. }
-        | AgentRequest::Shutdown => {}
+        | AgentRequest::Shutdown { .. } => {}
         _ => {
             ensure_storage_mounted();
         }
@@ -2319,8 +2320,10 @@ fn handle_request(
 
     match request {
         AgentRequest::Ping => {
-            let capabilities =
-                vec![smolvm_protocol::forkpoint::TYPED_BRANCHPOINT_CAPABILITY.to_string()];
+            let capabilities = vec![
+                smolvm_protocol::forkpoint::TYPED_BRANCHPOINT_CAPABILITY.to_string(),
+                smolvm_protocol::QUIESCED_SHUTDOWN_CAPABILITY.to_string(),
+            ];
             AgentResponse::Pong {
                 version: PROTOCOL_VERSION,
                 capabilities,
@@ -2347,6 +2350,7 @@ fn handle_request(
         AgentRequest::FormatStorage => handle_format_storage(),
 
         AgentRequest::StorageStatus => handle_storage_status(),
+        AgentRequest::MemoryStatus => handle_memory_status(),
 
         AgentRequest::BranchpointWait { timeout_ms } => {
             let markers = branchpoint::Markers::standard();
@@ -2398,9 +2402,15 @@ fn handle_request(
                 std::time::Duration::from_millis(timeout_ms),
             ))
         }
-        AgentRequest::FlattenLayers { lowerdirs, output } => {
-            handle_flatten_layers(&lowerdirs, &output)
-        }
+        AgentRequest::FlattenLayers { lowerdirs, output } => match output {
+            Some(output) => handle_flatten_layers(&lowerdirs, &output),
+            // Streaming goes through `handle_connection`'s explicit dispatch so
+            // it can emit multiple responses per request.
+            None => AgentResponse::error(
+                "streaming flatten must be handled at connection level",
+                error_codes::INTERNAL_ERROR,
+            ),
+        },
 
         AgentRequest::NetworkTest { url } => {
             info!(url = %url, "testing network connectivity directly from agent");
@@ -2463,14 +2473,10 @@ fn handle_request(
             }
         }
 
-        AgentRequest::Shutdown => {
-            info!("shutdown requested");
-            // Sync filesystem before shutdown to prevent corruption
-            sync_and_unmount_storage();
-            AgentResponse::Ok {
-                data: Some(serde_json::json!({"shutdown": true})),
-            }
-        }
+        AgentRequest::Shutdown { .. } => AgentResponse::error(
+            "shutdown must use the connection-level quiescence handler",
+            error_codes::INTERNAL_ERROR,
+        ),
 
         // VM-level background exec — spawn and return PID immediately
         AgentRequest::VmExec {
@@ -3833,6 +3839,7 @@ fn write_oci_bundle(
     // storage::run_command(). Mirror that path's GPU wiring so `-i`/`-t`
     // shells see /dev/dri when the VM was started with --gpu.
     spec.add_gpu_devices_if_available();
+    spec.add_kvm_device_if_available();
 
     if container_init {
         const INIT_SOURCE: &str = "/usr/local/bin/smolvm-agent";
@@ -5054,6 +5061,7 @@ fn spawn_interactive_command(
     let identity = oci::resolve_process_identity(rootfs_path, user)?;
     let mut spec = oci::OciSpec::new(command, env, workdir_str, false, &identity, unprivileged);
     spec.add_gpu_devices_if_available();
+    spec.add_kvm_device_if_available();
 
     for (tag, container_path, read_only) in mounts {
         let virtiofs_mount = storage::volume_bind_source(tag);
@@ -6490,6 +6498,96 @@ fn handle_flatten_layers(lowerdirs: &[String], output: &str) -> AgentResponse {
     }
 }
 
+/// Merge `lowerdirs` and stream the result back as a tar archive.
+///
+/// The same overlay merge [`handle_flatten_layers`] does, piped straight to the
+/// caller instead of landing on the guest's disk first. `pack create --from-vm`
+/// flattens a whole rootfs, so the staged form needs the export helper's disk to
+/// hold that rootfs *and* a second full copy of it as an archive; a large enough
+/// image runs the helper out of space partway through. Streaming keeps the
+/// archive off the disk entirely, so only the source rootfs has to fit.
+fn handle_streaming_flatten_layers(
+    stream: &mut impl Write,
+    lowerdirs: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    info!(
+        layer_count = lowerdirs.len(),
+        "flattening layers (streamed)"
+    );
+
+    // Held for the whole stream: dropping the guard unmounts the merged view, so
+    // it has to outlive the tar that reads through it.
+    let tree = match storage::flatten_layers(lowerdirs) {
+        Ok(tree) => tree,
+        Err(e) => {
+            send_response(
+                stream,
+                &AgentResponse::from_err(e, error_codes::MOUNT_FAILED),
+            )?;
+            return Ok(());
+        }
+    };
+
+    let mut child = match std::process::Command::new("tar")
+        .args(["-cf", "-", "-C"])
+        .arg(tree.path())
+        .arg(".")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    format!("failed to start flatten archive: {error}"),
+                    error_codes::EXPORT_FAILED,
+                ),
+            )?;
+            return Ok(());
+        }
+    };
+
+    let mut stdout = child.stdout.take().expect("piped tar stdout");
+    // Body-only, so tar's exit status is checked before the stream is declared
+    // clean: a tar that dies midway must not look like a complete archive.
+    let result = send_data_chunks_body(
+        stream,
+        &mut stdout,
+        smolvm_protocol::LAYER_CHUNK_SIZE,
+        "failed to read flatten archive",
+        error_codes::EXPORT_FAILED,
+    );
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    result?;
+    match child.wait() {
+        Ok(status) if status.success() => send_response(
+            stream,
+            &AgentResponse::DataChunk {
+                data: Vec::new(),
+                done: true,
+            },
+        ),
+        Ok(status) => send_response(
+            stream,
+            &AgentResponse::error(
+                format!("flatten archive exited with {status}"),
+                error_codes::EXPORT_FAILED,
+            ),
+        ),
+        Err(error) => send_response(
+            stream,
+            &AgentResponse::error(
+                format!("failed to wait for flatten archive: {error}"),
+                error_codes::EXPORT_FAILED,
+            ),
+        ),
+    }
+}
+
 /// Handle storage format request.
 fn handle_format_storage() -> AgentResponse {
     info!("formatting storage");
@@ -6568,6 +6666,57 @@ fn handle_streaming_export_layer(
 /// Handle storage status request.
 fn handle_storage_status() -> AgentResponse {
     AgentResponse::from_result(storage::status(), error_codes::STATUS_FAILED)
+}
+
+/// Report machine memory as the guest's own allocator sees it.
+///
+/// `/proc/meminfo` reports kB (always kibibytes, whatever the unit column
+/// says), so every value is scaled to bytes here and the protocol carries only
+/// bytes. A field the running kernel does not publish stays zero rather than
+/// failing the request: `SwapTotal` is absent on a guest with no swap, and
+/// `MemAvailable` predates some very old kernels.
+fn handle_memory_status() -> AgentResponse {
+    AgentResponse::from_result(read_meminfo("/proc/meminfo"), error_codes::STATUS_FAILED)
+}
+
+/// Parse the `Key:  value kB` lines of a meminfo file into bytes.
+fn read_meminfo(path: &str) -> std::io::Result<smolvm_protocol::MemoryStatus> {
+    let text = std::fs::read_to_string(path)?;
+    let mut status = smolvm_protocol::MemoryStatus::default();
+    let mut swap_free = 0u64;
+
+    for line in text.lines() {
+        let Some((key, rest)) = line.split_once(':') else {
+            continue;
+        };
+        // The value is the first token of the remainder; the unit, when present,
+        // is always kB.
+        let Some(value) = rest
+            .split_whitespace()
+            .next()
+            .and_then(|v| v.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let bytes = value.saturating_mul(1024);
+        match key {
+            "MemTotal" => status.total_bytes = bytes,
+            "MemAvailable" => status.available_bytes = bytes,
+            "MemFree" => status.free_bytes = bytes,
+            "Cached" => status.cached_bytes = bytes,
+            "SwapTotal" => status.swap_total_bytes = bytes,
+            "SwapFree" => swap_free = bytes,
+            _ => {}
+        }
+    }
+
+    status.swap_used_bytes = status.swap_total_bytes.saturating_sub(swap_free);
+    // A kernel too old for MemAvailable would otherwise report everything as
+    // used; free plus reclaimable cache is the estimate it replaced.
+    if status.available_bytes == 0 {
+        status.available_bytes = status.free_bytes.saturating_add(status.cached_bytes);
+    }
+    Ok(status)
 }
 
 // ============================================================================
@@ -7942,5 +8091,89 @@ fn branchpoint_error(e: branchpoint::TypedError) -> AgentResponse {
     AgentResponse::Error {
         message: e.message,
         code: Some(e.code.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod meminfo_tests {
+    use super::read_meminfo;
+
+    fn write(contents: &str) -> tempfile::NamedTempFile {
+        use std::io::Write as _;
+        let mut f = tempfile::NamedTempFile::new().expect("temp file");
+        f.write_all(contents.as_bytes()).expect("write");
+        f.flush().expect("flush");
+        f
+    }
+
+    /// meminfo reports kibibytes, so every field has to be scaled. Reading the
+    /// numbers as bytes would understate a machine's memory 1024-fold.
+    #[test]
+    fn values_are_scaled_from_kibibytes_to_bytes() {
+        let f = write(
+            "MemTotal:        4035968 kB\n\
+             MemFree:         4001728 kB\n\
+             MemAvailable:    3982212 kB\n\
+             Cached:             9512 kB\n",
+        );
+        let m = read_meminfo(f.path().to_str().unwrap()).expect("parses");
+
+        assert_eq!(m.total_bytes, 4_035_968 * 1024);
+        assert_eq!(m.free_bytes, 4_001_728 * 1024);
+        assert_eq!(m.available_bytes, 3_982_212 * 1024);
+        assert_eq!(m.cached_bytes, 9_512 * 1024);
+        // Total minus available is what the guest cannot hand back.
+        assert_eq!(m.used_bytes(), (4_035_968 - 3_982_212) * 1024);
+    }
+
+    /// Swap is reported as total and free; used is the difference. A guest with
+    /// no swap publishes neither line and must report zero, not garbage.
+    #[test]
+    fn swap_used_is_total_minus_free_and_absent_swap_is_zero() {
+        let with_swap = write(
+            "MemTotal:        1024 kB\n\
+             MemAvailable:     512 kB\n\
+             SwapTotal:       2048 kB\n\
+             SwapFree:         512 kB\n",
+        );
+        let m = read_meminfo(with_swap.path().to_str().unwrap()).expect("parses");
+        assert_eq!(m.swap_total_bytes, 2048 * 1024);
+        assert_eq!(m.swap_used_bytes, (2048 - 512) * 1024);
+
+        let no_swap = write("MemTotal:        1024 kB\nMemAvailable:     512 kB\n");
+        let m = read_meminfo(no_swap.path().to_str().unwrap()).expect("parses");
+        assert_eq!(m.swap_total_bytes, 0);
+        assert_eq!(m.swap_used_bytes, 0);
+    }
+
+    /// Kernels predating MemAvailable would otherwise report the whole machine
+    /// as used, since used is derived from it.
+    #[test]
+    fn a_kernel_without_mem_available_falls_back_to_free_plus_cache() {
+        let f = write(
+            "MemTotal:        1000 kB\n\
+             MemFree:          200 kB\n\
+             Cached:           300 kB\n",
+        );
+        let m = read_meminfo(f.path().to_str().unwrap()).expect("parses");
+        assert_eq!(m.available_bytes, 500 * 1024);
+        assert_eq!(m.used_bytes(), 500 * 1024);
+    }
+
+    /// Lines this build does not care about, and malformed ones, must not
+    /// derail the fields it does read.
+    #[test]
+    fn unknown_and_malformed_lines_are_skipped() {
+        let f = write(
+            "Committed_AS:   123456 kB\n\
+             not a meminfo line\n\
+             HugePages_Total:     0\n\
+             MemTotal:         2048 kB\n\
+             Bogus:          notanumber kB\n\
+             MemAvailable:     1024 kB\n",
+        );
+        let m = read_meminfo(f.path().to_str().unwrap()).expect("parses");
+        assert_eq!(m.total_bytes, 2048 * 1024);
+        assert_eq!(m.available_bytes, 1024 * 1024);
     }
 }

@@ -3871,6 +3871,18 @@ fn proc_table(name: &str) -> Option<*mut c_void> {
         "cuKernelSetAttribute" => cuKernelSetAttribute,
         "cuMemAlloc" => cuMemAlloc_v2,
         "cuMemFree" => cuMemFree_v2,
+        // CUDA VMM is resolved by current PyTorch through cuGetProcAddress,
+        // not the libcudart driver-entrypoint helper. Keep this complete as a
+        // lifecycle: advertising cuMemCreate alone makes the allocator get
+        // past capability detection only to fail while mapping its segment.
+        "cuMemAddressReserve" => cuMemAddressReserve,
+        "cuMemAddressFree" => cuMemAddressFree,
+        "cuMemCreate" => cuMemCreate,
+        "cuMemRelease" => cuMemRelease,
+        "cuMemMap" => cuMemMap,
+        "cuMemUnmap" => cuMemUnmap,
+        "cuMemSetAccess" => cuMemSetAccess,
+        "cuMemGetAllocationGranularity" => cuMemGetAllocationGranularity,
         "cuMemPoolCreate" => cuMemPoolCreate,
         "cuMemPoolDestroy" => cuMemPoolDestroy,
         "cuMemPoolSetAttribute" => cuMemPoolSetAttribute,
@@ -4318,6 +4330,22 @@ mod cuda_13_proc_tests {
         assert_eq!(
             proc_table("cuKernelSetAttribute"),
             Some(cuKernelSetAttribute as *mut c_void)
+        );
+    }
+
+    #[test]
+    fn resolves_vmm_lifecycle_for_modern_pytorch() {
+        assert_eq!(
+            resolve_proc("cuMemCreate", 13000),
+            Some(cuMemCreate as *mut c_void)
+        );
+        assert_eq!(
+            resolve_proc("cuMemMap_v2", 13000),
+            Some(cuMemMap as *mut c_void)
+        );
+        assert_eq!(
+            resolve_proc("cuMemGetAllocationGranularity", 13000),
+            Some(cuMemGetAllocationGranularity as *mut c_void)
         );
     }
 

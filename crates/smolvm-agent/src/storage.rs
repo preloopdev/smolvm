@@ -36,6 +36,8 @@ const OVERLAYS_DIR: &str = "overlays";
 const WORKSPACE_DIR: &str = "workspace";
 const DOCKER_HUB_AUTH_CONFIG_KEY: &str = "https://index.docker.io/v1/";
 const DOCKER_HUB_REGISTRY_ALIASES: &[&str] = &["docker.io", "index.docker.io"];
+/// Username Docker uses when the secret is an OAuth identity token.
+const DOCKER_IDENTITY_TOKEN_USERNAME: &str = "<token>";
 
 fn validate_storage_id(value: &str, context: &str) -> Result<()> {
     if value.is_empty() {
@@ -830,7 +832,7 @@ where
         std::fs::create_dir_all(&dir)?;
         info!(layer = %stem, "unpacking staged layer");
         progress("unpacking image layers", 0);
-        extract_layer_tar(tar, &dir)?;
+        extract_layer_tar_with_progress(tar, &dir, || progress("unpacking image layers", 0))?;
     }
 
     // Carry the stacking order across; without it the guest would fall back to
@@ -871,15 +873,20 @@ fn staged_tars_signature(tars: &[PathBuf]) -> Result<String> {
 /// always does — that is the whole point of unpacking here rather than on the
 /// host.
 fn extract_layer_tar(tar: &Path, dir: &Path) -> Result<()> {
-    let out = Command::new("tar")
+    extract_layer_tar_with_progress(tar, dir, || {})
+}
+
+fn extract_layer_tar_with_progress(tar: &Path, dir: &Path, progress: impl FnMut()) -> Result<()> {
+    let mut command = Command::new("tar");
+    command
         .arg("-x")
         .arg("-f")
         .arg(tar)
         .arg("-C")
         .arg(dir)
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
+        .stderr(Stdio::piped());
+    let out = command_output_with_progress(&mut command, progress)
         .map_err(|e| StorageError::new(format!("failed to run tar: {e}")))?;
     if !out.status.success() {
         return Err(StorageError::new(format!(
@@ -889,6 +896,30 @@ fn extract_layer_tar(tar: &Path, dir: &Path) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Drain child output while the caller keeps its streaming RPC responsive.
+fn command_output_with_progress(
+    command: &mut Command,
+    mut progress: impl FnMut(),
+) -> std::io::Result<std::process::Output> {
+    std::thread::scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("layer-unpack".into())
+            .spawn_scoped(scope, move || {
+                let _ = tx.send(command.output());
+            })?;
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                Ok(result) => return result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => progress(),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(std::io::Error::other("layer unpack worker stopped"));
+                }
+            }
+        }
+    })
 }
 
 /// The directory whose subdirs are this pack's layers, materialising them first
@@ -2223,9 +2254,7 @@ fn fetch_and_extract_layer(
             crane_cmd.stderr(Stdio::null());
         }
     }
-    if let Some(ref td) = temp_dir {
-        crane_cmd.env("DOCKER_CONFIG", td.path());
-    }
+    crane_cmd.env("DOCKER_CONFIG", temp_dir.path());
     apply_proxy_env(&mut crane_cmd, proxy, no_proxy);
 
     let mut crane = crane_cmd
@@ -2313,7 +2342,10 @@ where
         info!(image = %image, "using packed layers, skipping network pull");
         // A saved-image archive is flattened, host-staged tars are unpacked
         // here, and an already-unpacked dir is used as-is.
-        return create_packed_image_info(image, &effective_packed_dir(packed_dir)?);
+        let effective = effective_packed_dir_with_progress(packed_dir, |phase, _| {
+            progress(0, 0, phase);
+        })?;
+        return create_packed_image_info(image, &effective);
     }
 
     // Determine OCI platform - default to current architecture
@@ -2609,17 +2641,55 @@ where
     })
 }
 
+/// Inspect only completed local materializations; never extract during Query.
+fn query_packed_image(
+    image: &str,
+    packed_dir: &Path,
+    storage_root: &Path,
+) -> Result<Option<ImageInfo>> {
+    let archive = packed_dir.join(ARCHIVE_FILE_NAME);
+    let effective = if archive.exists() {
+        let key = packed_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("archive");
+        let out = storage_root.join("image-archives").join(key);
+        if std::fs::read_to_string(out.join(ARCHIVE_EXTRACTED_MARKER)).ok()
+            != Some(archive_signature(&archive)?)
+        {
+            return Ok(None);
+        }
+        out
+    } else {
+        let tars = staged_layer_tars(packed_dir)?;
+        if tars.is_empty() {
+            packed_dir.to_path_buf()
+        } else {
+            let key = packed_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("packed");
+            let out = storage_root.join(GUEST_LAYERS_DIR).join(key);
+            if std::fs::read_to_string(out.join(GUEST_LAYERS_MARKER)).ok()
+                != Some(staged_tars_signature(&tars)?)
+            {
+                return Ok(None);
+            }
+            out
+        }
+    };
+    create_packed_image_info(image, &effective).map(Some)
+}
+
 /// Query if an image exists locally.
 pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
     let image = normalize_image_ref(image);
     let image = image.as_str();
 
-    // Packed layers (a `.smolmachine` or a staged local image archive/dir):
-    // synthesize image info without a registry manifest, mirroring the pull
-    // path. A local image archive is flattened into a rootfs first.
+    // Query must not unpack an image: it has a short, single-response RPC
+    // deadline. Unprepared local images go through the streaming pull path.
     if let Some(packed_dir) = get_packed_layers_dir() {
-        let effective = effective_packed_dir(packed_dir)?;
-        return Ok(Some(create_packed_image_info(image, &effective)?));
+        return query_packed_image(image, packed_dir, Path::new(STORAGE_ROOT));
     }
 
     let root = Path::new(STORAGE_ROOT);
@@ -4464,7 +4534,42 @@ fn mount_overlay_fsconfig(
     ))
 }
 
-/// Merge `lowerdirs` into `output` as a single tar archive.
+/// A merged, readable view of a stack of layers.
+///
+/// Owns the overlay mount for as long as the caller needs the merged tree and
+/// tears it down on drop. Handing back the mount rather than a finished archive
+/// is what lets a caller tar straight out of it: a flattened rootfs is as large
+/// as the image it came from, so writing the archive to the guest's own disk
+/// first needs room for a second full copy of it.
+#[derive(Debug)]
+pub struct FlattenedTree {
+    path: PathBuf,
+    /// False when a single surviving layer was used directly, in which case
+    /// there is no mount to undo and the directory belongs to someone else.
+    mounted: bool,
+}
+
+impl FlattenedTree {
+    /// The merged tree's root.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for FlattenedTree {
+    fn drop(&mut self) {
+        if !self.mounted {
+            return;
+        }
+        // Best-effort: a failed unmount must not mask the caller's own error.
+        let _ = std::process::Command::new("umount")
+            .arg(&self.path)
+            .status();
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Merge `lowerdirs` into a single readable tree.
 ///
 /// Backs [`AgentRequest::FlattenLayers`](smolvm_protocol::AgentRequest::FlattenLayers).
 /// The merge is a read-only overlay mount so that whiteouts and opaque markers
@@ -4480,37 +4585,40 @@ fn mount_overlay_fsconfig(
 /// Entries that are missing or empty are dropped: callers pass a container
 /// overlay's upper dir without knowing whether the machine ever wrote to it, and
 /// overlayfs rejects a lowerdir that does not exist. A single surviving directory
-/// is tarred directly, since overlayfs requires two lower layers when there is no
+/// is used directly, since overlayfs requires two lower layers when there is no
 /// upperdir.
-pub fn flatten_layers_to_tar(lowerdirs: &[String], output: &Path) -> Result<()> {
+pub fn flatten_layers(lowerdirs: &[String]) -> Result<FlattenedTree> {
     let present = unique_lowerdirs(&mountable_lowerdirs(lowerdirs));
 
-    let source = match present.len() {
-        0 => {
-            return Err(StorageError::new(
-                "no layers to flatten: every directory was missing or empty".to_string(),
-            ))
-        }
+    match present.len() {
+        0 => Err(StorageError::new(
+            "no layers to flatten: every directory was missing or empty".to_string(),
+        )),
         // One layer needs no merge, and overlayfs would refuse it anyway.
-        1 => PathBuf::from(&present[0]),
+        1 => Ok(FlattenedTree {
+            path: PathBuf::from(&present[0]),
+            mounted: false,
+        }),
         _ => {
             let merged = Path::new(STORAGE_ROOT).join("flatten-merged");
             let _ = std::fs::remove_dir_all(&merged);
             std::fs::create_dir_all(&merged)?;
             mount_overlay_lowers_only(&present, &merged)?;
-            merged
+            Ok(FlattenedTree {
+                path: merged,
+                mounted: true,
+            })
         }
-    };
-
-    let tar_result = tar_directory(&source, output);
-
-    if source != Path::new(&present[0]) {
-        // Best-effort: a failed unmount must not mask a tar error.
-        let _ = std::process::Command::new("umount").arg(&source).status();
-        let _ = std::fs::remove_dir_all(&source);
     }
+}
 
-    tar_result
+/// Merge `lowerdirs` into `output` as a single tar archive.
+///
+/// The staged form of [`flatten_layers`], for callers that want the archive as a
+/// file in the guest rather than streamed out of it.
+pub fn flatten_layers_to_tar(lowerdirs: &[String], output: &Path) -> Result<()> {
+    let tree = flatten_layers(lowerdirs)?;
+    tar_directory(tree.path(), output)
 }
 
 /// Keep the entries of `lowerdirs` that overlayfs can actually stack.
@@ -4813,23 +4921,17 @@ fn base64_encode(input: &str) -> String {
     result
 }
 
-/// Set up Docker auth configuration for crane commands.
+/// Set up the Docker config crane reads for a pull.
 ///
-/// Creates a temporary directory with a Docker config.json file containing
-/// registry credentials. The returned TempDir must be kept alive for the
-/// duration of the command execution.
+/// Always creates a private config directory so crane never consults a
+/// mounted `/root/.docker`: a host config that names a credential helper
+/// (`credsStore`) makes crane exec a binary the guest does not have, and the
+/// pull fails even for public images. The host resolves credentials itself
+/// and forwards them here as `auth`; a username of `<token>` carries an OAuth
+/// identity token, which crane takes as `identitytoken`.
 ///
-/// Returns `Ok(None)` if no auth is provided.
-fn setup_docker_auth(
-    image: &str,
-    auth: Option<&RegistryAuth>,
-) -> Result<Option<tempfile::TempDir>> {
-    let Some(a) = auth else {
-        return Ok(None);
-    };
-
-    let registry = extract_registry_from_image(image);
-
+/// The returned TempDir must be kept alive for the duration of the command.
+fn setup_docker_auth(image: &str, auth: Option<&RegistryAuth>) -> Result<tempfile::TempDir> {
     // The guest root filesystem (and thus the default temp dir, /tmp) is
     // read-only, so create the auth config under the writable storage disk.
     let temp_dir = tempfile::Builder::new()
@@ -4839,23 +4941,29 @@ fn setup_docker_auth(
             StorageError::new(format!("failed to create temp directory for auth: {}", e))
         })?;
 
-    let auth_b64 = base64_encode(&format!("{}:{}", a.username, a.password));
-    let config_json = format!(
-        r#"{{"auths":{{"{}":{{"auth":"{}"}}}}}}"#,
-        registry, auth_b64
-    );
+    let config_json = match auth {
+        Some(a) => {
+            let registry = extract_registry_from_image(image);
+            let entry = if a.username == DOCKER_IDENTITY_TOKEN_USERNAME {
+                serde_json::json!({ "identitytoken": a.password })
+            } else {
+                serde_json::json!({ "auth": base64_encode(&format!("{}:{}", a.username, a.password)) })
+            };
+            debug!(
+                registry = %registry,
+                username = %a.username,
+                "using registry credentials via docker config"
+            );
+            serde_json::json!({ "auths": { registry: entry } }).to_string()
+        }
+        None => "{}".to_string(),
+    };
 
     let config_path = temp_dir.path().join("config.json");
     std::fs::write(&config_path, &config_json)
         .map_err(|e| StorageError::new(format!("failed to write docker auth config: {}", e)))?;
 
-    debug!(
-        registry = %registry,
-        username = %a.username,
-        "using registry credentials via docker config"
-    );
-
-    Ok(Some(temp_dir))
+    Ok(temp_dir)
 }
 
 /// Set HTTP_PROXY / HTTPS_PROXY / NO_PROXY on a crane subprocess so the
@@ -4922,9 +5030,7 @@ fn run_crane_once(
 
     // Set up auth if provided (temp_dir must stay alive until command completes)
     let _temp_dir = setup_docker_auth(image, auth)?;
-    if let Some(ref td) = _temp_dir {
-        cmd.env("DOCKER_CONFIG", td.path());
-    }
+    cmd.env("DOCKER_CONFIG", _temp_dir.path());
 
     apply_proxy_env(&mut cmd, proxy, no_proxy);
 
@@ -5103,6 +5209,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn packed_query_does_not_extract_staged_layers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let packed = tmp.path().join("packed");
+        let storage = tmp.path().join("storage");
+        std::fs::create_dir(&packed).unwrap();
+        let tar = packed.join("layer.tar");
+        // Deliberately not a valid archive: Query must not attempt extraction.
+        std::fs::write(&tar, b"not an archive").unwrap();
+        assert!(query_packed_image("ubuntu", &packed, &storage)
+            .unwrap()
+            .is_none());
+        assert!(!storage.exists());
+
+        let out = storage.join(GUEST_LAYERS_DIR).join("packed");
+        std::fs::create_dir_all(out.join("layer")).unwrap();
+        // A partial extraction is not usable until its completion marker exists.
+        assert!(query_packed_image("ubuntu", &packed, &storage)
+            .unwrap()
+            .is_none());
+        std::fs::write(
+            out.join(GUEST_LAYERS_MARKER),
+            staged_tars_signature(std::slice::from_ref(&tar)).unwrap(),
+        )
+        .unwrap();
+        let info = query_packed_image("ubuntu", &packed, &storage)
+            .unwrap()
+            .unwrap();
+        assert_eq!(info.layers, vec!["sha256:layer"]);
+        std::fs::write(&tar, b"changed staged archive").unwrap();
+        assert!(query_packed_image("ubuntu", &packed, &storage)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn packed_query_does_not_flatten_saved_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let packed = tmp.path().join("packed");
+        let storage = tmp.path().join("storage");
+        std::fs::create_dir(&packed).unwrap();
+        std::fs::write(packed.join(ARCHIVE_FILE_NAME), b"not an archive").unwrap();
+        assert!(query_packed_image("ubuntu", &packed, &storage)
+            .unwrap()
+            .is_none());
+        assert!(!storage.exists());
+    }
+
+    #[test]
+    fn unpack_wait_reports_progress_and_preserves_failure_output() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 2; printf unpack-error >&2; exit 7"]);
+        let mut updates = 0;
+        let output = command_output_with_progress(&mut command, || updates += 1).unwrap();
+        assert!(updates >= 1);
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stderr, b"unpack-error");
+    }
+
+    #[test]
     fn test_archive_arch_compatibility() {
         let guest_arch = match std::env::consts::ARCH {
             "x86_64" => "amd64",
@@ -5123,6 +5288,42 @@ mod tests {
         // Incompatible arch is rejected
         let err = ensure_archive_arch_compatible(other_arch).unwrap_err();
         assert!(err.to_string().contains("is built for architecture"));
+    }
+
+    /// A lone layer is handed back as-is rather than mounted, so dropping the
+    /// tree must leave it alone — the path belongs to the caller, and the
+    /// teardown that follows a real merge would delete the machine's own layer.
+    #[test]
+    fn flattening_a_lone_layer_does_not_consume_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let only = dir.path().join("rootfs");
+        std::fs::create_dir_all(only.join("usr")).unwrap();
+
+        let path = {
+            let tree = flatten_layers(&[only.to_string_lossy().into_owned()]).unwrap();
+            assert_eq!(tree.path(), only.as_path());
+            tree.path().to_path_buf()
+        };
+
+        assert!(path.exists(), "dropping the tree deleted the source layer");
+        assert!(path.join("usr").exists());
+    }
+
+    /// Nothing mountable is an error rather than an empty archive: a silently
+    /// empty flatten would pack a machine as though it had no filesystem.
+    #[test]
+    fn flattening_nothing_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let missing = dir.path().join("missing");
+
+        let err = flatten_layers(&[
+            empty.to_string_lossy().into_owned(),
+            missing.to_string_lossy().into_owned(),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("no layers to flatten"));
     }
 
     /// One empty layer is a legal OCI layer (metadata or whiteouts only), so

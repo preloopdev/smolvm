@@ -79,6 +79,7 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
     let memory_stats = pid.and_then(crate::process::process_memory_stats);
     MachineInfo {
         name: name.to_string(),
+        image: record.image.clone(),
         state: actual_state.to_string(),
         cpus: record.cpus,
         mem: record.mem,
@@ -157,6 +158,338 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
     }
 }
 
+/// Node-local cache of portable checkpoint artifacts, keyed by the caller's
+/// stable id (the control plane's checkpoint id).
+///
+/// A capture writes its artifact to a staging directory, streams it to the
+/// control plane, and used to drop it — the node discarded the very bytes it had
+/// just produced. A restore of that checkpoint then fetched the same bytes back
+/// from the object store, which for a multi-gigabyte live checkpoint was almost
+/// the entire restore time, and in practice the restore landed on the node that
+/// captured it. Keeping the artifact turns that restore into a local hard link.
+///
+/// Entries are hard links, so handing one to a restore (which may move or
+/// unlink what it is given) never disturbs the cached inode. The cache is
+/// bounded by [`checkpoint_cache_max_bytes`] and evicts oldest-used first; the
+/// artifact's own footer checksum is verified by every restore, so a cached
+/// file needs no integrity record of its own.
+fn checkpoint_cache_dir() -> Result<std::path::PathBuf, ApiError> {
+    let dir = checkpoint_transfer_root()?.join("checkpoint-cache");
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| ApiError::internal(format!("create checkpoint cache: {error}")))?;
+    Ok(dir)
+}
+
+/// A cache key is an opaque id from the control plane; it becomes a file name,
+/// so it is confined to a single conservative path segment.
+fn checkpoint_cache_path(key: &str) -> Result<std::path::PathBuf, ApiError> {
+    let ok = !key.is_empty()
+        && key.len() <= 128
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
+    if !ok || key.starts_with('.') {
+        return Err(ApiError::BadRequest(format!(
+            "invalid checkpoint cache key {key:?}"
+        )));
+    }
+    Ok(checkpoint_cache_dir()?.join(format!("{key}.smolcheckpoint")))
+}
+
+/// Byte ceiling for the checkpoint cache: `SMOLVM_CHECKPOINT_CACHE_MAX_BYTES`, or
+/// a tenth of the filesystem holding it, floored at 8 GiB so at least a couple
+/// of large checkpoints fit even on a small disk.
+fn checkpoint_cache_max_bytes(dir: &std::path::Path) -> u64 {
+    const FLOOR: u64 = 8 * 1024 * 1024 * 1024;
+    if let Some(n) = std::env::var("SMOLVM_CHECKPOINT_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+    {
+        return n;
+    }
+    filesystem_capacity_bytes(dir)
+        .map(|total| (total / 10).max(FLOOR))
+        .unwrap_or(FLOOR)
+}
+
+/// Total capacity of the filesystem holding `path` (unix); `None` elsewhere.
+fn filesystem_capacity_bytes(path: &std::path::Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+        // SAFETY: valid NUL-terminated path; `stat` read only after success.
+        unsafe {
+            let mut stat: std::mem::MaybeUninit<libc::statvfs> = std::mem::MaybeUninit::uninit();
+            if libc::statvfs(c.as_ptr(), stat.as_mut_ptr()) != 0 {
+                return None;
+            }
+            let stat = stat.assume_init();
+            #[allow(clippy::unnecessary_cast)]
+            let total = (stat.f_blocks as u64).checked_mul(stat.f_frsize as u64)?;
+            (total > 0).then_some(total)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// Link `artifact` into the cache under `key`, then evict oldest-used entries
+/// until the cache fits its ceiling. Best-effort: a cache failure must never
+/// fail the capture or restore that produced the artifact.
+fn checkpoint_cache_put(key: &str, artifact: &std::path::Path) {
+    let Ok(dest) = checkpoint_cache_path(key) else {
+        return;
+    };
+    match replace_checkpoint_cache_entry(artifact, &dest) {
+        Ok(()) => tracing::info!(key, "cached checkpoint artifact on this node"),
+        Err(error) => {
+            tracing::warn!(key, error = %error, "could not cache checkpoint artifact");
+            return;
+        }
+    }
+    if let Some(dir) = dest.parent() {
+        checkpoint_cache_evict(dir, checkpoint_cache_max_bytes(dir));
+    }
+}
+
+fn replace_checkpoint_cache_entry(
+    artifact: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    let parent = destination.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "cache path has no parent")
+    })?;
+    let _lock = lock_checkpoint_cache_namespace(parent)?;
+    link_checkpoint_cache_alias(artifact, destination, true)
+}
+
+fn link_checkpoint_cache_alias(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+    replace: bool,
+) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::artifact_cache::link_checkpoint_artifact(source, destination, replace)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if replace {
+            let parent = destination
+                .parent()
+                .ok_or_else(|| std::io::Error::other("cache destination has no parent"))?;
+            let staging = tempfile::tempdir_in(parent)?;
+            let link = staging.path().join("artifact");
+            std::fs::hard_link(source, &link)?;
+            std::fs::rename(link, destination)?;
+        } else {
+            std::fs::hard_link(source, destination)?;
+        }
+        let _ = std::fs::File::options()
+            .append(true)
+            .open(destination)
+            .and_then(|file| {
+                file.set_times(std::fs::FileTimes::new().set_accessed(std::time::SystemTime::now()))
+            });
+        Ok(())
+    }
+}
+
+const CHECKPOINT_CACHE_LOCK: &str = ".checkpoint-cache.lock";
+
+fn lock_checkpoint_cache_namespace(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(CHECKPOINT_CACHE_LOCK))?;
+    lock.lock()?;
+    Ok(lock)
+}
+
+// Readers may verify concurrently, but cache aliases must not change ctime
+// between the verifier's two fstat calls. Keep the full identity check intact.
+fn lock_checkpoint_cache_verification(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(CHECKPOINT_CACHE_LOCK))?;
+    lock.lock_shared()?;
+    Ok(lock)
+}
+
+fn discard_invalid_checkpoint_cache_entry(src: &std::path::Path) -> std::io::Result<()> {
+    let parent = src
+        .parent()
+        .ok_or_else(|| std::io::Error::other("cache path has no parent"))?;
+    let _lock = lock_checkpoint_cache_namespace(parent)?;
+    // A publisher may have replaced the entry since the reader pinned it.
+    // Recheck under the publication lock before removing the current name.
+    if crate::portable_checkpoint::verified_sidecar_footer(src).is_err() {
+        match std::fs::remove_file(src) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// Look `key` up; on a hit, hard-link the entry to `artifact` (a fresh path in a
+/// staging directory) and bump its use time. Returns whether `artifact` now
+/// exists. A stale link failure just reports a miss.
+/// On a hit, the returned verification pins `artifact`'s inode for the rest of
+/// the request so machine creation can reuse it instead of re-reading the
+/// payload (see [`crate::portable_checkpoint::VerifiedSidecar`]).
+struct CachedCheckpoint {
+    verified: Option<crate::portable_checkpoint::VerifiedSidecar>,
+}
+
+fn checkpoint_cache_take(key: &str, artifact: &std::path::Path) -> Option<CachedCheckpoint> {
+    let src = checkpoint_cache_path(key).ok()?;
+    take_checkpoint_cache_entry(key, &src, artifact)
+}
+
+fn take_checkpoint_cache_entry(
+    key: &str,
+    src: &std::path::Path,
+    artifact: &std::path::Path,
+) -> Option<CachedCheckpoint> {
+    take_checkpoint_cache_entry_with_verifier(
+        key,
+        src,
+        artifact,
+        crate::portable_checkpoint::classify_sidecar_verification,
+    )
+}
+
+fn take_checkpoint_cache_entry_with_verifier(
+    key: &str,
+    src: &std::path::Path,
+    artifact: &std::path::Path,
+    verify: impl FnOnce(
+        &std::path::Path,
+    ) -> crate::error::Result<crate::portable_checkpoint::SidecarVerification>,
+) -> Option<CachedCheckpoint> {
+    if !src.is_file() {
+        return None;
+    }
+    let link_started = std::time::Instant::now();
+    let linked = (|| -> std::io::Result<()> {
+        let parent = src
+            .parent()
+            .ok_or_else(|| std::io::Error::other("cache source has no parent"))?;
+        let _lock = lock_checkpoint_cache_namespace(parent)?;
+        link_checkpoint_cache_alias(src, artifact, false)
+    })();
+    if let Err(error) = linked {
+        tracing::warn!(key, error = %error, "cached checkpoint present but could not be linked");
+        return None;
+    }
+    let link_ms = link_started.elapsed().as_millis() as u64;
+    let verification_started = std::time::Instant::now();
+    // The cache-link operation already recorded access and refreshed any local
+    // provenance before verification captures its final inode identity.
+    let outcome = (|| {
+        let parent = src
+            .parent()
+            .ok_or_else(|| std::io::Error::other("cache source has no parent"))?;
+        let _lock = lock_checkpoint_cache_verification(parent)?;
+        verify(artifact)
+    })();
+    match outcome {
+        Ok(crate::portable_checkpoint::SidecarVerification::Stable(verified)) => {
+            tracing::info!(
+                key,
+                link_ms,
+                verify_ms = verification_started.elapsed().as_millis() as u64,
+                "restored checkpoint from the node-local cache"
+            );
+            Some(CachedCheckpoint {
+                verified: Some(verified),
+            })
+        }
+        #[cfg(unix)]
+        Ok(crate::portable_checkpoint::SidecarVerification::ChangedDuringRead) => {
+            // Hard-link publication/cleanup also changes ctime. A successful
+            // checksum with unstable identity is not evidence of bad bytes.
+            // Keep the pinned staging link but hand off no proof: creation
+            // must perform the full verification again before using it.
+            tracing::info!(
+                key,
+                "checkpoint identity changed during verification; requiring fresh verification"
+            );
+            Some(CachedCheckpoint { verified: None })
+        }
+        Err(error) => {
+            tracing::warn!(
+                key,
+                %error,
+                "discarding invalid cached checkpoint; retrying supplied source"
+            );
+            // This staging name can still alias a valid inode another reader
+            // is checking, even if this request's verification failed.
+            if let Some(parent) = src.parent() {
+                if let Ok(_lock) = lock_checkpoint_cache_namespace(parent) {
+                    let _ = std::fs::remove_file(artifact);
+                }
+            }
+            if let Err(error) = discard_invalid_checkpoint_cache_entry(src) {
+                tracing::warn!(key, %error, "could not discard invalid cached checkpoint");
+            }
+            None
+        }
+    }
+}
+
+/// Drop oldest-used entries until the directory's total is under `max`.
+fn checkpoint_cache_evict(dir: &std::path::Path, max: u64) {
+    let Ok(_lock) = lock_checkpoint_cache_namespace(dir) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, u64, std::path::PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            if e.file_name() == CHECKPOINT_CACHE_LOCK {
+                return None;
+            }
+            let meta = e.metadata().ok()?;
+            meta.is_file().then(|| {
+                (
+                    meta.accessed().unwrap_or(std::time::UNIX_EPOCH),
+                    meta.len(),
+                    e.path(),
+                )
+            })
+        })
+        .collect();
+    let mut total: u64 = files.iter().map(|f| f.1).sum();
+    if total <= max {
+        return;
+    }
+    files.sort_by_key(|f| f.0);
+    for (_, size, path) in files {
+        if total <= max {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(size);
+            tracing::info!(path = %path.display(), "evicted checkpoint from the node-local cache");
+        }
+    }
+}
+
 fn checkpoint_transfer_root() -> Result<std::path::PathBuf, ApiError> {
     let root = std::env::var_os("SMOLVM_PACK_STAGING")
         .map(std::path::PathBuf::from)
@@ -167,12 +500,272 @@ fn checkpoint_transfer_root() -> Result<std::path::PathBuf, ApiError> {
     Ok(root)
 }
 
+/// Refresh local alias provenance before TempDir removes the transfer files.
+struct CheckpointTransfer {
+    _directory: Option<tempfile::TempDir>,
+    artifact: std::path::PathBuf,
+}
+
+impl Drop for CheckpointTransfer {
+    fn drop(&mut self) {
+        // TempDir's unlink changes the same inode as the prepared cache. It
+        // must participate even when provenance refresh declines the alias.
+        let directory = self._directory.take();
+        let artifact = self.artifact.clone();
+        let cleanup = move || {
+            let lock = checkpoint_cache_dir()
+                .map_err(|error| std::io::Error::other(format!("{error:?}")))
+                .and_then(|dir| lock_checkpoint_cache_namespace(&dir));
+            let _lock = match lock {
+                Ok(lock) => lock,
+                Err(error) => {
+                    // Keep the private transfer for the reaper rather than
+                    // mutate an inode without the verification lease.
+                    if let Some(directory) = directory {
+                        tracing::warn!(path = %directory.keep().display(), %error, "checkpoint transfer cleanup deferred");
+                    }
+                    return;
+                }
+            };
+            #[cfg(target_os = "linux")]
+            crate::artifact_cache::release_checkpoint_artifact_alias(&artifact);
+            #[cfg(not(target_os = "linux"))]
+            let _ = &artifact;
+            drop(directory);
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn_blocking(cleanup);
+        } else {
+            cleanup();
+        }
+    }
+}
+
 fn max_checkpoint_upload_bytes() -> u64 {
     std::env::var("SMOLVM_MAX_CHECKPOINT_UPLOAD_BYTES")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(2 * 1024 * 1024 * 1024 * 1024)
+}
+
+/// Keep staging owned by the blocking task so cancellation cannot remove it
+/// while capture is writing; return ownership only to a connected caller.
+async fn with_owned_transfer<T: Send + 'static>(
+    transfer: tempfile::TempDir,
+    work: impl FnOnce(&std::path::Path) -> T + Send + 'static,
+) -> Result<(tempfile::TempDir, T), ApiError> {
+    tokio::task::spawn_blocking(move || {
+        let out = work(transfer.path());
+        (transfer, out)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("checkpoint transfer task failed: {error}")))
+}
+
+#[cfg(test)]
+mod capture_transfer_tests {
+    use super::{with_owned_operation, with_owned_transfer};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    const WAIT: Duration = Duration::from_secs(10);
+
+    #[tokio::test]
+    async fn disconnected_preparation_keeps_lifecycle_until_completion() {
+        let lifecycle = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        let owned = lifecycle.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (finish, gate) = tokio::sync::oneshot::channel();
+        let (completed, done) = tokio::sync::oneshot::channel();
+        let request = tokio::spawn(with_owned_operation(move |reply| async move {
+            let guard = owned.lock_owned().await;
+            started.send(()).unwrap();
+            gate.await.unwrap();
+            drop(guard);
+            let _ = reply.send(Ok(()));
+            completed.send(()).unwrap();
+        }));
+        ready.await.unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert!(lifecycle.try_lock().is_err());
+        finish.send(()).unwrap();
+        done.await.unwrap();
+        assert!(lifecycle.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn disconnected_queued_operation_can_skip_preparation() {
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let (observed, observation) = tokio::sync::oneshot::channel();
+        let request = tokio::spawn(with_owned_operation(move |reply| async move {
+            started.send(()).unwrap();
+            gate.await.unwrap();
+            observed.send(reply.is_closed()).unwrap();
+            let _ = reply.send(Ok(()));
+        }));
+        ready.await.unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        release.send(()).unwrap();
+        assert!(observation.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn disconnected_queued_cleanup_still_completes() {
+        let lifecycle = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        let guard = lifecycle.lock().await;
+        let owned = lifecycle.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (completed, done) = tokio::sync::oneshot::channel();
+        let request = tokio::spawn(with_owned_operation(move |reply| async move {
+            started.send(()).unwrap();
+            let _guard = owned.lock_owned().await;
+            completed.send(()).unwrap();
+            let _ = reply.send(Ok(()));
+        }));
+        ready.await.unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        drop(guard);
+        done.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnected_capture_holds_source_until_staged_not_until_packaged() {
+        let root = tempfile::tempdir().unwrap();
+        let source = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        let guard = source.clone().lock_owned().await;
+        let (started_tx, started_rx) = mpsc::channel();
+        let (stage_tx, stage_rx) = mpsc::channel();
+        let (staged_tx, staged_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let request = tokio::spawn(with_owned_transfer(transfer_in(root.path()), move |_| {
+            started_tx.send(()).unwrap();
+            stage_rx.recv().unwrap();
+            drop(guard);
+            staged_tx.send(()).unwrap();
+            finish_rx.recv().unwrap();
+            DropSignal(finished_tx)
+        }));
+        started_rx.recv_timeout(WAIT).unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert!(
+            source.try_lock().is_err(),
+            "disconnect released live source early"
+        );
+        stage_tx.send(()).unwrap();
+        staged_rx.recv_timeout(WAIT).unwrap();
+        assert!(source.try_lock().is_ok(), "packaging still owns the source");
+        finish_tx.send(()).unwrap();
+        finished_rx.recv_timeout(WAIT).unwrap();
+    }
+
+    /// Sends on drop, so the test can await the moment the task's result
+    /// (and with it the `TempDir`) has been released.
+    #[derive(Debug)]
+    struct DropSignal(mpsc::Sender<()>);
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    fn transfer_in(root: &std::path::Path) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("checkpoint-transfer-")
+            .tempdir_in(root)
+            .unwrap()
+    }
+
+    /// The client disconnects mid-capture (request future aborted) while the
+    /// capture is parked; the capture then resumes, recreates its output
+    /// directory the way `pack_artifact` does, and writes the artifact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_capture_request_never_leaves_an_orphan_transfer_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let transfer = transfer_in(root.path());
+        let dir = transfer.path().to_path_buf();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (released_tx, released_rx) = mpsc::channel();
+        let request = tokio::spawn(with_owned_transfer(transfer, move |out| {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            std::fs::create_dir_all(out).unwrap();
+            std::fs::write(out.join("x.smolcheckpoint"), b"artifact").unwrap();
+            DropSignal(released_tx)
+        }));
+        started_rx.recv_timeout(WAIT).unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        // The cancelled request must not have taken the directory away from
+        // the still-running capture.
+        assert!(
+            dir.exists(),
+            "cancellation removed the directory under a running capture"
+        );
+        release_tx.send(()).unwrap();
+        released_rx.recv_timeout(WAIT).unwrap();
+        assert!(!dir.exists(), "orphan transfer directory left behind");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connected_capture_hands_the_transfer_back_to_the_caller() {
+        let root = tempfile::tempdir().unwrap();
+        let transfer = transfer_in(root.path());
+        let expected = transfer.path().to_path_buf();
+        let (kept, out) = with_owned_transfer(transfer, |dir| {
+            std::fs::write(dir.join("a.smolcheckpoint"), b"1").unwrap();
+            7
+        })
+        .await
+        .unwrap();
+        assert_eq!(out, 7);
+        assert_eq!(kept.path(), expected);
+        assert!(expected.join("a.smolcheckpoint").exists());
+        drop(kept);
+        assert!(!expected.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_or_panicking_capture_still_reclaims_the_transfer() {
+        let root = tempfile::tempdir().unwrap();
+        // A capture error is handed back with the directory; the handler's
+        // early return drops it.
+        let transfer = transfer_in(root.path());
+        let dir = transfer.path().to_path_buf();
+        let (kept, out) = with_owned_transfer(transfer, |dir| {
+            std::fs::write(dir.join("partial"), b"x").unwrap();
+            Err::<(), &str>("capture failed")
+        })
+        .await
+        .unwrap();
+        assert_eq!(out, Err("capture failed"));
+        drop(kept);
+        assert!(!dir.exists());
+        // A panicking capture unwinds the task that owns the directory.
+        let transfer = transfer_in(root.path());
+        let dir = transfer.path().to_path_buf();
+        let error = with_owned_transfer::<()>(transfer, |dir| {
+            std::fs::write(dir.join("partial"), b"x").unwrap();
+            panic!("capture panicked");
+        })
+        .await
+        .expect_err("panic surfaces as an error");
+        assert!(format!("{error:?}").contains("checkpoint transfer task failed"));
+        let deadline = Instant::now() + WAIT;
+        while dir.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!dir.exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
 }
 
 fn checkpoint_capture_error(error: crate::Error) -> ApiError {
@@ -183,14 +776,26 @@ fn checkpoint_capture_error(error: crate::Error) -> ApiError {
 }
 
 /// Stream a running machine's complete live state as a `.smolcheckpoint`.
+/// Options for a checkpoint capture.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct CaptureCheckpointQuery {
+    /// Stable id to file the produced artifact under in the node-local cache,
+    /// so a later restore of this checkpoint on this node needs no download.
+    pub cache_key: Option<String>,
+}
+
+/// Capture a live checkpoint of a running machine and stream it back as a
+/// `.smolcheckpoint` artifact, keeping a node-local copy when the caller
+/// supplies a cache key.
 pub async fn capture_portable_checkpoint(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
+    Query(capture_options): Query<CaptureCheckpointQuery>,
 ) -> Result<Response<Body>, ApiError> {
     // Serialize capture with start/stop/delete/fork so the saved vCPU state and
     // cloned qcow chains describe one stable machine generation.
     let lifecycle = state.lifecycle_lock(&name);
-    let _guard = lifecycle.lock().await;
+    let guard = lifecycle.lock_owned().await;
     // Resolve through state first so an unknown name fails before allocating a
     // potentially large staging directory. The capture core revalidates the
     // machine's state and checkpoint profile at the consistency boundary.
@@ -199,24 +804,54 @@ pub async fn capture_portable_checkpoint(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("machine '{name}' not found")))?;
 
-    let transfer = tempfile::Builder::new()
-        .prefix("checkpoint-transfer-")
+    let mut transfer_builder = tempfile::Builder::new();
+    transfer_builder.prefix("checkpoint-transfer-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        transfer_builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let transfer = transfer_builder
         .tempdir_in(checkpoint_transfer_root()?)
         .map_err(|error| ApiError::internal(format!("create checkpoint transfer: {error}")))?;
     let artifact = transfer.path().join(format!("{name}.smolcheckpoint"));
     let capture_name = name.clone();
     let capture_path = artifact.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        crate::portable_checkpoint::capture_to_path(
+    let prepared_cache_budget_bytes = capture_options.cache_key.as_ref().map(|_| {
+        std::env::var("SMOLVM_PREPARED_CHECKPOINT_CACHE_MAX_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(8 * 1024 * 1024 * 1024)
+    });
+    // Keep staging alive until the background capture finishes, even on disconnect.
+    let (transfer, result) = with_owned_transfer(transfer, move |_dir| {
+        crate::portable_checkpoint::capture_to_path_with_source_release(
             &capture_name,
             &capture_path,
-            &crate::portable_checkpoint::CaptureOptions::default(),
+            &crate::portable_checkpoint::CaptureOptions {
+                prepared_cache_budget_bytes,
+                ..Default::default()
+            },
+            move || drop(guard),
         )
     })
-    .await
-    .map_err(|error| ApiError::internal(format!("checkpoint capture task failed: {error}")))?
-    .map_err(checkpoint_capture_error)?;
+    .await?;
+    let result = result.map_err(checkpoint_capture_error)?;
+    let transfer = CheckpointTransfer {
+        _directory: Some(transfer),
+        artifact: artifact.clone(),
+    };
 
+    if let Some(key) = capture_options.cache_key {
+        let artifact = artifact.clone();
+        if let Err(error) =
+            tokio::task::spawn_blocking(move || checkpoint_cache_put(&key, &artifact)).await
+        {
+            tracing::warn!(%error, "checkpoint cache task failed");
+        }
+    }
+    #[cfg(target_os = "linux")]
+    let prepared_reference = crate::artifact_cache::prepared_checkpoint_reference(&artifact).ok();
     let mut file = tokio::fs::File::open(&artifact)
         .await
         .map_err(|error| ApiError::internal(format!("open checkpoint artifact: {error}")))?;
@@ -239,7 +874,14 @@ pub async fn capture_portable_checkpoint(
             }
         }
     };
-    Response::builder()
+    let response = Response::builder();
+    #[cfg(target_os = "linux")]
+    let response = if let Some(reference) = prepared_reference {
+        response.header("x-smolvm-checkpoint-prepared", reference)
+    } else {
+        response
+    };
+    response
         .status(axum::http::StatusCode::OK)
         .header(
             header::CONTENT_TYPE,
@@ -259,59 +901,561 @@ pub async fn capture_portable_checkpoint(
 }
 
 /// Create a machine by streaming a `.smolcheckpoint` into this node.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct RestoreCheckpointQuery {
+    /// JSON port mappings for this host; guest ports must match the checkpoint.
+    pub ports: Option<String>,
+    /// Pre-signed object-store URL to pull the checkpoint from, instead of the
+    /// caller streaming it in the request body.
+    ///
+    /// A live checkpoint is gigabytes. Relaying it through the control plane
+    /// costs a second full copy over the wire and pins it to the control's
+    /// throughput — measured at roughly a fifth of what the node reaches
+    /// fetching the same object itself, and the dominant term in a restore that
+    /// then boots in three seconds. The URL carries its own scoped, expiring
+    /// authorisation, so the node needs no object-store credentials of its own.
+    pub source_url: Option<String>,
+    /// Stable id of the checkpoint; when this node captured it (or restored it
+    /// before) the artifact is served from the node-local cache and
+    /// `source_url` is never fetched.
+    pub cache_key: Option<String>,
+}
+
+fn checkpoint_host_ports(
+    captured: &[PortSpec],
+    requested: &[PortSpec],
+) -> Result<Vec<PortSpec>, ApiError> {
+    if requested.is_empty() {
+        return Ok(captured.to_vec());
+    }
+    let mut old_guests: Vec<_> = captured.iter().map(|port| port.guest).collect();
+    let mut new_guests: Vec<_> = requested.iter().map(|port| port.guest).collect();
+    old_guests.sort_unstable();
+    new_guests.sort_unstable();
+    if old_guests != new_guests {
+        return Err(ApiError::BadRequest(
+            "checkpoint port overrides must preserve the captured guest ports".into(),
+        ));
+    }
+    Ok(requested.to_vec())
+}
+
+/// Object-store hosts a checkpoint may be fetched from.
+///
+/// The node is being handed a URL by its control plane and asked to retrieve it,
+/// which is a request-forgery primitive if left open: a caller that can reach
+/// this endpoint could otherwise aim it at link-local metadata, a loopback
+/// admin port, or a peer on the private network. Restricting the host to the
+/// object store — and refusing redirects at the call site — keeps the parameter
+/// to the one job it exists for.
+const CHECKPOINT_SOURCE_HOSTS: [&str; 2] = ["storage.googleapis.com", "storage.cloud.google.com"];
+
+/// Validate a checkpoint source URL, returning it only when it is an HTTPS URL
+/// pointing at [`CHECKPOINT_SOURCE_HOSTS`] (or a bucket subdomain of one).
+fn checked_checkpoint_source(raw: &str) -> Result<reqwest::Url, ApiError> {
+    let url = reqwest::Url::parse(raw)
+        .map_err(|error| ApiError::BadRequest(format!("invalid checkpoint source url: {error}")))?;
+    if url.scheme() != "https" {
+        return Err(ApiError::BadRequest(
+            "checkpoint source url must be https".to_string(),
+        ));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| ApiError::BadRequest("checkpoint source url has no host".to_string()))?;
+    let allowed = CHECKPOINT_SOURCE_HOSTS
+        .iter()
+        .any(|h| host == *h || host.ends_with(&format!(".{h}")));
+    if !allowed {
+        return Err(ApiError::BadRequest(format!(
+            "checkpoint source host {host} is not an allowed object store"
+        )));
+    }
+    Ok(url)
+}
+
+#[cfg(test)]
+mod checkpoint_cache_tests {
+    use super::{
+        checkpoint_cache_evict, checkpoint_cache_path, discard_invalid_checkpoint_cache_entry,
+        lock_checkpoint_cache_namespace, replace_checkpoint_cache_entry,
+        take_checkpoint_cache_entry,
+    };
+
+    #[test]
+    fn cache_verification_excludes_alias_changes_but_allows_other_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let cached = dir.path().join("cached.smolcheckpoint");
+        let upload = dir.path().join("upload");
+        let manifest = smolvm_pack::format::PackManifest::new(
+            "vm://concurrent-cache".into(),
+            "none".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        smolvm_pack::packer::Packer::new(manifest)
+            .pack_artifact(&cached)
+            .unwrap();
+        let hit =
+            super::take_checkpoint_cache_entry_with_verifier("test", &cached, &upload, |path| {
+                let competing = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(dir.path().join(super::CHECKPOINT_CACHE_LOCK))
+                    .unwrap();
+                assert!(
+                    competing.try_lock().is_err(),
+                    "alias publication must wait until verification finishes"
+                );
+                competing
+                    .try_lock_shared()
+                    .expect("independent verifiers may run concurrently");
+                crate::portable_checkpoint::classify_sidecar_verification(path)
+            })
+            .unwrap();
+        let verified = hit.verified.unwrap();
+        #[cfg(unix)]
+        assert!(verified.covers(&upload));
+        #[cfg(not(unix))]
+        assert!(
+            !verified.covers(&upload),
+            "non-Unix verification is never reusable"
+        );
+        let competing = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.path().join(super::CHECKPOINT_CACHE_LOCK))
+            .unwrap();
+        competing
+            .try_lock()
+            .expect("verification releases the lease before VM creation");
+    }
+
+    #[test]
+    fn stale_invalid_reader_does_not_remove_repaired_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let cached = dir.path().join("cached.smolcheckpoint");
+        let reader = dir.path().join("reader");
+        let replacement = dir.path().join("replacement");
+        std::fs::write(&cached, b"invalid").unwrap();
+        std::fs::hard_link(&cached, &reader).unwrap();
+        let manifest = smolvm_pack::format::PackManifest::new(
+            "vm://cache-test".into(),
+            "none".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        smolvm_pack::packer::Packer::new(manifest)
+            .pack_artifact(&replacement)
+            .unwrap();
+        replace_checkpoint_cache_entry(&replacement, &cached).unwrap();
+        assert!(crate::portable_checkpoint::verified_sidecar_footer(&reader).is_err());
+        discard_invalid_checkpoint_cache_entry(&cached).unwrap();
+        assert!(crate::portable_checkpoint::verified_sidecar_footer(&cached).is_ok());
+        assert_eq!(std::fs::read(reader).unwrap(), b"invalid");
+    }
+
+    #[test]
+    fn eviction_preserves_namespace_lock_and_pinned_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let pinned_dir = tempfile::tempdir().unwrap();
+        let cached = dir.path().join("cached.smolcheckpoint");
+        let pinned = pinned_dir.path().join("reader");
+        std::fs::write(&cached, b"payload").unwrap();
+        std::fs::hard_link(&cached, &pinned).unwrap();
+        let lock = lock_checkpoint_cache_namespace(dir.path()).unwrap();
+        drop(lock);
+        checkpoint_cache_evict(dir.path(), 0);
+        assert!(!cached.exists());
+        assert!(dir.path().join(super::CHECKPOINT_CACHE_LOCK).exists());
+        assert_eq!(std::fs::read(pinned).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn invalid_cache_hit_is_removed_before_fresh_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        let cached = dir.path().join("cached");
+        let upload = dir.path().join("upload");
+        std::fs::write(&cached, b"not a checkpoint").unwrap();
+        assert!(take_checkpoint_cache_entry("test", &cached, &upload).is_none());
+        assert!(!cached.exists());
+        assert!(!upload.exists());
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(upload)
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn changing_cache_identity_preserves_hit_but_does_not_handoff_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let cached = dir.path().join("cached.smolcheckpoint");
+        let upload = dir.path().join("upload");
+        let manifest = smolvm_pack::format::PackManifest::new(
+            "vm://cache-test".into(),
+            "none".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        smolvm_pack::packer::Packer::new(manifest)
+            .pack_artifact(&cached)
+            .unwrap();
+        let hit =
+            super::take_checkpoint_cache_entry_with_verifier("test", &cached, &upload, |_| {
+                Ok(crate::portable_checkpoint::SidecarVerification::ChangedDuringRead)
+            })
+            .expect("unstable identity is still a cache hit");
+        assert!(
+            hit.verified.is_none(),
+            "creation must verify the artifact again"
+        );
+        assert!(cached.exists());
+        assert!(upload.exists());
+        assert!(crate::portable_checkpoint::verified_sidecar_footer(&upload).is_ok());
+    }
+
+    #[test]
+    fn cache_hit_preserves_artifact_modification_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let cached = dir.path().join("cached.smolcheckpoint");
+        let upload = dir.path().join("upload");
+        let manifest = smolvm_pack::format::PackManifest::new(
+            "vm://cache-test".into(),
+            "none".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        smolvm_pack::packer::Packer::new(manifest)
+            .pack_artifact(&cached)
+            .unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(300);
+        std::fs::File::options()
+            .write(true)
+            .open(&cached)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let before = std::fs::metadata(&cached).unwrap().modified().unwrap();
+        assert!(take_checkpoint_cache_entry("test", &cached, &upload).is_some());
+        assert_eq!(
+            std::fs::metadata(&cached).unwrap().modified().unwrap(),
+            before
+        );
+        assert_eq!(
+            std::fs::metadata(&upload).unwrap().modified().unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn publication_replaces_old_entry_without_changing_active_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let cached = dir.path().join("cached");
+        let active = dir.path().join("active");
+        let valid = dir.path().join("valid");
+        std::fs::write(&cached, b"old").unwrap();
+        std::fs::hard_link(&cached, &active).unwrap();
+        std::fs::write(&valid, b"new").unwrap();
+        replace_checkpoint_cache_entry(&valid, &cached).unwrap();
+        assert_eq!(std::fs::read(&cached).unwrap(), b"new");
+        assert_eq!(std::fs::read(&active).unwrap(), b"old");
+    }
+
+    #[test]
+    fn failed_publication_preserves_existing_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let cached = dir.path().join("cached");
+        std::fs::write(&cached, b"valid").unwrap();
+        assert!(replace_checkpoint_cache_entry(&dir.path().join("missing"), &cached).is_err());
+        assert_eq!(std::fs::read(cached).unwrap(), b"valid");
+    }
+
+    /// The key becomes a file name inside the cache directory, so it must never
+    /// be able to name anything outside it.
+    #[test]
+    fn cache_key_cannot_escape_the_cache_directory() {
+        for bad in [
+            "../etc",
+            "a/b",
+            ".hidden",
+            "",
+            "x\0y",
+            "ckpt-…",
+            &"a".repeat(129),
+        ] {
+            assert!(
+                checkpoint_cache_path(bad).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+        let ok = checkpoint_cache_path("ckpt-5e726c0e26aa459b88b1e6ef735b4102").unwrap();
+        assert!(ok.ends_with("ckpt-5e726c0e26aa459b88b1e6ef735b4102.smolcheckpoint"));
+    }
+
+    /// Eviction removes oldest-used entries only until the directory fits, and
+    /// never touches the newest.
+    #[test]
+    fn eviction_drops_oldest_until_under_the_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let mk = |name: &str, size: usize, age_secs: u64| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, vec![0u8; size]).unwrap();
+            let t = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+            std::fs::File::options()
+                .append(true)
+                .open(&p)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_accessed(t))
+                .unwrap();
+            p
+        };
+        let oldest = mk("a.smolcheckpoint", 300, 300);
+        let middle = mk("b.smolcheckpoint", 300, 200);
+        let newest = mk("c.smolcheckpoint", 300, 100);
+        checkpoint_cache_evict(dir.path(), 650);
+        assert!(!oldest.exists(), "oldest must go first");
+        assert!(middle.exists(), "eviction must stop once under the ceiling");
+        assert!(newest.exists(), "newest must survive");
+        checkpoint_cache_evict(dir.path(), 10_000);
+        assert!(
+            middle.exists() && newest.exists(),
+            "no-op when already under"
+        );
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_source_tests {
+    use super::checked_checkpoint_source;
+
+    /// The node fetches whatever URL its control plane names, so the allow-list
+    /// is the only thing standing between this parameter and a request-forgery
+    /// primitive. These are the targets that matter on a cloud host.
+    #[test]
+    fn refuses_everything_outside_the_object_store() {
+        for raw in [
+            "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token",
+            "https://169.254.169.254/computeMetadata/v1/",
+            "http://127.0.0.1:8080/api/v1/machines",
+            "https://127.0.0.1/",
+            "http://[::1]:8080/",
+            "https://10.0.0.2/",
+            "file:///etc/shadow",
+            "https://storage.googleapis.com.evil.test/o",
+            "https://evil.test/storage.googleapis.com",
+            "gopher://storage.googleapis.com/",
+        ] {
+            assert!(
+                checked_checkpoint_source(raw).is_err(),
+                "{raw} must be refused as a checkpoint source"
+            );
+        }
+    }
+
+    /// Plain HTTP is refused even for an allowed host: a signed URL in the clear
+    /// hands the bearer token to anything on the path.
+    #[test]
+    fn refuses_plaintext_even_for_an_allowed_host() {
+        assert!(checked_checkpoint_source("http://storage.googleapis.com/b/o").is_err());
+    }
+
+    /// The real shapes a signed URL arrives in: the bucket may be a subdomain or
+    /// the first path segment.
+    #[test]
+    fn accepts_signed_object_store_urls() {
+        for raw in [
+            "https://storage.googleapis.com/smolmachines-snapshots/o.smolcheckpoint?x-goog-signature=ab",
+            "https://smolmachines-snapshots.storage.googleapis.com/o.smolcheckpoint?x-goog-signature=ab",
+            "https://storage.cloud.google.com/smolmachines-snapshots/o.smolcheckpoint",
+        ] {
+            assert!(
+                checked_checkpoint_source(raw).is_ok(),
+                "{raw} is a legitimate signed checkpoint source"
+            );
+        }
+    }
+}
+
+/// Import a live checkpoint, optionally rebinding its host-side published ports.
 pub async fn restore_portable_checkpoint(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
+    Query(options): Query<RestoreCheckpointQuery>,
     request: axum::extract::Request,
 ) -> Result<Json<MachineInfo>, ApiError> {
     validate_vm_name(&name, "machine name").map_err(ApiError::BadRequest)?;
+    let ports: Vec<PortSpec> = options
+        .ports
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|error| ApiError::BadRequest(format!("invalid restore ports: {error}")))?
+        .unwrap_or_default();
     let transfer = tempfile::Builder::new()
         .prefix("checkpoint-restore-")
         .tempdir_in(checkpoint_transfer_root()?)
         .map_err(|error| ApiError::internal(format!("create checkpoint transfer: {error}")))?;
     let artifact = transfer.path().join("upload.smolcheckpoint");
-    let mut file = tokio::fs::File::create(&artifact)
-        .await
-        .map_err(|error| ApiError::internal(format!("create checkpoint upload: {error}")))?;
+    let _transfer = CheckpointTransfer {
+        _directory: Some(transfer),
+        artifact: artifact.clone(),
+    };
     let limit = max_checkpoint_upload_bytes();
-    let mut received = 0_u64;
-    let mut body = request.into_body().into_data_stream();
-    while let Some(chunk) = body.next().await {
-        let chunk = chunk
-            .map_err(|error| ApiError::BadRequest(format!("read checkpoint upload: {error}")))?;
-        received = received
-            .checked_add(chunk.len() as u64)
-            .ok_or_else(|| ApiError::BadRequest("checkpoint upload size overflow".to_string()))?;
-        if received > limit {
-            return Err(ApiError::BadRequest(format!(
-                "checkpoint exceeds the configured {limit}-byte upload limit"
-            )));
-        }
-        file.write_all(&chunk)
+    // A cached artifact is hard-linked straight into the staging directory:
+    // nothing is created or fetched, and the cache's own inode is untouched by
+    // whatever the restore does with its copy. Checked before any file exists
+    // at `artifact`, since a link cannot land on an existing path.
+    let cached = if let Some(key) = options.cache_key.clone() {
+        let artifact = artifact.clone();
+        tokio::task::spawn_blocking(move || checkpoint_cache_take(&key, &artifact))
             .await
-            .map_err(|error| ApiError::internal(format!("write checkpoint upload: {error}")))?;
+            .map_err(|error| ApiError::internal(format!("checkpoint cache task: {error}")))?
+    } else {
+        None
+    };
+    let cache_hit = cached.is_some();
+    let verified = cached.and_then(|entry| entry.verified);
+    let received: u64 = if cache_hit {
+        std::fs::metadata(&artifact).map(|m| m.len()).unwrap_or(0)
+    } else {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&artifact)
+            .await
+            .map_err(|error| ApiError::internal(format!("create checkpoint upload: {error}")))?;
+        let mut received = 0_u64;
+        if let Some(raw) = options.source_url.as_deref() {
+            // Pull the checkpoint ourselves. `none()` redirects: a signed URL needs
+            // no hop, and following one would let the allow-list above be escaped by
+            // a 302 to somewhere it forbids.
+            let url = checked_checkpoint_source(raw)?;
+            let client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .read_timeout(std::time::Duration::from_secs(120))
+                .timeout(std::time::Duration::from_secs(1800))
+                .build()
+                .map_err(|error| {
+                    ApiError::internal(format!("build checkpoint fetch client: {error}"))
+                })?;
+            let response = client.get(url).send().await.map_err(|error| {
+                ApiError::internal(format!(
+                    "fetch checkpoint from source url: {}",
+                    error.without_url()
+                ))
+            })?;
+            if !response.status().is_success() {
+                return Err(ApiError::BadRequest(format!(
+                    "checkpoint source url returned {}",
+                    response.status()
+                )));
+            }
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|error| {
+                    ApiError::internal(format!(
+                        "read checkpoint from source url: {}",
+                        error.without_url()
+                    ))
+                })?;
+                received = received.checked_add(chunk.len() as u64).ok_or_else(|| {
+                    ApiError::BadRequest("checkpoint upload size overflow".to_string())
+                })?;
+                if received > limit {
+                    return Err(ApiError::BadRequest(format!(
+                        "checkpoint exceeds the configured {limit}-byte upload limit"
+                    )));
+                }
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|error| ApiError::internal(format!("write checkpoint: {error}")))?;
+            }
+        } else {
+            let mut body = request.into_body().into_data_stream();
+            while let Some(chunk) = body.next().await {
+                let chunk = chunk.map_err(|error| {
+                    ApiError::BadRequest(format!("read checkpoint upload: {error}"))
+                })?;
+                received = received.checked_add(chunk.len() as u64).ok_or_else(|| {
+                    ApiError::BadRequest("checkpoint upload size overflow".to_string())
+                })?;
+                if received > limit {
+                    return Err(ApiError::BadRequest(format!(
+                        "checkpoint exceeds the configured {limit}-byte upload limit"
+                    )));
+                }
+                file.write_all(&chunk).await.map_err(|error| {
+                    ApiError::internal(format!("write checkpoint upload: {error}"))
+                })?;
+            }
+        }
+        file.flush()
+            .await
+            .map_err(|error| ApiError::internal(format!("flush checkpoint upload: {error}")))?;
+        file.sync_all()
+            .await
+            .map_err(|error| ApiError::internal(format!("sync checkpoint upload: {error}")))?;
+        drop(file);
+        received
+    };
+    if received > limit {
+        return Err(ApiError::BadRequest(format!(
+            "checkpoint exceeds the configured {limit}-byte upload limit"
+        )));
     }
     if received == 0 {
         return Err(ApiError::BadRequest(
             "checkpoint upload is empty".to_string(),
         ));
     }
-    file.flush()
+
+    // Prepared state is an optional optimization: eviction or missing metadata
+    // falls back to the durable artifact before machine creation starts.
+    #[cfg(target_os = "linux")]
+    let prepared = if cache_hit && smolvm_pack::extract::shared_extract_enabled() {
+        let artifact = artifact.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::artifact_cache::open_prepared_checkpoint_for_sidecar(&artifact).ok()
+        })
         .await
-        .map_err(|error| ApiError::internal(format!("flush checkpoint upload: {error}")))?;
-    file.sync_all()
-        .await
-        .map_err(|error| ApiError::internal(format!("sync checkpoint upload: {error}")))?;
-    drop(file);
+        .map_err(|error| ApiError::internal(format!("prepared checkpoint task: {error}")))?
+    } else {
+        None
+    };
+    let restore_path = artifact.clone();
+    #[cfg(target_os = "linux")]
+    let restore_path = prepared
+        .as_ref()
+        .map(|input| input.path.clone())
+        .unwrap_or(restore_path);
 
     let request: CreateMachineRequest = serde_json::from_value(serde_json::json!({
         "name": name,
-        "from": artifact.to_string_lossy(),
+        "from": restore_path.to_string_lossy(),
+        "ports": ports,
     }))
     .map_err(|error| ApiError::internal(format!("build checkpoint restore request: {error}")))?;
     // create_machine consumes and verifies the artifact before this TempDir is
     // dropped, installing owned checkpoint payloads and exact qcow chains.
-    create_machine(State(state), Json(request)).await
+    // The cache take verified this request's pinned artifact; hand that
+    // verification over so creation does not read the payload a second time.
+    // It only applies if the path creation uses still names that exact inode.
+    let result = create_machine_inner(State(state), Json(request), verified, cache_hit).await;
+    #[cfg(target_os = "linux")]
+    drop(prepared);
+    if result.is_ok() {
+        if let Some(key) = options.cache_key {
+            if let Err(error) =
+                tokio::task::spawn_blocking(move || checkpoint_cache_put(&key, &artifact)).await
+            {
+                tracing::warn!(%error, "checkpoint cache task failed");
+            }
+        }
+    }
+    result
 }
 
 /// Build a MachineEntry from a VmRecord and AgentManager.
@@ -331,6 +1475,7 @@ fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> Machin
         .collect();
     MachineEntry {
         manager,
+        image: record.image.clone(),
         mounts,
         ports,
         resources: ResourceSpec {
@@ -387,13 +1532,13 @@ async fn reconcile_confirmed_stopped_machine(
         })
 }
 
-/// Attempt graceful shutdown, then force-terminate if still running.
+/// Stop after confirmed guest quiescence, or discard an explicitly deleted VM.
 ///
 /// Uses verified signals to prevent killing an unrelated process if the
 /// PID was recycled by the OS. Returns true if the process is confirmed
 /// dead (or was never running), false if it may still be alive.
-/// `graceful`: when true (stop), give the guest a SIGTERM grace period to flush
-/// to its persistent overlay before SIGKILL. When false (delete), the machine's
+/// `graceful`: when true (stop), require a safe shutdown acknowledgment before
+/// sending any termination signal. When false (delete), the machine's
 /// disks are discarded immediately after, so there is nothing to flush — SIGKILL
 /// at once instead of waiting out the guest's graceful shutdown (the bulk of the
 /// ~1.9s DELETE latency on metal).
@@ -406,12 +1551,22 @@ fn shutdown_machine_process(
     // Try graceful shutdown via vsock first.
     // If vsock connects, this confirms the process is our VM (identity verification).
     let manager = AgentManager::for_vm(name).ok();
-    let mut vsock_confirmed = false;
-    if let Some(ref manager) = manager {
+    let mut shutdown_acknowledged = false;
+    if let Some(manager) = manager.as_ref().filter(|_| graceful) {
         if let Ok(mut client) = AgentClient::connect(manager.vsock_socket()) {
-            vsock_confirmed = true;
-            let _ = client.shutdown();
+            shutdown_acknowledged = client.shutdown().is_ok();
         }
+    }
+
+    if graceful && !shutdown_acknowledged {
+        if pid.is_some_and(|pid| !is_alive(pid)) {
+            return true;
+        }
+        tracing::warn!(
+            name,
+            "guest shutdown was not acknowledged; preserving the live VM and its disks"
+        );
+        return false;
     }
 
     // PID-based signal handling.
@@ -420,7 +1575,7 @@ fn shutdown_machine_process(
         // We intentionally do NOT use the lenient is_our_process() here because
         // it treats any alive PID as "ours" when start_time is None — which risks
         // killing an unrelated process if the OS reused the PID.
-        let identity_ok = vsock_confirmed || is_our_process_strict(pid, pid_start_time);
+        let identity_ok = shutdown_acknowledged || is_our_process_strict(pid, pid_start_time);
 
         if identity_ok {
             // On delete the disks are removed right after, so skip the SIGTERM
@@ -524,6 +1679,43 @@ pub async fn create_machine(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<CreateMachineRequest>,
 ) -> Result<Json<MachineInfo>, ApiError> {
+    create_machine_inner(State(state), Json(req), None, false).await
+}
+
+/// [`create_machine`], optionally reusing a verification of the `from`
+/// artifact that this same request already performed on a pinned descriptor.
+/// The reuse is granted only when the path about to be used still resolves to
+/// that unchanged inode; otherwise the artifact is verified afresh here. This
+/// is a private request-scoped handoff, not a public option.
+async fn create_machine_inner(
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<CreateMachineRequest>,
+    verified: Option<crate::portable_checkpoint::VerifiedSidecar>,
+    cached_checkpoint: bool,
+) -> Result<Json<MachineInfo>, ApiError> {
+    #[cfg(target_os = "linux")]
+    let mut req = req;
+    #[cfg(target_os = "linux")]
+    let _prepared = if let Some(reference) = req
+        .from
+        .as_ref()
+        .filter(|value| value.starts_with("checkpoint://"))
+    {
+        let reference = reference.clone();
+        let prepared = tokio::task::spawn_blocking(move || {
+            crate::artifact_cache::open_prepared_checkpoint(&reference)
+        })
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+        req.from = Some(prepared.path.to_string_lossy().into_owned());
+        Some(prepared)
+    } else {
+        None
+    };
+    #[cfg(target_os = "linux")]
+    let cached_checkpoint = cached_checkpoint || _prepared.is_some();
+    let mut checkpoint_phase = std::time::Instant::now();
     // Validate: registry_ref, from, and image are mutually exclusive
     let source_count = [
         req.registry_ref.is_some(),
@@ -554,6 +1746,7 @@ pub async fn create_machine(
     }
 
     // If registry_ref is set, pull the artifact from the registry and treat as `from`
+    #[cfg(not(target_os = "linux"))]
     let mut req = req;
     if let Some(ref registry_ref) = req.registry_ref.clone() {
         let pulled_path = pull_from_registry(
@@ -701,6 +1894,28 @@ pub async fn create_machine(
                 sidecar_path
             )));
         }
+        // Cache lookup and creation are separate phases. Another restore may
+        // have changed link metadata in between; reverify under the same lease
+        // used by lookup, publication, eviction and transfer cleanup.
+        let verification_path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let _lock = if cached_checkpoint {
+                Some(lock_checkpoint_cache_verification(&checkpoint_cache_dir()?)
+                    .map_err(|e| ApiError::internal(format!("lock checkpoint verification: {e}")))?)
+            } else {
+                None
+            };
+            if verified.as_ref().is_some_and(|input| input.covers(&verification_path)) {
+                tracing::info!(
+                    artifact = %verification_path.display(),
+                    "reusing this request's pinned checkpoint verification; skipping a second checksum pass"
+                );
+            } else {
+                crate::portable_checkpoint::verified_sidecar_footer(&verification_path)
+                    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            }
+            Ok::<_, ApiError>(())
+        }).await.map_err(|e| ApiError::internal(format!("checkpoint verification task: {e}")))??;
         let manifest = smolvm_pack::packer::read_manifest_from_sidecar(path)
             .map_err(|e| ApiError::internal(format!("read .smolmachine: {}", e)))?;
         let checkpoint = manifest.checkpoint.clone();
@@ -831,7 +2046,7 @@ pub async fn create_machine(
         .as_ref()
         .and_then(|checkpoint| checkpoint.overlay_gib)
         .or(req.overlay_gb);
-    let restored_ports: Vec<PortSpec> = checkpoint_network
+    let captured_ports: Vec<PortSpec> = checkpoint_network
         .map(|network| {
             network
                 .ports
@@ -843,6 +2058,11 @@ pub async fn create_machine(
                 .collect()
         })
         .unwrap_or_else(|| req.ports.clone());
+    let restored_ports = if manifest_checkpoint.is_some() {
+        checkpoint_host_ports(&captured_ports, &req.ports)?
+    } else {
+        captured_ports
+    };
     let restored_network_backend = match manifest_checkpoint.as_ref() {
         Some(checkpoint) => crate::portable_checkpoint::restored_network_backend(checkpoint)
             .map_err(|error| ApiError::BadRequest(error.to_string()))?,
@@ -869,7 +2089,6 @@ pub async fn create_machine(
         }
         if !host_mount_specs.is_empty()
             || !remote_volumes.is_empty()
-            || !req.ports.is_empty()
             || req.network
             || req.gpu
             || req.cuda
@@ -901,6 +2120,9 @@ pub async fn create_machine(
         .map(|network| network.enabled)
         .unwrap_or(req.network || manifest_net);
 
+    if manifest_checkpoint.is_some() {
+        crate::portable_checkpoint::log_phase(&name, "api_restore_verify", &mut checkpoint_phase);
+    }
     // Reserve the name atomically (prevents concurrent creation)
     let guard = ReservationGuard::new(&state, name.clone())?;
 
@@ -917,6 +2139,9 @@ pub async fn create_machine(
     .await
     .map_err(|e| ApiError::internal(format!("task error: {}", e)))??;
 
+    if manifest_checkpoint.is_some() {
+        crate::portable_checkpoint::log_phase(&name, "api_restore_prepare", &mut checkpoint_phase);
+    }
     // Extract the bundle's OCI layers into this machine's own data dir (created
     // by the manager above) rather than the shared pack cache, so every start is
     // independent of the .smolmachine file surviving and the macOS layers volume
@@ -997,6 +2222,9 @@ pub async fn create_machine(
         .map_err(|e| ApiError::internal(format!("task error: {}", e)))??;
     }
 
+    if manifest_checkpoint.is_some() {
+        crate::portable_checkpoint::log_phase(&name, "api_restore_extract", &mut checkpoint_phase);
+    }
     // VM-mode pack: seed this machine's overlay + storage disks from the packed
     // templates (extracted above) so a start boots the source VM's rootfs rather
     // than the bare agent-rootfs (the /bin/sh-missing bug). `open_or_create_at`
@@ -1054,6 +2282,9 @@ pub async fn create_machine(
         }
     }
 
+    if manifest_checkpoint.is_some() {
+        crate::portable_checkpoint::log_phase(&name, "api_restore_seed", &mut checkpoint_phase);
+    }
     // Install a live checkpoint only after the ordinary VM-mode templates have
     // been seeded. The checkpoint's exact qcow chains must be the final disk
     // publication; seeding afterwards would silently replace the captured
@@ -1085,6 +2316,9 @@ pub async fn create_machine(
         }
     }
 
+    if manifest_checkpoint.is_some() {
+        crate::portable_checkpoint::log_phase(&name, "api_restore_install", &mut checkpoint_phase);
+    }
     let resources = ResourceSpec {
         cpus: Some(cpus),
         memory_mb: Some(mem),
@@ -1173,6 +2407,7 @@ pub async fn create_machine(
             .as_ref()
             .and_then(|checkpoint| checkpoint.workload.as_ref())
             .map(|workload| workload.overlay_owner.clone()),
+        host_uid_owner: manifest_checkpoint.as_ref().map(|_| name.clone()),
         // Record secrets = packed refs from --from (validated Untrusted above)
         // merged with request refs (validated Untrusted at ~line 333); request
         // refs win on key collision. Both sources are store-only, so RecordReplay
@@ -1556,7 +2791,7 @@ pub async fn start_machine(
     let source_smolmachine = record.source_smolmachine.clone();
     let dns_filter_hosts = record.dns_filter_hosts.clone();
     let record_golden = record.golden.clone();
-    let record_fork_overlay_owner = record.fork_overlay_owner.clone();
+    let record_fork_overlay_owner = record.vm_uid_owner().map(str::to_string);
     let cuda_fork_pool_size = record.cuda_fork_pool_size;
     let cuda_vram_limit_mib = record.cuda_vram_limit_mib;
     let restore_record = record.clone();
@@ -1687,16 +2922,21 @@ pub async fn start_machine(
             // the booted VM as an untracked orphan — its pid never reaches the
             // record, and a later delete then reports "process still alive after
             // shutdown; not removing" while the VM leaks. Tear the VM down so the
-            // machine is left exactly like a never-started one (`created`, no live
-            // process) — cleanly retryable (e.g. once a transient registry outage
+            // machine is stopped with no live process and is cleanly retryable
+            // (e.g. once a transient registry outage
             // clears) and deletable — then surface the pull failure.
             let st = pid.and_then(process_start_time);
             let name_rb = name.clone();
-            tokio::task::spawn_blocking(move || {
-                shutdown_machine_process(&name_rb, pid, st, false);
+            let stopped = tokio::task::spawn_blocking(move || {
+                shutdown_machine_process(&name_rb, pid, st, false)
             })
             .await
-            .ok();
+            .unwrap_or(false);
+            if stopped {
+                reconcile_confirmed_stopped_machine(&state, &name, false).await?;
+            } else {
+                tracing::warn!(machine = %name, "image pull failed and VM teardown is incomplete; retaining the launch lock");
+            }
             return Err(e);
         }
         // Launch the workload container. Best-effort past the pull: a transient
@@ -1850,6 +3090,35 @@ pub(crate) async fn fork_machine_inner(
     golden: String,
     req: ForkRequest,
 ) -> Result<MachineInfo, ApiError> {
+    // A disconnected request must not drop lifecycle guards while its blocking
+    // preparation still creates disks and registers the child. Once preparation
+    // starts, finish boot or rollback before releasing those guards.
+    with_owned_operation(move |reply| async move {
+        let outcome = fork_machine_transaction(state, golden, req, &reply).await;
+        let _ = reply.send(outcome);
+    })
+    .await
+}
+
+async fn with_owned_operation<T, F, Fut>(work: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce(tokio::sync::oneshot::Sender<Result<T, ApiError>>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let (reply, result) = tokio::sync::oneshot::channel();
+    tokio::spawn(work(reply));
+    result
+        .await
+        .map_err(|error| ApiError::internal(format!("machine lifecycle task failed: {error}")))?
+}
+
+async fn fork_machine_transaction(
+    state: Arc<ApiState>,
+    golden: String,
+    req: ForkRequest,
+    reply: &tokio::sync::oneshot::Sender<Result<MachineInfo, ApiError>>,
+) -> Result<MachineInfo, ApiError> {
     let clone = req.name.clone();
     let pinned_ports: Vec<(u16, u16)> = req.ports.iter().map(|p| (p.host, p.guest)).collect();
     let req_share_weights = req.share_weights;
@@ -1932,6 +3201,15 @@ pub(crate) async fn fork_machine_inner(
     // acquired before clone, matching the fork-pool lock order.
     let lifecycle = state.lifecycle_lock(&clone);
     let _guard = lifecycle.lock().await;
+
+    // Cancellation while queued is still safe: no child has been prepared.
+    // Check under the child lock so a concurrent delete either sees no child
+    // or waits for the entire transaction, never for just its request future.
+    if reply.is_closed() {
+        return Err(ApiError::Conflict(
+            "branch request cancelled before preparation".into(),
+        ));
+    }
 
     // Phase 1: freeze + snapshot the golden, register the clone with CoW disks.
     // This is unix-socket IO + disk work, so it runs on the blocking pool. Its
@@ -2214,6 +3492,9 @@ async fn boot_prepared_fork_inner(
         // Boot from the golden's snapshot instead of cold-booting.
         features.forkable = record.forkable;
         features.snapshot_dir = Some(prep.snapshot_dir);
+        // A nested branch must keep the original lineage's UID, not allocate
+        // a new UID from the immediate parent's snapshot directory.
+        features.uid_share_dir = record.vm_uid_owner().map(crate::agent::vm_data_dir);
         features.cuda_share_weights = share_weights;
         features.cuda_preload_modules = record.cuda_preload_modules;
         features.cuda_fork_pool_size = record.cuda_fork_pool_size;
@@ -2557,8 +3838,8 @@ pub async fn stop_machine(
             match e.manager.stop() {
                 Ok(()) => true,
                 Err(err) => {
-                    tracing::warn!(name = %name_clone, error = %err, "manager.stop() failed, falling back to process kill");
-                    shutdown_machine_process(&name_clone, pid, pid_start_time, true)
+                    tracing::warn!(name = %name_clone, error = %err, "graceful stop failed; preserving the live VM for retry");
+                    false
                 }
             }
         } else {
@@ -2647,8 +3928,11 @@ pub async fn sync_machine(
 /// gated, and the loopback door is localhost.
 pub async fn drain_node(State(state): State<Arc<ApiState>>) -> axum::http::StatusCode {
     tracing::info!("drain requested via API (node decommission)");
-    drain_machines(&state).await;
-    axum::http::StatusCode::OK
+    if drain_machines(&state).await {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    }
 }
 
 /// Gracefully stop every running VM. Two callers: the opt-in shutdown path
@@ -2657,7 +3941,7 @@ pub async fn drain_node(State(state): State<Arc<ApiState>>) -> axum::http::Statu
 /// Draining stops VMs cleanly — flushing disk state and marking them stopped so
 /// the control plane can reschedule. Best-effort, concurrent, and bounded so it
 /// fits inside the host's termination grace period.
-pub async fn drain_machines(state: &Arc<ApiState>) {
+pub async fn drain_machines(state: &Arc<ApiState>) -> bool {
     let running: Vec<(String, VmRecord)> = match state.list_vm_records().await {
         Ok(vms) => vms
             .into_iter()
@@ -2665,11 +3949,11 @@ pub async fn drain_machines(state: &Arc<ApiState>) {
             .collect(),
         Err(e) => {
             tracing::error!(error = ?e, "drain: failed to list machines");
-            return;
+            return false;
         }
     };
     if running.is_empty() {
-        return;
+        return true;
     }
     tracing::info!(
         count = running.len(),
@@ -2700,19 +3984,14 @@ pub async fn drain_machines(state: &Arc<ApiState>) {
                         return false;
                     }
                 }
-                // Prefer the registered manager (holds the flock); fall back to a
-                // PID-verified signal — same path as the stop handler.
-                let via_manager = entry
-                    .as_ref()
-                    .map(|e| e.lock().manager.stop().is_ok())
-                    .unwrap_or(false);
-                via_manager
-                    || shutdown_machine_process(
+                // Both paths require guest quiescence before verified signals.
+                entry.as_ref().map(|e| e.lock().manager.stop().is_ok()).unwrap_or_else(||
+                    shutdown_machine_process(
                         &name_for_kill,
                         record.pid,
                         record.pid_start_time,
                         true,
-                    )
+                    ))
             })
             .await
             .unwrap_or(false);
@@ -2733,20 +4012,24 @@ pub async fn drain_machines(state: &Arc<ApiState>) {
                     })
                     .await;
             }
-            tracing::info!(machine = %name, stopped, "drain: machine stopped");
+            tracing::info!(machine = %name, stopped, "drain: shutdown attempt finished");
+            stopped
         }));
     }
 
     let drain_all = async {
+        let mut complete = true;
         for h in handles {
-            let _ = h.await;
+            complete &= h.await.unwrap_or(false);
         }
+        complete
     };
-    if tokio::time::timeout(std::time::Duration::from_secs(25), drain_all)
-        .await
-        .is_err()
-    {
-        tracing::warn!("drain: deadline reached before all machines stopped");
+    match tokio::time::timeout(std::time::Duration::from_secs(130), drain_all).await {
+        Ok(complete) => complete,
+        Err(_) => {
+            tracing::warn!("drain: deadline reached before all machines stopped");
+            false
+        }
     }
 }
 
@@ -2795,6 +4078,19 @@ pub async fn delete_machine(
 /// with live clones. Shared by [`delete_machine`] (once per golden, and once per
 /// clone during a cascade).
 pub(crate) async fn delete_one(
+    state: Arc<ApiState>,
+    name: String,
+) -> Result<DeleteResponse, ApiError> {
+    // A cleanup request may outlive its caller's deadline while waiting for a
+    // branch. Keep it queued, and hold its locks through the blocking teardown.
+    with_owned_operation(move |reply| async move {
+        let result = delete_one_transaction(state, name).await;
+        let _ = reply.send(result);
+    })
+    .await
+}
+
+async fn delete_one_transaction(
     state: Arc<ApiState>,
     name: String,
 ) -> Result<DeleteResponse, ApiError> {
@@ -3433,6 +4729,70 @@ mod tests {
     use crate::db::SmolvmDb;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    #[test]
+    fn machine_response_reports_resolved_image_for_registry_binding() {
+        let mut record = VmRecord::new("image-contract".into(), 1, 512, vec![], vec![], false);
+        let bare = serde_json::to_value(record_to_info("image-contract", &record)).unwrap();
+        assert!(bare.get("image").is_none());
+        for image in [
+            "registry.smolmachines.com/tenants/example/app:latest",
+            "ghcr.io/example/app:latest",
+        ] {
+            record.image = Some(image.into());
+            let response = serde_json::to_value(record_to_info("image-contract", &record)).unwrap();
+            assert_eq!(response["image"], image);
+            let manager = AgentManager::for_vm("image-contract").unwrap();
+            let entry = machine_entry_from_record(&record, manager);
+            let cached = serde_json::to_value(crate::api::state::machine_entry_to_info(
+                "image-contract".into(),
+                &entry,
+            ))
+            .unwrap();
+            assert_eq!(cached["image"], image);
+        }
+    }
+
+    #[test]
+    fn checkpoint_ports_allow_host_rebinding_but_preserve_guest_topology() {
+        let captured = vec![
+            PortSpec {
+                host: 30001,
+                guest: 8080,
+            },
+            PortSpec {
+                host: 30002,
+                guest: 3000,
+            },
+        ];
+        let requested = vec![
+            PortSpec {
+                host: 31002,
+                guest: 3000,
+            },
+            PortSpec {
+                host: 31001,
+                guest: 8080,
+            },
+        ];
+        let ports = checkpoint_host_ports(&captured, &requested).unwrap();
+        assert_eq!(ports[0].host, 31002);
+        assert_eq!(ports[1].host, 31001);
+        assert_eq!(
+            checkpoint_host_ports(&captured, &[]).unwrap()[0].host,
+            30001
+        );
+        assert!(checkpoint_host_ports(&captured, &requested[..1]).is_err());
+        assert!(checkpoint_host_ports(
+            &captured,
+            &[PortSpec {
+                host: 31001,
+                guest: 9090
+            }]
+        )
+        .is_err());
+        assert!(checkpoint_host_ports(&[], &requested).is_err());
+    }
 
     #[tokio::test]
     async fn bounded_futures_stream_results_without_exceeding_the_limit() {

@@ -167,6 +167,15 @@ pub fn start_network_stack(
     egress: EgressPolicy,
     fabric: Option<crate::fabric::FabricHandle>,
 ) -> std::io::Result<JoinHandle<()>> {
+    // A restored guest retains TCP state, but this host-side stack is new.
+    // Replaying both the port and ISN sequence collides with saved connections
+    // and forces a reset followed by the one-second SYN retransmit timer.
+    // Obtain entropy here, after a branch/restore, not in saved VM config.
+    let mut entropy = [0u8; 10];
+    getrandom::fill(&mut entropy)
+        .map_err(|error| std::io::Error::other(format!("seed network connections: {error}")))?;
+    let sequence_seed = u64::from_ne_bytes(entropy[..8].try_into().unwrap());
+    let port_seed = u16::from_ne_bytes(entropy[8..].try_into().unwrap());
     virtio_net_log!(
         "virtio-net: spawning poll thread guest_ip={} gateway_ip={} mtu={}",
         config.guest_ipv4,
@@ -175,7 +184,17 @@ pub fn start_network_stack(
     );
     thread::Builder::new()
         .name("smolvm-net-poll".into())
-        .spawn(move || run_network_stack(queues, config, tcp_receiver, egress, fabric))
+        .spawn(move || {
+            run_network_stack(
+                queues,
+                config,
+                tcp_receiver,
+                egress,
+                fabric,
+                sequence_seed,
+                port_seed,
+            )
+        })
 }
 
 fn run_network_stack(
@@ -184,6 +203,8 @@ fn run_network_stack(
     mut tcp_receiver: Option<Receiver<AcceptedTcpConnection>>,
     egress: EgressPolicy,
     fabric: Option<crate::fabric::FabricHandle>,
+    sequence_seed: u64,
+    port_seed: u16,
 ) {
     // Poll loop overview:
     //
@@ -205,7 +226,7 @@ fn run_network_stack(
     );
     let clock = StdInstant::now();
     let mut device = VirtioNetworkDevice::new(queues.clone(), config.mtu);
-    let mut interface = create_interface(&mut device, &config);
+    let mut interface = create_interface(&mut device, &config, sequence_seed);
     let mut sockets = SocketSet::new(vec![]);
     let dns_routing = DnsRouting {
         upstream: config.upstream_dns,
@@ -230,7 +251,8 @@ fn run_network_stack(
         egress.clone(),
         gateway_addrs.to_vec(),
         config.host_service,
-    );
+    )
+    .with_published_port_seed(port_seed);
     let mut relay_spawn_attempts = 0_u64;
     let mut relay_spawn_successes = 0_u64;
     let mut relay_spawn_failures = 0_u64;
@@ -505,7 +527,11 @@ fn run_network_stack(
     }
 }
 
-fn create_interface(device: &mut VirtioNetworkDevice, config: &VirtioPollConfig) -> Interface {
+fn create_interface(
+    device: &mut VirtioNetworkDevice,
+    config: &VirtioPollConfig,
+    sequence_seed: u64,
+) -> Interface {
     // This interface models the host-side gateway endpoint, not the guest NIC.
     //
     // Equivalent conceptual state:
@@ -515,13 +541,11 @@ fn create_interface(device: &mut VirtioNetworkDevice, config: &VirtioPollConfig)
     //
     // The guest IP exists as a peer on the same virtual link; it is not an
     // address owned by this interface.
-    let mut interface = Interface::new(
-        Config::new(HardwareAddress::Ethernet(EthernetAddress(
-            config.gateway_mac,
-        ))),
-        device,
-        Instant::ZERO,
-    );
+    let mut interface_config = Config::new(HardwareAddress::Ethernet(EthernetAddress(
+        config.gateway_mac,
+    )));
+    interface_config.random_seed = sequence_seed;
+    let mut interface = Interface::new(interface_config, device, Instant::ZERO);
     interface.update_ip_addrs(|addresses| {
         addresses
             .push(IpCidr::new(IpAddress::Ipv4(config.gateway_ipv4), 30))
@@ -1308,6 +1332,75 @@ pub fn fuzz_classify_guest_frame(frame: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn initial_tcp_sequence(seed: u64) -> i32 {
+        let config = VirtioPollConfig {
+            gateway_mac: [2, 0, 0, 0, 0, 1],
+            guest_mac: [2, 0, 0, 0, 0, 2],
+            gateway_ipv4: Ipv4Addr::new(100, 96, 0, 1),
+            guest_ipv4: Ipv4Addr::new(100, 96, 0, 2),
+            gateway_ipv6: "fd00::1".parse().unwrap(),
+            guest_ipv6: "fd00::2".parse().unwrap(),
+            prefix_len6: 64,
+            upstream_dns: Ipv4Addr::new(1, 1, 1, 1),
+            host_service: None,
+            mtu: 1500,
+        };
+        let queues = NetworkFrameQueues::shared(32);
+        let mut device = VirtioNetworkDevice::new(queues.clone(), config.mtu);
+        let mut interface = create_interface(&mut device, &config, seed);
+        let mut sockets = SocketSet::new(vec![]);
+
+        // Learn the guest's MAC through an ordinary ARP request, so egress can
+        // emit the SYN immediately rather than pausing for neighbor discovery.
+        let mut arp = Vec::new();
+        arp.extend_from_slice(&config.gateway_mac);
+        arp.extend_from_slice(&config.guest_mac);
+        arp.extend_from_slice(&[8, 6, 0, 1, 8, 0, 6, 4, 0, 1]);
+        arp.extend_from_slice(&config.guest_mac);
+        arp.extend_from_slice(&config.guest_ipv4.octets());
+        arp.extend_from_slice(&[0; 6]);
+        arp.extend_from_slice(&config.gateway_ipv4.octets());
+        queues.guest_to_host.push(arp).unwrap();
+        device.stage_next_frame().unwrap();
+        interface.poll_ingress_single(Instant::ZERO, &mut device, &mut sockets);
+        while queues.host_to_guest.pop().is_some() {}
+
+        let mut socket = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0; 1024]),
+            tcp::SocketBuffer::new(vec![0; 1024]),
+        );
+        socket
+            .connect(
+                interface.context(),
+                (config.guest_ipv4, 8080),
+                (config.gateway_ipv4, 49152),
+            )
+            .unwrap();
+        sockets.add(socket);
+        interface.poll_egress(Instant::from_millis(1), &mut device, &mut sockets);
+        while let Some(frame) = queues.host_to_guest.pop() {
+            let ethernet = EthernetFrame::new_checked(&frame).unwrap();
+            if ethernet.ethertype() != EthernetProtocol::Ipv4 {
+                continue;
+            }
+            let ip = Ipv4Packet::new_checked(ethernet.payload()).unwrap();
+            if ip.next_header() != IpProtocol::Tcp {
+                continue;
+            }
+            let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+            assert!(tcp.syn());
+            return tcp.seq_number().0;
+        }
+        panic!("interface did not emit its initial SYN");
+    }
+
+    #[test]
+    fn fresh_interface_seed_changes_the_wire_sequence_number() {
+        // Same seed reproduces the old restart behavior for an identical tuple.
+        assert_eq!(initial_tcp_sequence(0), initial_tcp_sequence(0));
+        assert_ne!(initial_tcp_sequence(123), initial_tcp_sequence(456));
+    }
 
     /// Minimal Ethernet(IPv4(TCP SYN)) frame with no payload. `new_checked`
     /// validates lengths/header fields (not checksums), so dummy checksums are

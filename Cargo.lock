@@ -280,9 +280,9 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.17.0"
+version = "1.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ec2f1fc3ec205783a5da9a7e6c1509cc69dedf09a1949e412c1e18469326d00"
+checksum = "b281d307588d634de920874890732659e2e7672f72b5e10e81badc1a8a83621e"
 dependencies = [
  "aws-lc-sys",
  "zeroize",
@@ -290,14 +290,15 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.41.0"
+version = "0.45.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a2f9779ce85b93ab6170dd940ad0169b5766ff848247aff13bb788b832fe3f4"
+checksum = "9bff6c3b54fad79a2e60b8102caf565819711497c1f5f092f49508e2f5c31b27"
 dependencies = [
  "cc",
  "cmake",
  "dunce",
  "fs_extra",
+ "pkg-config",
 ]
 
 [[package]]
@@ -2800,9 +2801,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.40"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -2835,9 +2836,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -3078,7 +3079,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "smolfile"
-version = "1.14.6"
+version = "1.16.1"
 dependencies = [
  "serde",
  "smolvm-protocol",
@@ -3104,7 +3105,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm"
-version = "1.14.6"
+version = "1.16.1"
 dependencies = [
  "async-stream",
  "axum",
@@ -3162,11 +3163,12 @@ dependencies = [
  "windows-sys 0.60.2",
  "wiremock",
  "zeroize",
+ "zstd",
 ]
 
 [[package]]
 name = "smolvm-agent"
-version = "1.14.6"
+version = "1.16.1"
 dependencies = [
  "flate2",
  "lazy_static",
@@ -3189,7 +3191,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cuda"
-version = "1.14.6"
+version = "1.16.1"
 dependencies = [
  "getrandom 0.3.4",
  "libc",
@@ -3198,11 +3200,11 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cuda-codegen"
-version = "1.14.6"
+version = "1.16.1"
 
 [[package]]
 name = "smolvm-cuda-guest"
-version = "1.14.6"
+version = "1.16.1"
 dependencies = [
  "smolvm-cuda",
  "vsock",
@@ -3210,7 +3212,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cuda-shim"
-version = "1.14.6"
+version = "1.16.1"
 dependencies = [
  "libc",
  "smolvm-cuda",
@@ -3219,7 +3221,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cudart-shim"
-version = "1.14.6"
+version = "1.16.1"
 dependencies = [
  "libc",
  "smolvm-cuda",
@@ -3228,9 +3230,10 @@ dependencies = [
 
 [[package]]
 name = "smolvm-network"
-version = "1.14.6"
+version = "1.16.1"
 dependencies = [
  "crossbeam-queue",
+ "getrandom 0.3.4",
  "humantime",
  "libc",
  "polling",
@@ -3242,14 +3245,14 @@ dependencies = [
 
 [[package]]
 name = "smolvm-nvml-shim"
-version = "1.14.6"
+version = "1.16.1"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "smolvm-oci-layer"
-version = "1.14.6"
+version = "1.16.1"
 dependencies = [
  "flate2",
  "libc",
@@ -3262,7 +3265,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-pack"
-version = "1.14.6"
+version = "1.16.1"
 dependencies = [
  "crc32fast",
  "dirs",
@@ -3281,7 +3284,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-protocol"
-version = "1.14.6"
+version = "1.16.1"
 dependencies = [
  "base64",
  "serde",
@@ -3291,7 +3294,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-registry"
-version = "1.14.6"
+version = "1.16.1"
 dependencies = [
  "bytes",
  "dirs",
@@ -3313,7 +3316,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-s3fs"
-version = "1.14.6"
+version = "1.16.1"
 dependencies = [
  "hmac",
  "libc",
@@ -3920,7 +3923,7 @@ version = "1.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "97fee6b57c6a41524a810daee9286c02d7752c4253064d0b05472833a438f675"
 dependencies = [
- "cfg-if 1.0.4",
+ "cfg-if 0.1.10",
  "static_assertions",
 ]
 

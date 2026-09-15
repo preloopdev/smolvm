@@ -89,16 +89,14 @@ pub fn registry_client(registry: &str, config: &RegistryConfig, auth: &PullAuth)
         PullAuth::Bearer(token) => client.with_token(token.clone()),
         PullAuth::Identity(token) => client.with_identity_token(token.clone()),
         PullAuth::FromConfig => {
-            let Some(entry) = config.registries.get(cred_key) else {
-                return client;
-            };
-            if let Some(identity_token) = &entry.identity_token {
+            let entry = config.registries.get(cred_key);
+            if let Some(identity_token) = entry.and_then(|e| e.identity_token.as_ref()) {
                 // A lapsed identity token makes the token service answer with a
                 // bare 401 that reads like a permissions problem — so a returning
                 // user whose short-lived credential expired hits a wall even on a
                 // public, anonymous-pullable image. Surface the real cause and the
                 // fix up front rather than letting the opaque 401 be the whole story.
-                warn_if_credential_expired(cred_key, entry.expires_at);
+                warn_if_credential_expired(cred_key, entry.and_then(|e| e.expires_at));
                 client.with_identity_token(identity_token.clone())
             } else if let Some(cred) = config.get_credentials(cred_key) {
                 // Legacy convention: username "token" means the password IS the
@@ -107,6 +105,17 @@ pub fn registry_client(registry: &str, config: &RegistryConfig, auth: &PullAuth)
                     client.with_token(cred.password)
                 } else {
                     client.with_basic_credentials(cred.username, cred.password)
+                }
+            } else if let Some(cred) = crate::docker_config::credential_for(cred_key) {
+                // Nothing in smolvm's own config: fall back to what `docker login`
+                // stored, including credentials held by a credential helper.
+                // An identity token needs the OAuth refresh exchange this client
+                // does not speak, so only a username/secret pair is usable here.
+                if cred.is_identity_token() {
+                    tracing::debug!(registry = %cred_key, "docker identity token is not usable for the host-side registry client");
+                    client
+                } else {
+                    client.with_basic_credentials(cred.username, cred.secret)
                 }
             } else {
                 client

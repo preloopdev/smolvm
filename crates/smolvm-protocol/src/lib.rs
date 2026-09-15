@@ -84,6 +84,9 @@ pub mod base64_bytes {
 /// Protocol version.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// The agent can freeze internal filesystems before acknowledging shutdown.
+pub const QUIESCED_SHUTDOWN_CAPABILITY: &str = "quiesced-shutdown-v1";
+
 /// virtiofs tag under which the host exposes the Rosetta 2 Linux runtime to the
 /// guest. Shared host↔guest so the launcher's `krun_add_virtiofs` tag and the
 /// guest agent's `mount -t virtiofs` source can't drift apart.
@@ -254,6 +257,57 @@ pub struct FsNotifyEvent {
 // Agent Protocol (OCI Operations)
 // ============================================================================
 
+fn shutdown_progress_disabled(progress: &bool) -> bool {
+    !progress
+}
+
+#[cfg(test)]
+mod shutdown_compat_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_shutdown_wire_shape_is_unchanged() {
+        let wire = r#"{"method":"shutdown"}"#;
+        assert!(matches!(
+            serde_json::from_str::<AgentRequest>(wire).unwrap(),
+            AgentRequest::Shutdown { progress: false }
+        ));
+        assert_eq!(
+            serde_json::to_string(&AgentRequest::Shutdown { progress: false }).unwrap(),
+            wire
+        );
+    }
+
+    #[test]
+    fn older_agent_can_accept_opt_in_request() {
+        #[derive(Deserialize)]
+        #[serde(tag = "method", rename_all = "snake_case")]
+        enum LegacyRequest {
+            Shutdown,
+        }
+        let wire = serde_json::to_string(&AgentRequest::Shutdown { progress: true }).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<LegacyRequest>(&wire).unwrap(),
+            LegacyRequest::Shutdown
+        ));
+    }
+
+    #[test]
+    fn traced_shutdown_preserves_progress_opt_in() {
+        let envelope = Envelope::with_trace_id(
+            AgentRequest::Shutdown { progress: true },
+            Some("shutdown-test".into()),
+        );
+        let decoded: Envelope<AgentRequest> =
+            decode_message(&encode_message(&envelope).unwrap()).unwrap();
+        assert!(matches!(
+            decoded.body,
+            AgentRequest::Shutdown { progress: true }
+        ));
+        assert_eq!(decoded.trace_id.as_deref(), Some("shutdown-test"));
+    }
+}
+
 /// Agent request types (for image management and OCI operations).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
@@ -333,6 +387,16 @@ pub enum AgentRequest {
     /// Get storage disk status.
     StorageStatus,
 
+    /// Report the guest's own view of machine memory, read from
+    /// `/proc/meminfo`.
+    ///
+    /// The host cannot answer this. macOS charges the VMM's `phys_footprint`
+    /// as `internal + compressed`, and the compressed part is counted at the
+    /// pages' *uncompressed* size, so an idle guest whose memory has been
+    /// compressed reports a footprint several times the bytes it actually
+    /// occupies. Only the guest's allocator knows what the machine is using.
+    MemoryStatus,
+
     /// Test network connectivity directly from the agent (not via chroot).
     /// Used to debug TSI networking.
     NetworkTest {
@@ -341,7 +405,11 @@ pub enum AgentRequest {
     },
 
     /// Shutdown the agent.
-    Shutdown,
+    Shutdown {
+        /// Opt into progress frames while storage is being synchronized.
+        #[serde(default, skip_serializing_if = "shutdown_progress_disabled")]
+        progress: bool,
+    },
 
     /// Export a layer as a tar archive.
     ///
@@ -370,8 +438,16 @@ pub enum AgentRequest {
         /// are dropped, so a caller may include a container overlay's upper dir
         /// without first checking whether the machine ever wrote to it.
         lowerdirs: Vec<String>,
-        /// Guest path to write the tar archive to.
-        output: String,
+        /// Guest path to write the tar archive to, or `None` to stream the
+        /// archive straight back as `DataChunk` responses.
+        ///
+        /// Streaming is what a large export wants. The flattened tar is as large
+        /// as the image it came from, so staging it in the guest means the disk
+        /// has to hold both the expanded rootfs and a second full copy of it as
+        /// an archive — the export sizes that disk by guessing, and a big enough
+        /// image runs it out of space.
+        #[serde(default)]
+        output: Option<String>,
     },
 
     /// Wait until the workload has declared a branchpoint, returning the ready
@@ -728,8 +804,9 @@ impl AgentRequest {
             AgentRequest::CleanupOverlay { .. } => "CleanupOverlay".into(),
             AgentRequest::FormatStorage => "FormatStorage".into(),
             AgentRequest::StorageStatus => "StorageStatus".into(),
+            AgentRequest::MemoryStatus => "MemoryStatus".into(),
             AgentRequest::NetworkTest { .. } => "NetworkTest".into(),
-            AgentRequest::Shutdown => "Shutdown".into(),
+            AgentRequest::Shutdown { .. } => "Shutdown".into(),
             AgentRequest::ExportLayer { .. } => "ExportLayer".into(),
             AgentRequest::FlattenLayers { lowerdirs, .. } => {
                 format!("FlattenLayers {{ count: {} }}", lowerdirs.len())
@@ -1073,6 +1150,38 @@ pub struct OverlayInfo {
     pub work_path: String,
 }
 
+/// The guest's own account of machine memory, from `/proc/meminfo`.
+///
+/// This is what a machine is actually using. The host-side `phys_footprint`
+/// answers a different question — it counts compressed pages at their
+/// uncompressed size and keeps counting memory the guest has stopped needing —
+/// so it runs well above these figures and should not be read as consumption.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryStatus {
+    /// Total usable RAM the guest sees, in bytes. Slightly below the machine's
+    /// configured size: the kernel reserves some before the allocator sees it.
+    pub total_bytes: u64,
+    /// Memory available for new allocations without swapping, in bytes. The
+    /// figure to report, since `free_bytes` excludes reclaimable page cache.
+    pub available_bytes: u64,
+    /// Free memory in bytes: never allocated, or released and not reused.
+    pub free_bytes: u64,
+    /// Page cache in bytes. Counted inside `available_bytes`.
+    pub cached_bytes: u64,
+    /// Swap configured in the guest, in bytes. Zero when the guest has none.
+    pub swap_total_bytes: u64,
+    /// Swap in use, in bytes.
+    pub swap_used_bytes: u64,
+}
+
+impl MemoryStatus {
+    /// Memory the guest cannot hand back on demand.
+    pub fn used_bytes(&self) -> u64 {
+        self.total_bytes.saturating_sub(self.available_bytes)
+    }
+}
+
 /// Storage status information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageStatus {
@@ -1343,6 +1452,31 @@ mod tests {
                 assert_eq!(uid, None);
                 assert_eq!(gid, None);
             }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flatten_layers_output_is_optional() {
+        // A client predating streaming always names a guest path to stage the
+        // archive at, and must keep deserializing.
+        let staged =
+            r#"{"method":"flatten_layers","lowerdirs":["/a","/b"],"output":"/storage/x.tar"}"#;
+        let req: AgentRequest = serde_json::from_str(staged).unwrap();
+        match req {
+            AgentRequest::FlattenLayers { lowerdirs, output } => {
+                assert_eq!(lowerdirs, vec!["/a".to_string(), "/b".to_string()]);
+                assert_eq!(output, Some("/storage/x.tar".to_string()));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // Omitting it asks the agent to stream the archive back instead, which is
+        // what keeps a large export from needing room for a second full copy.
+        let streamed = r#"{"method":"flatten_layers","lowerdirs":["/a","/b"]}"#;
+        let req: AgentRequest = serde_json::from_str(streamed).unwrap();
+        match req {
+            AgentRequest::FlattenLayers { output, .. } => assert_eq!(output, None),
             other => panic!("unexpected: {other:?}"),
         }
     }

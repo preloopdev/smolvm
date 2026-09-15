@@ -50,7 +50,7 @@ perl -i -pe "s/version = \"\Q$BASE\E\"/version = \"$VERSION\"/g" Cargo.toml
 # exists, by the "Update Nix flake" workflow (packaging/nix/bump.py), or by hand
 # with ./scripts/update-nix-hashes.sh VERSION if that bump has not landed.
 
-if grep -rn "^version = \"$BASE\"" Cargo.toml crates/*/Cargo.toml >/dev/null 2>&1; then
+if [[ "$BASE" != "$VERSION" ]] && grep -rn "^version = \"$BASE\"" Cargo.toml crates/*/Cargo.toml >/dev/null 2>&1; then
   echo "error: some manifests still at $BASE after bump:" >&2
   grep -rn "^version = \"$BASE\"" Cargo.toml crates/*/Cargo.toml >&2
   exit 1
@@ -60,7 +60,11 @@ cargo update -w
 cargo metadata --no-deps --format-version 1 >/dev/null
 
 git add -A
-git commit -m "Bump the workspace to $VERSION"
+if ! git diff --cached --quiet; then
+  git commit -m "Prepare SmolVM v$VERSION for release"
+else
+  echo ">>> workspace already at $VERSION; tagging current main"
+fi
 git tag -a "v$VERSION" -m "smolvm v$VERSION"
 git push -u origin "$BRANCH"
 git push origin "v$VERSION"

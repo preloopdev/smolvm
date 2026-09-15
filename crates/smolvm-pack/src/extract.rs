@@ -57,7 +57,7 @@ pub(crate) fn mark_file_sparse(file: &fs::File) -> std::io::Result<()> {
 /// extractions of the same checksum race. The lock is released when the OS
 /// closes the handle (i.e. when the `File` is dropped).
 #[cfg(unix)]
-fn lock_file_exclusive(lock_file: &fs::File) -> std::io::Result<()> {
+pub(crate) fn lock_file_exclusive(lock_file: &fs::File) -> std::io::Result<()> {
     let ret = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
     if ret != 0 {
         return Err(std::io::Error::last_os_error());
@@ -66,7 +66,7 @@ fn lock_file_exclusive(lock_file: &fs::File) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-fn lock_file_exclusive(lock_file: &fs::File) -> std::io::Result<()> {
+pub(crate) fn lock_file_exclusive(lock_file: &fs::File) -> std::io::Result<()> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK};
     use windows_sys::Win32::System::IO::OVERLAPPED;
@@ -589,6 +589,110 @@ fn safe_unpack_with_limits<R: Read>(
     dest: &Path,
     limits: &SafeUnpackLimits,
 ) -> std::io::Result<UnpackReport> {
+    safe_unpack_with_policy(archive, dest, limits, false)
+}
+
+// Both operations must succeed before returning the input to the installer. Do not join writeback
+// before verification: that merely moves the same wait earlier in import.
+fn overlap_checkpoint_writeback<T>(
+    flush: impl FnOnce() -> std::io::Result<()> + Send,
+    verify: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    std::thread::scope(|scope| {
+        let worker = std::thread::Builder::new()
+            .name("checkpoint-fsync".into())
+            .spawn_scoped(scope, flush)?;
+        let verified = verify();
+        worker
+            .join()
+            .map_err(|_| std::io::Error::other("checkpoint writeback worker failed"))??;
+        verified
+    })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod checkpoint_writeback_tests {
+    use super::*;
+
+    #[test]
+    fn writeback_preserves_bytes_and_final_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory.bin");
+        let mut file = File::create(&path).unwrap();
+        let data = vec![0x71; 1024 * 1024];
+        for _ in 0..16 {
+            file.write_all(&data).unwrap();
+        }
+        overlap_checkpoint_writeback(|| File::open(&path)?.sync_all(), || Ok(())).unwrap();
+        file.sync_all().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), data.repeat(16));
+    }
+
+    #[test]
+    fn missing_input_does_not_create_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent");
+        assert!(overlap_checkpoint_writeback(|| File::open(&path)?.sync_all(), || Ok(())).is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn verification_overlaps_flush_and_waits_for_completion() {
+        let (started, wait_started) = std::sync::mpsc::channel();
+        let (release, wait_release) = std::sync::mpsc::channel();
+        let complete = std::sync::atomic::AtomicBool::new(false);
+        let complete_ref = &complete;
+        overlap_checkpoint_writeback(
+            move || {
+                started.send(()).unwrap();
+                wait_release
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                complete_ref.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+            || {
+                wait_started
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                release.send(()).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(complete.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn failed_verification_still_joins_writeback() {
+        let complete = std::sync::atomic::AtomicBool::new(false);
+        let result: std::io::Result<()> = overlap_checkpoint_writeback(
+            || {
+                complete.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+            || Err(std::io::Error::other("invalid digest")),
+        );
+        assert!(result.is_err());
+        assert!(complete.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn successful_verification_does_not_hide_writeback_failure() {
+        let result = overlap_checkpoint_writeback(
+            || Err(std::io::Error::other("writeback failed")),
+            || Ok("verified"),
+        );
+        assert_eq!(result.unwrap_err().to_string(), "writeback failed");
+    }
+}
+
+fn safe_unpack_with_policy<R: Read>(
+    archive: &mut tar::Archive<R>,
+    dest: &Path,
+    limits: &SafeUnpackLimits,
+    checkpoint: bool,
+) -> std::io::Result<UnpackReport> {
     let mut report = UnpackReport::default();
     // Use `normalize_path` (not `canonicalize`) for the containment base so it
     // matches the per-entry `normalized` paths, which are built from this same
@@ -628,6 +732,34 @@ fn safe_unpack_with_limits<R: Read>(
         let mut entry = entry_result?;
         let entry_type = entry.header().entry_type();
         let entry_path = entry.path()?.to_path_buf();
+        // RAM is a host runtime input, not a guest filesystem entry. Never
+        // restore the exporting VMM's UID onto this shared cache object.
+        let host_memory =
+            checkpoint && normalize_path(&entry_path) == Path::new("checkpoint/memory.bin");
+        // Disk images are host runtime inputs too. Their archived UID belongs
+        // to the exporting VMM, not to any file inside the guest filesystem.
+        let host_disk =
+            checkpoint && normalize_path(&entry_path).starts_with(Path::new("checkpoint/disks"));
+        let host_runtime = host_memory || host_disk;
+        if host_disk
+            && entry_type != tar::EntryType::Directory
+            && entry_type != tar::EntryType::Regular
+            && entry_type != tar::EntryType::GNUSparse
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "checkpoint disks must be regular files or directories",
+            ));
+        }
+        if host_memory
+            && entry_type != tar::EntryType::Regular
+            && entry_type != tar::EntryType::GNUSparse
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "checkpoint RAM must be a regular file",
+            ));
+        }
 
         // Enforce the entry-count and total-bytes ceilings (Fix 3): reject an
         // archive that would flood inodes or exhaust disk before we write it.
@@ -792,7 +924,11 @@ fn safe_unpack_with_limits<R: Read>(
         // Masked to the permission bits so a hostile header cannot carry setuid,
         // setgid or sticky through, matching the sparse path.
         if entry_type == tar::EntryType::Directory {
-            let mode = entry.header().mode().unwrap_or(0o755) & 0o777;
+            let mode = if host_disk {
+                0o700
+            } else {
+                entry.header().mode().unwrap_or(0o755) & 0o777
+            };
             if mode != 0o755 {
                 deferred_dir_modes.push((full_path.clone(), mode));
             }
@@ -804,8 +940,16 @@ fn safe_unpack_with_limits<R: Read>(
         // Read the owner off the header before the entry is consumed: the
         // sparse path streams `entry` to exhaustion, after which the header is
         // still available but reading it here keeps both branches symmetric.
-        let uid = entry.header().uid().unwrap_or(0);
-        let gid = entry.header().gid().unwrap_or(0);
+        let uid = if host_runtime {
+            0
+        } else {
+            entry.header().uid().unwrap_or(0)
+        };
+        let gid = if host_runtime {
+            0
+        } else {
+            entry.header().gid().unwrap_or(0)
+        };
 
         // GNU sparse entries already carry an exact extent map. Let the tar
         // reader seek over those holes directly instead of expanding them and
@@ -870,6 +1014,9 @@ fn safe_unpack_with_limits<R: Read>(
             // and the deferred directory pass below only restores modes, never
             // owners, so doing it here is the single point that applies.
             set_owner(&full_path, uid, gid);
+        }
+        if host_runtime && is_regular {
+            set_mode(&full_path, 0o600);
         }
         report.entries += 1;
     }
@@ -1026,15 +1173,80 @@ pub fn cached_layers_usable(cache_dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Smallest cache the default sizing will ever choose, and the fallback when the
+/// filesystem's capacity can't be read. This was the whole cap before it scaled.
+const PACK_CACHE_MIN_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
+/// Share of the filesystem the extraction cache may use by default.
+const PACK_CACHE_DISK_FRACTION: u64 = 10;
+
 /// Maximum total size of the pack extraction cache before LRU eviction kicks in.
-/// Override with `SMOLVM_PACK_CACHE_MAX_BYTES` (in bytes); default 5 GiB.
-pub fn pack_cache_max_bytes() -> u64 {
-    const DEFAULT: u64 = 5 * 1024 * 1024 * 1024;
-    std::env::var("SMOLVM_PACK_CACHE_MAX_BYTES")
+///
+/// Defaults to a tenth of the capacity of the filesystem holding `cache_root`,
+/// with [`PACK_CACHE_MIN_BYTES`] as a floor. A fixed cap cannot suit both ends of
+/// the range this runs on: 5 GiB is most of a laptop's spare room but a rounding
+/// error on a multi-terabyte host, where a pack over a gigabyte was evicted
+/// between one start and the next and re-extracted every time — turning a boot
+/// of about a second into tens of seconds. Scaling with the disk suits both.
+///
+/// `SMOLVM_PACK_CACHE_MAX_BYTES` (in bytes) still overrides, and is the escape
+/// hatch for a host that shares its disk with something else.
+pub fn pack_cache_max_bytes(cache_root: &Path) -> u64 {
+    if let Some(n) = std::env::var("SMOLVM_PACK_CACHE_MAX_BYTES")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT)
+    {
+        return n;
+    }
+    filesystem_capacity_bytes(cache_root)
+        .map(|total| (total / PACK_CACHE_DISK_FRACTION).max(PACK_CACHE_MIN_BYTES))
+        .unwrap_or(PACK_CACHE_MIN_BYTES)
+}
+
+/// Total capacity (not free space) of the filesystem holding `path`, or `None`
+/// when it can't be determined — an unwritten path, an unsupported platform, or
+/// a failing syscall. Capacity rather than free space on purpose: a cap derived
+/// from free space shrinks as the disk fills, which would tighten the cache
+/// exactly when eviction is already churning and make the thrash worse.
+fn filesystem_capacity_bytes(path: &Path) -> Option<u64> {
+    // The cache root may not exist yet on a first extraction; the nearest
+    // existing ancestor sits on the same filesystem, which is what we're after.
+    let mut probe = path;
+    loop {
+        if probe.exists() {
+            break;
+        }
+        probe = probe.parent()?;
+    }
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::mem::MaybeUninit;
+        use std::os::unix::ffi::OsStrExt;
+
+        let c_path = CString::new(probe.as_os_str().as_bytes()).ok()?;
+        // SAFETY: `c_path` is a valid NUL-terminated string for the duration of
+        // the call, and `stat` is only read after statvfs reports success.
+        unsafe {
+            let mut stat: MaybeUninit<libc::statvfs> = MaybeUninit::uninit();
+            if libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) != 0 {
+                return None;
+            }
+            let stat = stat.assume_init();
+            // `f_blocks`/`f_frsize` are `c_ulong` on some targets and already
+            // `u64` on others, so the widening is a no-op on exactly the
+            // platforms where clippy notices it.
+            #[allow(clippy::unnecessary_cast)]
+            let total = (stat.f_blocks as u64).checked_mul(stat.f_frsize as u64)?;
+            (total > 0).then_some(total)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = probe;
+        None
+    }
 }
 
 /// Maximum number of entries `safe_unpack` will extract from a single archive
@@ -1299,7 +1511,7 @@ fn extract_sidecar_capped(
             // vcpu BadActivate). A torch pack (~13 GiB) alone exceeds the 5 GiB
             // default cap, which is exactly when oldest-first eviction reaches it.
             let freed =
-                evict_cache_to_size_protecting(root, pack_cache_max_bytes(), Some(cache_dir));
+                evict_cache_to_size_protecting(root, pack_cache_max_bytes(root), Some(cache_dir));
             if freed > 0 && debug {
                 eprintln!("debug: pack cache evicted {freed} bytes to stay under cap");
             }
@@ -1326,6 +1538,103 @@ pub fn shared_extract_enabled() -> bool {
 /// Directory holding the shared copy for one pack checksum, under `shared_root`.
 pub fn shared_pack_dir(shared_root: &Path, checksum: u32) -> PathBuf {
     shared_root.join(format!("{:08x}", checksum))
+}
+
+/// Retain the owned, immutable staging tree used to produce a local checkpoint.
+/// Only the capture path may call this: `prepared` must be the exact tree just
+/// packed into `sidecar`, with no live guest writers or untrusted path aliases.
+#[cfg(target_os = "linux")]
+pub fn retain_prepared_checkpoint(
+    sidecar: &Path,
+    prepared: &Path,
+    shared_root: &Path,
+) -> std::io::Result<()> {
+    retain_prepared_checkpoint_with_identity(sidecar, prepared, shared_root, None)
+}
+
+/// Retain capture-owned state using the packer's request-local digest when
+/// available; changed inputs still take the full verification path.
+#[cfg(target_os = "linux")]
+pub fn retain_prepared_checkpoint_with_identity(
+    sidecar: &Path,
+    prepared: &Path,
+    shared_root: &Path,
+    identity: Option<&crate::packer::PackedArtifactIdentity>,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let footer = crate::packer::read_footer_from_sidecar(sidecar).map_err(std::io::Error::other)?;
+    let manifest =
+        crate::packer::read_manifest_from_sidecar(sidecar).map_err(std::io::Error::other)?;
+    if !crate::packer::verify_sidecar_checksum(sidecar, &footer).map_err(std::io::Error::other)? {
+        return Err(std::io::Error::other(
+            "prepared checkpoint checksum mismatch",
+        ));
+    }
+    if manifest.checkpoint.is_none() || !manifest.assets.layers.is_empty() {
+        return Err(std::io::Error::other(
+            "prepared cache requires a captured checkpoint",
+        ));
+    }
+    fs::create_dir_all(shared_root)?;
+    fs::set_permissions(shared_root, fs::Permissions::from_mode(0o700))?;
+    let target = shared_pack_dir(shared_root, footer.checksum);
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(target.with_extension("lock"))?;
+    lock_file_exclusive(&lock)?;
+    if is_extracted(&target) {
+        ensure_shared_artifact_sha256(sidecar, &target)?;
+        return Ok(());
+    }
+    // Do not expose the completion marker until all payloads are durable.
+    post_process_extraction(prepared, &[], true, false)?;
+    fs::set_permissions(
+        prepared.join("checkpoint/memory.bin"),
+        fs::Permissions::from_mode(0o600),
+    )?;
+    fn sync_tree(path: &Path) -> std::io::Result<()> {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                sync_tree(&entry.path())?;
+            } else if kind.is_file() {
+                File::open(entry.path())?.sync_all()?;
+            }
+        }
+        File::open(path)?.sync_all()
+    }
+    sync_tree(prepared)?;
+    fs::set_permissions(prepared, fs::Permissions::from_mode(0o700))?;
+    // A previous incomplete extraction is disposable under the entry lock.
+    if target.exists() {
+        fs::remove_dir_all(&target)?;
+    }
+    let retained_artifact = target.with_extension("prepared.smolcheckpoint");
+    if retained_artifact.exists() {
+        fs::remove_file(&retained_artifact)?;
+    }
+    // Consume the packer's proof before our own hard-link operation changes
+    // ctime. A stale proof falls back to full verification.
+    ensure_shared_artifact_sha256_with_identity(sidecar, &target, identity)?;
+    let produced_locally = fs::read(shared_artifact_source_path(&target))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ArtifactSourceIdentity>(&bytes).ok())
+        .is_some_and(|source| source.locally_produced);
+    fs::hard_link(sidecar, &retained_artifact)?;
+    // Capture owns both names under the cache lock; publish the post-link
+    // fingerprint rather than paying another hash for our own metadata change.
+    let mut retained_identity = artifact_source_identity(&retained_artifact)?;
+    retained_identity.locally_produced = produced_locally;
+    write_atomic_marker(
+        &shared_artifact_source_path(&target),
+        &serde_json::to_vec(&retained_identity).map_err(std::io::Error::other)?,
+    )?;
+    fs::rename(prepared, &target)?;
+    File::open(shared_root)?.sync_all()?;
+    Ok(())
 }
 
 /// Extract a sidecar pack ONCE into the shared content-addressed store and return
@@ -1356,12 +1665,26 @@ pub fn extract_sidecar_shared(
     debug: bool,
 ) -> std::io::Result<PathBuf> {
     let shared_dir = shared_pack_dir(shared_root, footer.checksum);
+    let was_extracted = is_extracted(&shared_dir);
     // cap_cache=false: never perform blind automatic LRU eviction here. Shared
     // entries are maintained explicitly by `smolvm pack prune`, which treats
     // each machine's `.pack-shared` pointer as a durable lease and therefore
     // cannot delete a pack mounted by a running or stopped VM.
     extract_sidecar_capped(sidecar_path, &shared_dir, footer, false, debug, false)?;
-    ensure_shared_artifact_sha256(sidecar_path, &shared_dir)?;
+    let overlap = cfg!(target_os = "linux")
+        && !was_extracted
+        && std::env::var_os("SMOLVM_DISABLE_CHECKPOINT_WRITEBACK").is_none()
+        && crate::packer::read_manifest_from_sidecar(sidecar_path)
+            .is_ok_and(|m| m.checkpoint.is_some());
+    if overlap {
+        let memory = shared_dir.join("checkpoint/memory.bin");
+        overlap_checkpoint_writeback(
+            || File::open(&memory)?.sync_all(),
+            || ensure_shared_artifact_sha256(sidecar_path, &shared_dir),
+        )?;
+    } else {
+        ensure_shared_artifact_sha256(sidecar_path, &shared_dir)?;
+    }
     // Lock down the store so a dropped per-VM uid can't read the shared copy
     // directly (it must go through its idmapped mount). Best-effort: traversal
     // by root (the VMM before it drops privileges) is unaffected by 0700.
@@ -1397,31 +1720,238 @@ pub fn read_shared_artifact_sha256(shared_dir: &Path) -> std::io::Result<String>
     Ok(digest)
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 struct ArtifactSourceIdentity {
     canonical_path: String,
     len: u64,
     modified_secs: Option<u64>,
     modified_nanos: Option<u32>,
+    #[serde(default)]
+    inode: Option<(u64, u64, i64, i64)>,
+    #[serde(default)]
+    locally_produced: bool,
+}
+
+impl ArtifactSourceIdentity {
+    fn same_inode(&self, other: &Self) -> bool {
+        self.inode
+            .zip(other.inode)
+            .is_some_and(|(a, b)| a.0 == b.0 && a.1 == b.1)
+    }
+
+    fn covers_local(&self, other: &Self) -> bool {
+        self.locally_produced
+            && self.inode.is_some()
+            && self.inode == other.inode
+            && self.len == other.len
+            && self.modified_secs == other.modified_secs
+            && self.modified_nanos == other.modified_nanos
+    }
+}
+
+fn service_owned_artifact(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(file) = fs::symlink_metadata(path) else {
+            return false;
+        };
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+        let Ok(parent) = fs::metadata(parent) else {
+            return false;
+        };
+        file.is_file()
+            && file.uid() == 0
+            && file.mode() & 0o077 == 0
+            && parent.is_dir()
+            && parent.uid() == 0
+            && parent.mode() & 0o022 == 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
 }
 
 fn artifact_source_identity(sidecar_path: &Path) -> std::io::Result<ArtifactSourceIdentity> {
     let canonical = sidecar_path.canonicalize()?;
     let metadata = fs::metadata(&canonical)?;
+    Ok(artifact_metadata_identity(
+        canonical.to_string_lossy().into_owned(),
+        &metadata,
+    ))
+}
+
+fn artifact_metadata_identity(
+    canonical_path: String,
+    metadata: &fs::Metadata,
+) -> ArtifactSourceIdentity {
     let modified = metadata
         .modified()
         .ok()
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok());
-    Ok(ArtifactSourceIdentity {
-        canonical_path: canonical.to_string_lossy().into_owned(),
+    ArtifactSourceIdentity {
+        canonical_path,
         len: metadata.len(),
         modified_secs: modified.map(|duration| duration.as_secs()),
         modified_nanos: modified.map(|duration| duration.subsec_nanos()),
-    })
+        #[cfg(unix)]
+        inode: {
+            use std::os::unix::fs::MetadataExt;
+            Some((
+                metadata.dev(),
+                metadata.ino(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            ))
+        },
+        #[cfg(not(unix))]
+        inode: None,
+        locally_produced: false,
+    }
 }
 
 fn shared_artifact_source_path(shared_dir: &Path) -> PathBuf {
     shared_dir.with_extension("artifact-source.json")
+}
+
+/// Release a private transfer alias without invalidating its local digest.
+/// This is best effort: contention or stale provenance leaves ordinary TempDir
+/// cleanup to invalidate the identity, requiring verification on the next use.
+#[cfg(target_os = "linux")]
+pub fn release_checkpoint_artifact_alias(source: &Path, shared_root: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if !service_owned_artifact(source) {
+        return Ok(());
+    }
+    let footer = crate::packer::read_footer_from_sidecar(source).map_err(std::io::Error::other)?;
+    let shared = shared_pack_dir(shared_root, footer.checksum);
+    let lock = fs::OpenOptions::new()
+        .write(true)
+        .open(shared_artifact_sha256_path(&shared).with_extension("artifact-sha256.lock"))?;
+    // Drop may execute on an async worker. Never wait behind a full-file hash.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Ok(());
+    }
+    let before = artifact_source_identity(source)?;
+    let cached: ArtifactSourceIdentity =
+        serde_json::from_slice(&fs::read(shared_artifact_source_path(&shared))?)
+            .map_err(std::io::Error::other)?;
+    if !cached.covers_local(&before) {
+        return Ok(());
+    }
+    let pinned = File::open(source)?;
+    if !before.same_inode(&artifact_metadata_identity(
+        before.canonical_path.clone(),
+        &pinned.metadata()?,
+    )) {
+        return Ok(());
+    }
+    fs::remove_file(source)?;
+    let mut after = artifact_metadata_identity(before.canonical_path.clone(), &pinned.metadata()?);
+    if !before.same_inode(&after)
+        || before.len != after.len
+        || before.modified_secs != after.modified_secs
+        || before.modified_nanos != after.modified_nanos
+    {
+        return Ok(());
+    }
+    after.locally_produced = true;
+    write_atomic_marker(
+        &shared_artifact_source_path(&shared),
+        &serde_json::to_vec(&after).map_err(std::io::Error::other)?,
+    )
+}
+
+/// Create a service-owned cache alias and account for its metadata-only change.
+/// The caller must hold its cache namespace lock. Only an unchanged locally
+/// produced inode can carry its digest through this operation; other sources
+/// retain the ordinary full-verification path.
+pub fn link_checkpoint_artifact(
+    source: &Path,
+    destination: &Path,
+    shared_root: &Path,
+    replace: bool,
+) -> std::io::Result<()> {
+    let provenance = (|| -> std::io::Result<_> {
+        if !service_owned_artifact(source) {
+            return Err(std::io::Error::other("not a service-owned capture"));
+        }
+        let footer =
+            crate::packer::read_footer_from_sidecar(source).map_err(std::io::Error::other)?;
+        let shared = shared_pack_dir(shared_root, footer.checksum);
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(shared_artifact_sha256_path(&shared).with_extension("artifact-sha256.lock"))?;
+        lock_file_exclusive(&lock)?;
+        let before = artifact_source_identity(source)?;
+        let cached: ArtifactSourceIdentity =
+            serde_json::from_slice(&fs::read(shared_artifact_source_path(&shared))?)
+                .map_err(std::io::Error::other)?;
+        if !cached.covers_local(&before) {
+            return Err(std::io::Error::other("local capture identity changed"));
+        }
+        let pinned = File::open(source)?;
+        Ok((lock, shared, before, pinned))
+    })()
+    .ok();
+
+    if replace {
+        let parent = destination
+            .parent()
+            .ok_or_else(|| std::io::Error::other("cache destination has no parent"))?;
+        let staging = tempfile::tempdir_in(parent)?;
+        let link = staging.path().join("artifact");
+        fs::hard_link(source, &link)?;
+        fs::rename(&link, destination)?;
+    } else {
+        fs::hard_link(source, destination)?;
+    }
+    // Record LRU use before refreshing ctime. Neither operation changes bytes.
+    if let Ok(file) = File::open(destination) {
+        let _ = file.set_times(fs::FileTimes::new().set_accessed(std::time::SystemTime::now()));
+    }
+    if let Some((_lock, shared, before, pinned)) = provenance {
+        let refresh = (|| -> std::io::Result<()> {
+            let mut after = artifact_source_identity(destination)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let pinned = pinned.metadata()?;
+                if after.inode.map(|id| (id.0, id.1)) != Some((pinned.dev(), pinned.ino())) {
+                    return Err(std::io::Error::other(
+                        "cache alias replaced during publication",
+                    ));
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = pinned;
+            if !service_owned_artifact(destination)
+                || !before.same_inode(&after)
+                || before.len != after.len
+                || before.modified_secs != after.modified_secs
+                || before.modified_nanos != after.modified_nanos
+            {
+                return Err(std::io::Error::other(
+                    "capture changed during cache publication",
+                ));
+            }
+            after.locally_produced = true;
+            write_atomic_marker(
+                &shared_artifact_source_path(&shared),
+                &serde_json::to_vec(&after).map_err(std::io::Error::other)?,
+            )
+        })();
+        // A missed fingerprint refresh only costs a later full hash. Cache
+        // publication itself must not fail after a valid alias was installed.
+        let _ = refresh;
+    }
+    Ok(())
 }
 
 fn hash_artifact_sha256(sidecar_path: &Path) -> std::io::Result<String> {
@@ -1474,6 +2004,14 @@ fn ensure_shared_artifact_sha256(
     sidecar_path: &Path,
     shared_dir: &Path,
 ) -> std::io::Result<String> {
+    ensure_shared_artifact_sha256_with_identity(sidecar_path, shared_dir, None)
+}
+
+fn ensure_shared_artifact_sha256_with_identity(
+    sidecar_path: &Path,
+    shared_dir: &Path,
+    identity: Option<&crate::packer::PackedArtifactIdentity>,
+) -> std::io::Result<String> {
     let digest_path = shared_artifact_sha256_path(shared_dir);
     let lock_path = digest_path.with_extension("artifact-sha256.lock");
     let lock_file = fs::OpenOptions::new()
@@ -1484,13 +2022,17 @@ fn ensure_shared_artifact_sha256(
     lock_file_exclusive(&lock_file)?;
 
     let source_path = shared_artifact_source_path(shared_dir);
-    let source_identity = artifact_source_identity(sidecar_path)?;
+    let mut source_identity = artifact_source_identity(sidecar_path)?;
     if digest_path.exists() {
         let cached_digest = read_shared_artifact_sha256(shared_dir)?;
         let cached_source = fs::read(&source_path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<ArtifactSourceIdentity>(&bytes).ok());
-        if cached_source.as_ref() == Some(&source_identity) {
+        if service_owned_artifact(sidecar_path)
+            && cached_source
+                .as_ref()
+                .is_some_and(|cached| cached.covers_local(&source_identity))
+        {
             return Ok(cached_digest);
         }
 
@@ -1509,6 +2051,13 @@ fn ensure_shared_artifact_sha256(
                 ),
             ));
         }
+        // A changed inode has crossed a provenance boundary, even if its
+        // bytes matched. Only the original locally produced inode keeps this
+        // property after a successful full re-verification.
+        source_identity.locally_produced = service_owned_artifact(sidecar_path)
+            && cached_source.as_ref().is_some_and(|cached| {
+                cached.locally_produced && cached.same_inode(&source_identity)
+            });
         write_atomic_marker(
             &source_path,
             &serde_json::to_vec(&source_identity)
@@ -1517,7 +2066,13 @@ fn ensure_shared_artifact_sha256(
         return Ok(cached_digest);
     }
 
-    let digest = hash_artifact_sha256(sidecar_path)?;
+    let written_digest = identity.and_then(|identity| identity.digest_for(sidecar_path));
+    source_identity.locally_produced =
+        written_digest.is_some() && service_owned_artifact(sidecar_path);
+    let digest = match written_digest {
+        Some(digest) => digest.to_owned(),
+        None => hash_artifact_sha256(sidecar_path)?,
+    };
     write_atomic_marker(&digest_path, format!("{digest}\n").as_bytes())?;
     write_atomic_marker(
         &source_path,
@@ -1568,7 +2123,15 @@ fn extract_sidecar_inner(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     let mut archive = tar::Archive::new(decoder);
-    safe_unpack(&mut archive, cache_dir)?;
+    let manifest = crate::packer::read_manifest_from_sidecar(sidecar_path).ok();
+    safe_unpack_with_policy(
+        &mut archive,
+        cache_dir,
+        &SafeUnpackLimits::from_env(),
+        manifest
+            .as_ref()
+            .is_some_and(|manifest| manifest.checkpoint.is_some()),
+    )?;
 
     if debug {
         eprintln!("debug: extracted assets to {}", cache_dir.display());
@@ -1576,7 +2139,6 @@ fn extract_sidecar_inner(
 
     // A sidecar can be any age while the smolvm running it is current, so its
     // manifest is the only thing that says what the agent inside can do.
-    let manifest = crate::packer::read_manifest_from_sidecar(sidecar_path).ok();
 
     // Layer order from the sidecar manifest (bottom→top). Best-effort: if the
     // manifest can't be read the agent falls back to a name sort.
@@ -2964,6 +3526,46 @@ pub fn create_or_copy_storage_disk(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_digest_identity_ignores_only_path() {
+        let original = super::ArtifactSourceIdentity {
+            canonical_path: "capture".into(),
+            len: 1024,
+            modified_secs: Some(10),
+            modified_nanos: Some(20),
+            inode: Some((1, 2, 30, 40)),
+            locally_produced: true,
+        };
+        let mut alias = super::ArtifactSourceIdentity {
+            canonical_path: "restore".into(),
+            locally_produced: false,
+            ..original.clone()
+        };
+        assert!(original.covers_local(&alias));
+        alias.inode = Some((1, 3, 30, 40));
+        assert!(
+            !original.covers_local(&alias),
+            "copied bytes are not local provenance"
+        );
+        alias.inode = Some((1, 2, 30, 41));
+        assert!(
+            !original.covers_local(&alias),
+            "ctime changes require verification"
+        );
+        alias.inode = original.inode;
+        alias.len += 1;
+        assert!(!original.covers_local(&alias));
+        alias.len = original.len;
+        alias.modified_nanos = Some(21);
+        assert!(!original.covers_local(&alias));
+        let mut untrusted = original.clone();
+        untrusted.locally_produced = false;
+        assert!(!untrusted.covers_local(&original));
+        untrusted.locally_produced = true;
+        untrusted.inode = None;
+        assert!(!untrusted.covers_local(&untrusted));
+    }
+
     /// The macOS leniency may only skip the errors it exists for. A destination
     /// that has stopped accepting writes is not one of them: skipping it turns
     /// a failed extraction into one that reports success on a half-written tree.
@@ -3320,6 +3922,129 @@ mod tests {
         assert_eq!(read_shared_artifact_sha256(&shared).unwrap(), first_digest);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn shared_digest_rejects_same_length_edit_with_restored_mtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+        let artifact = temp.path().join("artifact");
+        fs::write(&artifact, b"original").unwrap();
+        let digest = ensure_shared_artifact_sha256(&artifact, &shared).unwrap();
+        let modified = fs::metadata(&artifact).unwrap().modified().unwrap();
+        // Separate timestamps even on filesystems with coarse clock resolution.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&artifact, b"modified").unwrap();
+        File::open(&artifact)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert!(ensure_shared_artifact_sha256(&artifact, &shared).is_err());
+        assert_eq!(read_shared_artifact_sha256(&shared).unwrap(), digest);
+    }
+
+    #[test]
+    fn legacy_digest_identity_has_no_local_provenance() {
+        let identity: super::ArtifactSourceIdentity = serde_json::from_str(
+            r#"{"canonical_path":"old","len":1,"modified_secs":1,"modified_nanos":0}"#,
+        )
+        .unwrap();
+        assert!(!identity.locally_produced);
+        assert!(identity.inode.is_none());
+        assert!(!identity.covers_local(&identity));
+    }
+
+    #[test]
+    fn an_unchanged_external_artifact_still_requires_digest_verification() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+        let artifact = temp.path().join("download");
+        fs::write(&artifact, b"downloaded bytes").unwrap();
+        ensure_shared_artifact_sha256(&artifact, &shared).unwrap();
+        // A cached digest is not proof of local production, even with an exact
+        // source fingerprint. Re-reading the bytes must catch this mismatch.
+        fs::write(shared_artifact_sha256_path(&shared), "0".repeat(64)).unwrap();
+        assert!(ensure_shared_artifact_sha256(&artifact, &shared).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locally_produced_digest_survives_controlled_alias_publication() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let artifact = temp.path().join("capture");
+        let manifest = crate::format::PackManifest::new(
+            "vm://saved".into(),
+            "none".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        let (info, proof) = crate::packer::Packer::new(manifest)
+            .pack_artifact_with_identity(&artifact)
+            .unwrap();
+        // Pack files inherit the private staging directory. Do not chmod after
+        // obtaining the proof: that would correctly invalidate its ctime.
+        let private = fs::metadata(&artifact).unwrap().permissions().mode() & 0o077 == 0;
+        let shared = shared_pack_dir(temp.path(), info.checksum);
+        fs::create_dir(&shared).unwrap();
+        let digest =
+            ensure_shared_artifact_sha256_with_identity(&artifact, &shared, Some(&proof)).unwrap();
+        let local = service_owned_artifact(&artifact);
+        let cache = temp.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        // The API cache directory is root-owned 0755. Directory readability
+        // does not allow replacing a private 0600 artifact inside it.
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o755)).unwrap();
+        let alias = cache.join("artifact");
+        link_checkpoint_artifact(&artifact, &alias, temp.path(), true).unwrap();
+        let recorded: ArtifactSourceIdentity =
+            serde_json::from_slice(&fs::read(shared_artifact_source_path(&shared)).unwrap())
+                .unwrap();
+        if local {
+            assert!(private);
+            assert!(recorded.covers_local(&artifact_source_identity(&alias).unwrap()));
+        } else {
+            assert!(!recorded.locally_produced);
+        }
+        assert_eq!(
+            ensure_shared_artifact_sha256(&alias, &shared).unwrap(),
+            digest
+        );
+        // Service-owned request cleanup must preserve the proof after unlink.
+        #[cfg(target_os = "linux")]
+        release_checkpoint_artifact_alias(&artifact, temp.path()).unwrap();
+        if artifact.exists() {
+            fs::remove_file(&artifact).unwrap();
+        }
+        if local {
+            let recorded: ArtifactSourceIdentity =
+                serde_json::from_slice(&fs::read(shared_artifact_source_path(&shared)).unwrap())
+                    .unwrap();
+            assert_eq!(
+                recorded.covers_local(&artifact_source_identity(&alias).unwrap()),
+                cfg!(target_os = "linux")
+            );
+            assert_eq!(
+                ensure_shared_artifact_sha256(&alias, &shared).unwrap(),
+                digest
+            );
+        }
+        let upload = temp.path().join("upload");
+        fs::copy(&alias, &upload).unwrap();
+        assert_eq!(
+            ensure_shared_artifact_sha256(&upload, &shared).unwrap(),
+            digest
+        );
+        let uploaded: ArtifactSourceIdentity =
+            serde_json::from_slice(&fs::read(shared_artifact_source_path(&shared)).unwrap())
+                .unwrap();
+        assert!(
+            !uploaded.locally_produced,
+            "copied bytes must not inherit provenance"
+        );
+    }
+
     /// Build a single-file tar archive in memory with the given name and data.
     fn make_tar(name: &str, data: &[u8]) -> Vec<u8> {
         let mut builder = tar::Builder::new(Vec::new());
@@ -3355,6 +4080,60 @@ mod tests {
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
         // The symlink target must not be modified
         assert_eq!(fs::read(&outside).unwrap(), b"untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_runtime_files_are_host_owned_but_guest_files_keep_their_owner() {
+        use std::os::unix::fs::MetadataExt;
+        let mut builder = tar::Builder::new(Vec::new());
+        for path in ["checkpoint/disks", "checkpoint/disks/storage"] {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_size(0);
+            header.set_mode(0o777);
+            header.set_uid(999);
+            header.set_gid(999);
+            header.set_cksum();
+            builder.append_data(&mut header, path, &b""[..]).unwrap();
+        }
+        for path in [
+            "checkpoint/memory.bin",
+            "checkpoint/disks/storage/1",
+            "pgdata",
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(4);
+            header.set_mode(0o666);
+            header.set_uid(999);
+            header.set_gid(999);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, &b"data"[..])
+                .unwrap();
+        }
+        let bytes = builder.into_inner().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut archive = tar::Archive::new(bytes.as_slice());
+        safe_unpack_with_policy(
+            &mut archive,
+            dir.path(),
+            &SafeUnpackLimits::from_env(),
+            true,
+        )
+        .unwrap();
+        let ram = fs::metadata(dir.path().join("checkpoint/memory.bin")).unwrap();
+        let guest = fs::metadata(dir.path().join("pgdata")).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        assert_eq!(ram.uid(), uid);
+        assert_eq!(ram.mode() & 0o777, 0o600);
+        let disk = fs::metadata(dir.path().join("checkpoint/disks/storage/1")).unwrap();
+        assert_eq!(disk.uid(), uid);
+        assert_eq!(disk.mode() & 0o777, 0o600);
+        let directory = fs::metadata(dir.path().join("checkpoint/disks/storage")).unwrap();
+        assert_eq!(directory.uid(), uid);
+        assert_eq!(directory.mode() & 0o777, 0o700);
+        assert_eq!(guest.uid(), if uid == 0 { 999 } else { uid });
     }
 
     /// Container images address their service accounts numerically — postgres
@@ -3514,6 +4293,7 @@ mod tests {
 
     /// Build a tar archive carrying a single symlink entry whose link target
     /// is `link_target`, plus (optionally) a trailing regular-file entry.
+    #[cfg(unix)]
     fn make_symlink_tar(name: &str, link_target: &str) -> Vec<u8> {
         let mut builder = tar::Builder::new(Vec::new());
         let mut header = tar::Header::new_gnu();
@@ -4820,6 +5600,65 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(dest.join("after.txt")).unwrap(), "after");
         assert!(!dest.join("unknown-type-entry").exists());
+    }
+
+    /// `SMOLVM_PACK_CACHE_MAX_BYTES` is process-global, so the tests that set and
+    /// clear it must not run concurrently with the one that reads the default.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The cap must track the disk, not a constant: a fixed 5 GiB evicted a pack
+    /// between one start and the next on a large host, so each boot re-extracted
+    /// it. Asserted against the real filesystem the test runs on.
+    #[test]
+    fn cache_cap_scales_with_the_filesystem_it_lives_on() {
+        let dir = tempfile::tempdir().unwrap();
+        // Serialised with the override test below: both touch the same env var.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("SMOLVM_PACK_CACHE_MAX_BYTES");
+
+        let cap = pack_cache_max_bytes(dir.path());
+        assert!(
+            cap >= PACK_CACHE_MIN_BYTES,
+            "the cap must never fall below the old fixed default, got {cap}"
+        );
+        if let Some(total) = filesystem_capacity_bytes(dir.path()) {
+            // A big disk must yield a bigger cache than the old constant did.
+            if total / PACK_CACHE_DISK_FRACTION > PACK_CACHE_MIN_BYTES {
+                assert!(
+                    cap > PACK_CACHE_MIN_BYTES,
+                    "a {total}-byte filesystem should give more than the {PACK_CACHE_MIN_BYTES}-byte floor, got {cap}"
+                );
+            }
+            assert!(
+                cap <= total,
+                "the cache may never be allowed to exceed the whole filesystem"
+            );
+        }
+    }
+
+    /// An operator sharing the disk with something else must still be able to pin
+    /// the cache, including to a value below the floor.
+    #[test]
+    fn explicit_override_beats_the_disk_derived_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("SMOLVM_PACK_CACHE_MAX_BYTES", "1048576");
+        let cap = pack_cache_max_bytes(dir.path());
+        std::env::remove_var("SMOLVM_PACK_CACHE_MAX_BYTES");
+        assert_eq!(cap, 1024 * 1024, "an explicit cap must win outright");
+    }
+
+    /// A cache root that does not exist yet (first extraction) must still size
+    /// from the filesystem it is about to be created on, not fall to the floor.
+    #[test]
+    fn sizes_from_the_nearest_existing_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let unborn = dir.path().join("not").join("created").join("yet");
+        assert_eq!(
+            filesystem_capacity_bytes(&unborn),
+            filesystem_capacity_bytes(dir.path()),
+            "an unwritten cache root must resolve to its filesystem"
+        );
     }
 
     // Sets directory mtimes via libc::utimes to drive the LRU ordering, so it

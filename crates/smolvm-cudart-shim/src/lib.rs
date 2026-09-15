@@ -4078,14 +4078,15 @@ pub extern "C" fn cudaGetDriverEntryPointByVersion(
     set_last(CUDA_SUCCESS)
 }
 
-/// CUDA VMM itself is forwarded, but exporting its generic allocation handles
-/// across guest processes is not.  `cuMemCreate` is the standard capability
-/// probe used by NCCL before selecting its CUMEM transport; exposing it through
-/// the runtime lookup would advertise a transport that later fails at handle
-/// export.  Direct Driver API users retain the supported, process-local VMM
-/// surface through libcuda/cuGetProcAddress.
+/// Runtime users (including current PyTorch) discover CUDA VMM entrypoints
+/// through `cudaGetDriverEntryPoint*`, rather than linking `libcuda` directly.
+/// The CUDA shim remotes the process-local VMM allocation lifecycle, so these
+/// lookups must expose that surface.  Cross-process generic-handle export is a
+/// separate capability: callers that request it receive the normal unsupported
+/// result from that entrypoint instead of making VMM allocation unavailable.
 fn driver_entrypoint_supported(symbol: &CStr) -> bool {
-    symbol.to_bytes() != b"cuMemCreate"
+    let _ = symbol;
+    true
 }
 
 #[no_mangle]
@@ -6402,8 +6403,8 @@ mod tests {
     }
 
     #[test]
-    fn runtime_lookup_does_not_advertise_cross_process_vmm() {
-        assert!(!driver_entrypoint_supported(c"cuMemCreate"));
+    fn runtime_lookup_exposes_process_local_vmm() {
+        assert!(driver_entrypoint_supported(c"cuMemCreate"));
         assert!(driver_entrypoint_supported(c"cuMemAlloc_v2"));
     }
 }

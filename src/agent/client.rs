@@ -9,9 +9,9 @@ use crate::registry::{extract_registry, rewrite_image_registry, RegistryAuth};
 use crate::settings::SmolSettings;
 use smolvm_protocol::normalize_image_ref;
 use smolvm_protocol::{
-    encode_message, AgentRequest, AgentResponse, Envelope, FsNotifyEvent, ImageInfo, OverlayInfo,
-    StorageStatus, FILE_TRANSFER_MAX_TOTAL, FILE_WRITE_CHUNK_SIZE, FILE_WRITE_SINGLE_SHOT_MAX,
-    MAX_FRAME_SIZE, PROTOCOL_VERSION,
+    encode_message, AgentRequest, AgentResponse, Envelope, FsNotifyEvent, ImageInfo, MemoryStatus,
+    OverlayInfo, StorageStatus, FILE_TRANSFER_MAX_TOTAL, FILE_WRITE_CHUNK_SIZE,
+    FILE_WRITE_SINGLE_SHOT_MAX, MAX_FRAME_SIZE, PROTOCOL_VERSION,
 };
 use std::io::{Read, Write};
 use std::path::Path;
@@ -274,11 +274,67 @@ fn detached_start_timeout() -> Duration {
 /// timeout to allow for protocol overhead and response transmission.
 const TIMEOUT_BUFFER_SECS: u64 = 5;
 
-/// Timeout for shutdown acknowledgment (5 seconds).
-/// sync() + ack transmission is typically <100ms, but heavy writes or
-/// large journals may take longer. If no ack within 5s, the VM has
-/// likely already torn down — safe to proceed with SIGTERM.
+/// Maximum silence between complete shutdown progress frames.
+/// A timeout is not permission to terminate a guest with unflushed storage.
 const SHUTDOWN_ACK_TIMEOUT_SECS: u64 = 5;
+
+struct ShutdownDeadlines {
+    idle: Instant,
+    hard: Instant,
+    idle_timeout: Duration,
+}
+
+impl ShutdownDeadlines {
+    fn new(now: Instant, idle_timeout: Duration, maximum: Duration) -> Self {
+        Self {
+            idle: now + idle_timeout,
+            hard: now + maximum,
+            idle_timeout,
+        }
+    }
+
+    fn next(&self) -> Instant {
+        self.idle.min(self.hard)
+    }
+
+    fn progress(&mut self, now: Instant) {
+        self.idle = now + self.idle_timeout;
+    }
+}
+
+fn shutdown_io_until(
+    deadline: Instant,
+    mut operation: impl FnMut() -> std::io::Result<usize>,
+) -> std::io::Result<usize> {
+    loop {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "shutdown deadline exceeded",
+            ));
+        }
+        match operation() {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed",
+                ))
+            }
+            Ok(count) => return Ok(count),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
 
 /// Default read window for a guest-side flatten (overlay merge + tar of tens
 /// of GiB to the guest disk). The guest stays quiet while tar runs, so the
@@ -1128,7 +1184,7 @@ impl AgentClient {
 
     /// Connect to the agent socket and configure read/write timeouts (in milliseconds).
     fn connect_with_timeouts_ms(socket_path: &Path, read_ms: u64, write_ms: u64) -> Result<Self> {
-        let stream = UdsStream::connect(socket_path)
+        let stream = UdsStream::connect_timeout(socket_path, Duration::from_millis(read_ms.max(1)))
             .map_err(|e| Error::agent("connect to agent", e.to_string()))?;
 
         stream
@@ -1265,16 +1321,34 @@ impl AgentClient {
             let registry_config = SmolSettings::load().unwrap_or_default().images;
             let registry = extract_registry(image);
 
-            // Get credentials from config if not explicitly provided
-            let auth = options.auth.or_else(|| {
-                registry_config.get_credentials(&registry).inspect(|creds| {
-                    tracing::debug!(
-                        registry = %registry,
-                        username = %creds.username,
-                        "using configured registry credentials"
-                    );
+            // Get credentials from config if not explicitly provided, then from
+            // what `docker login` stored on the host (inline or in a credential
+            // helper). The guest's crane accepts a username/secret pair and an
+            // identity token alike, so both forms are forwarded.
+            let auth = options
+                .auth
+                .or_else(|| {
+                    registry_config.get_credentials(&registry).inspect(|creds| {
+                        tracing::debug!(
+                            registry = %registry,
+                            username = %creds.username,
+                            "using configured registry credentials"
+                        );
+                    })
                 })
-            });
+                .or_else(|| {
+                    crate::docker_config::credential_for(&registry).map(|cred| {
+                        tracing::debug!(
+                            registry = %registry,
+                            username = %cred.username,
+                            "using host docker credentials"
+                        );
+                        RegistryAuth {
+                            username: cred.username,
+                            password: cred.secret,
+                        }
+                    })
+                });
 
             // Apply mirror if configured
             let img = if let Some(mirror) = registry_config.get_mirror(&registry) {
@@ -1573,15 +1647,48 @@ impl AgentClient {
         let _timeout_guard = self.set_extended_read_timeout(flatten_timeout())?;
         let resp = self.request(&AgentRequest::FlattenLayers {
             lowerdirs: lowerdirs.to_vec(),
-            output: output.to_string(),
+            output: Some(output.to_string()),
         })?;
         expect_ok(resp, "flatten layers")
+    }
+
+    /// Merge `lowerdirs` (bottom -> top) and stream the result straight into
+    /// `local_path` as a tar archive.
+    ///
+    /// Same merge as [`Self::flatten_layers`], but the archive never lands on the
+    /// guest's disk. Prefer this wherever the merged tree can be large: staging
+    /// the tar guest-side needs room for a second full copy of everything being
+    /// flattened, which is what exhausts an export helper's disk on a big image.
+    pub fn flatten_layers_to_path<F: FnMut(u64)>(
+        &mut self,
+        lowerdirs: &[String],
+        local_path: &std::path::Path,
+        cap: u64,
+        on_progress: F,
+    ) -> Result<u64> {
+        // The agent sends nothing while it mounts the overlay and spawns tar, so
+        // the same widened window the staged form needs applies here too.
+        let _timeout_guard = self.set_extended_read_timeout(flatten_timeout())?;
+        self.send_raw(&AgentRequest::FlattenLayers {
+            lowerdirs: lowerdirs.to_vec(),
+            output: None,
+        })?;
+        self.receive_stream_to_path(local_path, cap, on_progress, "flatten layers")
     }
 
     /// Get storage status.
     pub fn storage_status(&mut self) -> Result<StorageStatus> {
         let resp = self.request(&AgentRequest::StorageStatus)?;
         expect_data(resp, "storage status")
+    }
+
+    /// The guest's own view of machine memory.
+    ///
+    /// Agents older than this request reject it as an unknown variant, so
+    /// callers should treat an error as "not available" rather than a failure.
+    pub fn memory_status(&mut self) -> Result<MemoryStatus> {
+        let resp = self.request(&AgentRequest::MemoryStatus)?;
+        expect_data(resp, "memory status")
     }
 
     /// Test network connectivity directly from the agent (not via chroot).
@@ -1601,46 +1708,124 @@ impl AgentClient {
     /// Request agent shutdown.
     ///
     /// Waits for the agent to acknowledge the shutdown request before returning.
-    /// This ensures the agent has called sync() to flush filesystem caches
-    /// before we send SIGTERM to terminate the VM.
-    ///
-    /// The acknowledgment is critical for data integrity - without it, the VM
-    /// may be killed before ext4 journal commits are flushed, causing layer
-    /// corruption on next boot.
+    /// The agent must advertise safe shutdown before receiving a mutating
+    /// request, then confirm internal filesystems are frozen before termination.
     pub fn shutdown(&mut self) -> Result<()> {
-        // Set a timeout for shutdown acknowledgment.
-        // The agent calls sync() then sends the ack — typically <100ms,
-        // but heavy writes or large journals may take longer.
-        // If no ack within 5s, the VM has likely already torn down.
-        let _ = self
-            .stream
-            .set_read_timeout(Some(Duration::from_secs(SHUTDOWN_ACK_TIMEOUT_SECS)));
+        self.shutdown_with_timeouts(
+            Duration::from_secs(SHUTDOWN_ACK_TIMEOUT_SECS),
+            Duration::from_secs(120),
+        )
+    }
 
-        let data = self.encode_traced(&AgentRequest::Shutdown)?;
-        self.stream
-            .write_all(&data)
-            .map_err(|e| Error::agent("send shutdown", e.to_string()))?;
+    #[cfg(test)]
+    fn shutdown_with_deadline(&mut self, timeout: Duration) -> Result<()> {
+        self.shutdown_with_timeouts(timeout, timeout)
+    }
 
-        // Wait for acknowledgment - this confirms sync() completed.
-        // Returns Ok only when the ack is actually received, so callers
-        // can distinguish "sync confirmed" from "sync unknown".
-        match self.receive() {
-            Ok(_) => {
-                tracing::debug!("agent acknowledged shutdown (sync complete)");
-                Ok(())
+    fn shutdown_with_timeouts(&mut self, idle: Duration, maximum: Duration) -> Result<()> {
+        let started = Instant::now();
+        let mut deadlines = ShutdownDeadlines::new(started, idle, maximum);
+        self.stream.as_socket().set_nonblocking(true)?;
+        let result = (|| -> Result<()> {
+            // Old agents remount storage read-only even when their reply cannot
+            // satisfy this contract. Check capability before changing the guest.
+            self.shutdown_send_until(&AgentRequest::Ping, deadlines.next())?;
+            match self.shutdown_response_until(deadlines.next())? {
+                AgentResponse::Pong { capabilities, .. }
+                    if capabilities.iter().any(|c| c == smolvm_protocol::QUIESCED_SHUTDOWN_CAPABILITY) => {}
+                AgentResponse::Pong { .. } => return Err(Error::agent(
+                    "shutdown capability",
+                    "running guest agent does not support safe shutdown; VM left unchanged; update the guest agent before retrying",
+                )),
+                _ => return Err(Error::agent("shutdown capability", "unexpected ping response")),
             }
-            Err(e) => {
-                let error_str = e.to_string();
-                if is_benign_shutdown_error(&error_str) {
-                    tracing::debug!(
-                        "shutdown ack not received (connection closed) - sync may have completed"
-                    );
-                } else {
-                    tracing::warn!(error = %e, "shutdown acknowledgment failed");
+            let data = self.encode_traced(&AgentRequest::Shutdown { progress: true })?;
+            let mut sent = 0;
+            while sent < data.len() {
+                sent += shutdown_io_until(deadlines.next(), || self.stream.write(&data[sent..]))?;
+            }
+            tracing::debug!(
+                send_ms = started.elapsed().as_millis(),
+                "shutdown request sent; waiting for acknowledgment"
+            );
+            loop {
+                // One deadline covers the entire frame; partial bytes never
+                // prolong shutdown. Only a complete progress response does.
+                let deadline = deadlines.next();
+                match self.shutdown_response_until(deadline)? {
+                    AgentResponse::Ok { data }
+                        if data
+                            .as_ref()
+                            .and_then(|value| value.get("filesystems_quiesced"))
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(true) =>
+                    {
+                        return Ok(())
+                    }
+                    AgentResponse::Ok { .. } => {
+                        return Err(Error::agent(
+                            "shutdown ack",
+                            "guest did not confirm that its filesystems were quiesced",
+                        ));
+                    }
+                    AgentResponse::Progress { message, .. } => {
+                        tracing::debug!(%message, "shutdown progress");
+                        deadlines.progress(Instant::now());
+                    }
+                    AgentResponse::Error { message, .. } => {
+                        return Err(Error::agent("shutdown ack", message));
+                    }
+                    _ => return Err(Error::agent("shutdown ack", "unexpected acknowledgment")),
                 }
-                Err(Error::agent("shutdown ack", error_str))
+            }
+        })();
+        let reset = self.stream.as_socket().set_nonblocking(false);
+        tracing::debug!(
+            elapsed_ms = started.elapsed().as_millis(),
+            acknowledged = result.is_ok(),
+            "shutdown acknowledgment finished"
+        );
+        if let Err(error) = &result {
+            let _ = self.stream.shutdown(std::net::Shutdown::Both);
+            if is_benign_shutdown_error(&error.to_string()) {
+                tracing::debug!(%error, "shutdown connection closed without acknowledgment");
+            } else {
+                tracing::warn!(%error, "shutdown acknowledgment failed");
             }
         }
+        result?;
+        reset?;
+        Ok(())
+    }
+
+    fn shutdown_read_until(&mut self, buf: &mut [u8], deadline: Instant) -> Result<()> {
+        let mut read = 0;
+        while read < buf.len() {
+            read += shutdown_io_until(deadline, || self.stream.read(&mut buf[read..]))?;
+        }
+        Ok(())
+    }
+
+    fn shutdown_send_until(&mut self, request: &AgentRequest, deadline: Instant) -> Result<()> {
+        let data = self.encode_traced(request)?;
+        let mut sent = 0;
+        while sent < data.len() {
+            sent += shutdown_io_until(deadline, || self.stream.write(&data[sent..]))?;
+        }
+        Ok(())
+    }
+
+    fn shutdown_response_until(&mut self, deadline: Instant) -> Result<AgentResponse> {
+        let mut header = [0; 4];
+        self.shutdown_read_until(&mut header, deadline)?;
+        let len = u32::from_be_bytes(header) as usize;
+        if len > MAX_FRAME_SIZE as usize {
+            return Err(Error::agent("shutdown ack", "response frame too large"));
+        }
+        let mut body = vec![0; len];
+        self.shutdown_read_until(&mut body, deadline)?;
+        serde_json::from_slice(&body)
+            .map_err(|error| Error::agent("shutdown ack", error.to_string()))
     }
 
     // ========================================================================
@@ -3820,6 +4005,196 @@ mod stalled_body_tests {
     use super::*;
     use std::io::Write;
     use std::time::{Duration, Instant};
+
+    fn advertise_safe_shutdown(peer: &mut UdsStream) {
+        let mut header = [0; 4];
+        peer.read_exact(&mut header).unwrap();
+        let mut body = vec![0; u32::from_be_bytes(header) as usize];
+        peer.read_exact(&mut body).unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("ping"));
+        let response = AgentResponse::Pong {
+            version: smolvm_protocol::PROTOCOL_VERSION,
+            capabilities: vec![smolvm_protocol::QUIESCED_SHUTDOWN_CAPABILITY.into()],
+        };
+        let body = serde_json::to_vec(&response).unwrap();
+        peer.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
+        peer.write_all(&body).unwrap();
+    }
+
+    #[test]
+    fn shutdown_never_mutates_a_legacy_guest() {
+        let (client_stream, mut peer) = UdsStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut header = [0; 4];
+            peer.read_exact(&mut header).unwrap();
+            let mut request = vec![0; u32::from_be_bytes(header) as usize];
+            peer.read_exact(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request).contains("ping"));
+            let body = serde_json::to_vec(&AgentResponse::Pong {
+                version: smolvm_protocol::PROTOCOL_VERSION,
+                capabilities: vec![],
+            })
+            .unwrap();
+            peer.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
+            peer.write_all(&body).unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            assert_eq!(
+                peer.read(&mut header).unwrap(),
+                0,
+                "must close without sending shutdown"
+            );
+        });
+        let error = AgentClient::from_stream(client_stream)
+            .shutdown()
+            .unwrap_err();
+        assert!(error.to_string().contains("VM left unchanged"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_progress_extends_idle_but_not_hard_deadline() {
+        let start = Instant::now();
+        let mut d = ShutdownDeadlines::new(start, Duration::from_secs(5), Duration::from_secs(12));
+        assert_eq!(d.next(), start + Duration::from_secs(5));
+        d.progress(start + Duration::from_secs(4));
+        assert_eq!(d.next(), start + Duration::from_secs(9));
+        d.progress(start + Duration::from_secs(8));
+        assert_eq!(d.next(), start + Duration::from_secs(12));
+        d.progress(start + Duration::from_secs(11));
+        assert_eq!(d.next(), start + Duration::from_secs(12));
+    }
+
+    #[test]
+    fn shutdown_accepts_progress_then_final_ack() {
+        let (client_stream, mut peer) = UdsStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            advertise_safe_shutdown(&mut peer);
+            let mut request = [0; 1024];
+            assert!(peer.read(&mut request).unwrap() > 0);
+            for response in [
+                AgentResponse::Progress {
+                    message: "syncing".into(),
+                    percent: None,
+                    layer: None,
+                },
+                AgentResponse::Ok {
+                    data: Some(serde_json::json!({
+                        "shutdown": true,
+                        "filesystems_quiesced": true,
+                    })),
+                },
+            ] {
+                let body = serde_json::to_vec(&response).unwrap();
+                peer.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
+                peer.write_all(&body).unwrap();
+            }
+        });
+        AgentClient::from_stream(client_stream)
+            .shutdown_with_timeouts(Duration::from_secs(1), Duration::from_secs(2))
+            .unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_rejects_legacy_ack_without_quiesce_confirmation() {
+        let (client_stream, mut peer) = UdsStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            advertise_safe_shutdown(&mut peer);
+            let mut request = [0; 1024];
+            assert!(peer.read(&mut request).unwrap() > 0);
+            let response = AgentResponse::Ok {
+                data: Some(serde_json::json!({"shutdown": true})),
+            };
+            let body = serde_json::to_vec(&response).unwrap();
+            peer.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
+            peer.write_all(&body).unwrap();
+        });
+        let error = AgentClient::from_stream(client_stream)
+            .shutdown_with_timeouts(Duration::from_secs(1), Duration::from_secs(2))
+            .unwrap_err();
+        assert!(error.to_string().contains("filesystems were quiesced"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_returns_flush_error() {
+        let (client_stream, mut peer) = UdsStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            advertise_safe_shutdown(&mut peer);
+            let mut request = [0; 1024];
+            assert!(peer.read(&mut request).unwrap() > 0);
+            let body =
+                serde_json::to_vec(&AgentResponse::error("flush failed", "IO_ERROR")).unwrap();
+            peer.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
+            peer.write_all(&body).unwrap();
+        });
+        let error = AgentClient::from_stream(client_stream)
+            .shutdown()
+            .unwrap_err();
+        assert!(error.to_string().contains("flush failed"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_progress_stream_cannot_extend_absolute_limit() {
+        let (client_stream, mut peer) = UdsStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            advertise_safe_shutdown(&mut peer);
+            let mut request = [0; 1024];
+            assert!(peer.read(&mut request).unwrap() > 0);
+            let body = serde_json::to_vec(&AgentResponse::Progress {
+                message: "syncing".into(),
+                percent: None,
+                layer: None,
+            })
+            .unwrap();
+            let bytes = [(body.len() as u32).to_be_bytes().as_slice(), &body].concat();
+            while peer.write_all(&bytes).is_ok() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let start = Instant::now();
+        let error = AgentClient::from_stream(client_stream)
+            .shutdown_with_timeouts(Duration::from_millis(80), Duration::from_millis(160))
+            .unwrap_err();
+        assert!(error.to_string().contains("deadline exceeded"));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_deadline_is_not_extended_by_partial_frames() {
+        for slow_header in [true, false] {
+            let (client_stream, mut peer) = UdsStream::pair().unwrap();
+            let server = std::thread::spawn(move || {
+                advertise_safe_shutdown(&mut peer);
+                let mut request = [0; 1024];
+                assert!(peer.read(&mut request).unwrap() > 0);
+                let body = serde_json::to_vec(&AgentResponse::Ok { data: None }).unwrap();
+                let header = (body.len() as u32).to_be_bytes();
+                let bytes = if slow_header {
+                    [header.as_slice(), body.as_slice()].concat()
+                } else {
+                    peer.write_all(&header).unwrap();
+                    body
+                };
+                for byte in bytes {
+                    if peer.write_all(&[byte]).is_err() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(30));
+                }
+            });
+            let mut client = AgentClient::from_stream(client_stream);
+            let start = Instant::now();
+            let error = client
+                .shutdown_with_deadline(Duration::from_millis(100))
+                .unwrap_err();
+            assert!(error.to_string().contains("deadline exceeded"), "{error}");
+            assert!(start.elapsed() < Duration::from_millis(500));
+            server.join().unwrap();
+        }
+    }
 
     #[test]
     fn receive_times_out_when_peer_never_starts_a_frame() {

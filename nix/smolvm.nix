@@ -17,7 +17,7 @@
   gnutar,
   coreutils,
 }: let
-  version = "1.14.6";
+  version = "1.16.0";
 
   releases = {
     x86_64-linux = {
@@ -44,10 +44,16 @@
     bzip2
   ];
 
-  # crun/e2fsprogs/util-linux are Linux-only; the container runtime and mkfs.ext4
-  # only matter there. On darwin smolvm uses the host's own facilities.
+  # e2fsprogs is needed on EVERY host, not just Linux: `resize2fs` shrinks a
+  # machine's disk whenever one is asked for below the template size
+  # (src/disk_utils.rs:112 and :135 at 8dd8b18d), and the macOS branch of that
+  # error tells the user to `brew install e2fsprogs`. Without it on PATH the
+  # shrink is skipped with a warning and the machine silently gets the full
+  # template instead of the size that was requested. crun and util-linux stay
+  # Linux-only: the container runtime and mkfs.ext4 only matter there.
   runtimeDeps =
     [
+      e2fsprogs
       jq
       gzip
       gnutar
@@ -55,7 +61,6 @@
     ]
     ++ lib.optionals stdenv.hostPlatform.isLinux [
       crun
-      e2fsprogs
       util-linux
     ];
 in

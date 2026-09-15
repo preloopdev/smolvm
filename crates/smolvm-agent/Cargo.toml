@@ -1,6 +1,6 @@
 [package]
 name = "smolvm-agent"
-version = "1.14.6"
+version = "1.16.1"
 edition = "2021"
 description = "Guest agent for smolvm VMs (handles OCI operations and command execution)"
 license = "Apache-2.0"
@@ -44,7 +44,7 @@ zstd = "0.13"
 
 # Linux-specific dependencies for vsock
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.27", features = ["socket", "fs"] }
+nix = { version = "0.27", features = ["socket", "fs", "ioctl"] }
 # The new mount API (fsopen/fsconfig/fsmount/move_mount) for overlay mounts — lets
 # us append each lower layer via `lowerdir+` instead of shelling out to `mount(8)`,
 # whose `-o lowerdir=` value is capped at ~255 bytes. Already in the workspace lock.

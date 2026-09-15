@@ -85,6 +85,13 @@ pub struct KrunFunctions {
     >,
     pub get_egress_handle: Option<unsafe extern "C" fn(u32) -> *mut libc::c_void>,
     pub set_gpu_options2: Option<unsafe extern "C" fn(u32, u32, u64) -> i32>,
+    /// Expose the host's virtualization extensions to the guest so it can run
+    /// KVM itself. Optional: older bundled libkrun builds lack it.
+    pub set_nested_virt: Option<unsafe extern "C" fn(u32, bool) -> i32>,
+    /// Whether the HOST can offer nesting at all (1 = yes). Checked before
+    /// asking, so an unsupported host gets a clear refusal instead of a VM that
+    /// boots without `/dev/kvm`.
+    pub check_nested_virt: Option<unsafe extern "C" fn() -> i32>,
     /// Add a virtio-gpu scanout (display) of the given width/height.
     ///
     /// Without at least one display the device reports `num_scanouts = 0`, the
@@ -113,6 +120,7 @@ pub struct KrunFunctions {
     /// Boot the VM as a fork clone from a snapshot directory (CoW-map a golden
     /// VM's RAM + restore state instead of cold-booting).
     pub set_snapshot: Option<unsafe extern "C" fn(u32, *const libc::c_char) -> i32>,
+    pub set_snapshot_memory_fd: Option<unsafe extern "C" fn(u32, i32) -> i32>,
     /// Create a qcow2 copy-on-write overlay backed by an existing disk image
     /// (used for fork-clone block disks). Pure filesystem op; takes no ctx.
     pub create_disk_overlay:
@@ -200,12 +208,15 @@ impl KrunFunctions {
         let add_net_unixstream = load_optional_sym!("krun_add_net_unixstream");
         let get_egress_handle = load_optional_sym!("krun_get_egress_handle");
         let set_gpu_options2 = load_optional_sym!("krun_set_gpu_options2");
+        let set_nested_virt = load_optional_sym!("krun_set_nested_virt");
+        let check_nested_virt = load_optional_sym!("krun_check_nested_virt");
         let add_display = load_optional_sym!("krun_add_display");
         let set_display_backend = load_optional_sym!("krun_set_display_backend");
         let add_input_device = load_optional_sym!("krun_add_input_device");
         let get_guest_ram = load_optional_sym!("krun_get_guest_ram");
         let set_control_socket = load_optional_sym!("krun_set_control_socket");
         let set_snapshot = load_optional_sym!("krun_set_snapshot");
+        let set_snapshot_memory_fd = load_optional_sym!("krun_set_snapshot_memory_fd");
         let create_disk_overlay = load_optional_sym!("krun_create_disk_overlay");
 
         Ok(Self {
@@ -233,12 +244,15 @@ impl KrunFunctions {
             add_net_unixstream,
             get_egress_handle,
             set_gpu_options2,
+            set_nested_virt,
+            check_nested_virt,
             add_display,
             set_display_backend,
             add_input_device,
             get_guest_ram,
             set_control_socket,
             set_snapshot,
+            set_snapshot_memory_fd,
             create_disk_overlay,
         })
     }
