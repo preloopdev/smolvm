@@ -1031,7 +1031,63 @@ pub(crate) fn describe_krun_start_error(ret: i32) -> String {
         );
     }
 
+    // Entitled but still EINVAL: probe `hv_vm_create` directly. On a host that
+    // cannot run VMs at all — a VM on a physical host without nested
+    // virtualization (hosted CI runners are VMs; nested HVF needs Apple M3+
+    // silicon) — the probe fails the same way the boot did, and the generic
+    // "disk/overlay" hint would send the user debugging the wrong layer.
+    #[cfg(target_os = "macos")]
+    if -ret == 22 && hypervisor_vm_create_probe() == Some(false) {
+        return format!(
+            "krun_start_enter returned: {ret} (Hypervisor.framework cannot create a \
+             VM on this host — a direct hv_vm_create probe fails identically, so the \
+             host itself lacks virtualization support rather than this VM's config \
+             being invalid. This machine is likely itself a VM on a host without \
+             nested virtualization (hosted CI runners are; nested HVF requires \
+             Apple M3+ silicon). Run on bare metal or a host with nested \
+             virtualization enabled)"
+        );
+    }
+
     describe_start_error_with_probe(ret, kvm_error.as_deref())
+}
+
+/// Whether `hv_vm_create` can create a VM on this host right now.
+///
+/// Mirrors libkrun's `HvfVm::new` exactly — `hv_vm_config_create` then
+/// `hv_vm_create` — so the probe fails where the real boot fails. `Some(true)`
+/// the hypervisor works (the boot failure is config-specific); `Some(false)`
+/// it does not; `None` the probe itself could not run (framework/symbols
+/// missing) and says nothing either way.
+#[cfg(target_os = "macos")]
+fn hypervisor_vm_create_probe() -> Option<bool> {
+    type ConfigCreate = unsafe extern "C" fn() -> *mut std::ffi::c_void;
+    type VmCreate = unsafe extern "C" fn(*mut std::ffi::c_void) -> u32;
+    type VmDestroy = unsafe extern "C" fn() -> u32;
+    const HV_SUCCESS: u32 = 0;
+
+    let lib = unsafe {
+        libloading::Library::new(
+            "/System/Library/Frameworks/Hypervisor.framework/Versions/A/Hypervisor",
+        )
+    }
+    .ok()?;
+    let config_create: libloading::Symbol<ConfigCreate> =
+        unsafe { lib.get(b"hv_vm_config_create") }.ok()?;
+    let vm_create: libloading::Symbol<VmCreate> = unsafe { lib.get(b"hv_vm_create") }.ok()?;
+
+    let config = unsafe { config_create() };
+    if config.is_null() {
+        return Some(false);
+    }
+    let ret = unsafe { vm_create(config) };
+    if ret == HV_SUCCESS {
+        // Don't leak the probe VM.
+        if let Ok(destroy) = unsafe { lib.get::<VmDestroy>(b"hv_vm_destroy") } {
+            unsafe { destroy() };
+        }
+    }
+    Some(ret == HV_SUCCESS)
 }
 
 pub(crate) fn describe_krun_start_error_with_detail(ret: i32, detail: Option<&str>) -> String {
@@ -1281,6 +1337,17 @@ mod tests {
         assert!(!entitlement_enabled(
             "<key>com.apple.security.cs.allow-jit</key><true/>"
         ));
+    }
+
+    // The hv_vm_create probe must answer on any host where Hypervisor.framework
+    // loads: `Some(true)` on capable hardware, `Some(false)` where the host
+    // cannot run VMs (a VM without nested virtualization). `None` would mean
+    // the probe itself broke — framework or symbols missing — which is the only
+    // outcome that makes the EINVAL diagnosis silently wrong.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hypervisor_probe_returns_a_verdict() {
+        assert!(hypervisor_vm_create_probe().is_some());
     }
 
     #[test]
