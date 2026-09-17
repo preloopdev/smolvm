@@ -126,6 +126,9 @@ fn stray_stub_note(exe_stem: &str) -> Option<String> {
 }
 
 fn main() {
+    // Lets pack extraction pick host-side layers when this host's virtiofs
+    // server can present their recorded ownership.
+    smolvm_pack::extract::set_host_layers_probe(smolvm::agent::host_layers_supported);
     // Honor an explicit SMOLVM_DATA_DIR for EVERY command (so the CLI and serve
     // agree on where smolvm state lives) before anything computes a path. The
     // auto /var/lib/smolvm default is serve-only (applied in its run()). Done

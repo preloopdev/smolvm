@@ -52,6 +52,53 @@ pub struct ArtifactCachePruneReport {
 
 struct ArtifactCacheLock(fs::File);
 
+/// Keep pruning and another publisher out while replacing a verified cache file.
+pub(crate) struct CheckpointEntryLock {
+    _entry: ArtifactCacheLock,
+    _cache: ArtifactCacheLock,
+}
+
+pub(crate) fn lock_checkpoint_entry(shared_dir: &Path) -> io::Result<Option<CheckpointEntryLock>> {
+    lock_checkpoint_entry_in(&vm_cache_root(), &shared_pack_cache_root(), shared_dir)
+}
+
+fn lock_checkpoint_entry_in(
+    vm_root: &Path,
+    root: &Path,
+    shared_dir: &Path,
+) -> io::Result<Option<CheckpointEntryLock>> {
+    if shared_dir.parent() != Some(root) {
+        return Ok(None);
+    }
+    let cache = lock_artifact_cache(vm_root, false)?;
+    let shared = canonical_shared_dir(shared_dir, root)?;
+    for directory in [root, shared.as_path()] {
+        let metadata = fs::symlink_metadata(directory)?;
+        if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+            return Ok(None);
+        }
+    }
+    let entry = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(shared.with_extension("lock"))?;
+    if unsafe { libc::flock(entry.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // A cache miss is not an invitation to create an unverified extraction.
+    if !smolvm_pack::extract::is_extracted(&shared) {
+        return Ok(None);
+    }
+    read_artifact_digest(&shared)?;
+    Ok(Some(CheckpointEntryLock {
+        _entry: ArtifactCacheLock(entry),
+        _cache: cache,
+    }))
+}
+
 impl Drop for ArtifactCacheLock {
     fn drop(&mut self) {
         let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
@@ -877,6 +924,63 @@ mod tests {
     fn publish_test_lease(machine: &Path, shared: &Path) {
         fs::create_dir_all(machine.join("pack")).unwrap();
         atomic_publish_pointer(&machine.join(SHARED_PACK_POINTER), shared).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires root to exercise service-owned promotion cache"]
+    fn promotion_serializes_publishers_and_excludes_pruning() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("vms");
+        let (shared, _) = install_artifact(&root, "deadbeef", DIGEST_A);
+        fs::write(shared.join(".smolvm-extracted"), b"done").unwrap();
+        let held = lock_checkpoint_entry_in(&root, &root.join("_shared"), &shared)
+            .unwrap()
+            .unwrap();
+        std::thread::scope(|scope| {
+            let (publisher_entered, published) = mpsc::channel();
+            let (pruner_entered, pruned) = mpsc::channel();
+            let root = &root;
+            let shared = &shared;
+            scope.spawn(move || {
+                let _guard = lock_checkpoint_entry_in(root, &root.join("_shared"), shared)
+                    .unwrap()
+                    .unwrap();
+                publisher_entered.send(()).unwrap();
+            });
+            scope.spawn(move || {
+                let _guard = lock_artifact_cache(root, true).unwrap();
+                pruner_entered.send(()).unwrap();
+            });
+            assert!(published.recv_timeout(Duration::from_millis(100)).is_err());
+            assert!(pruned.recv_timeout(Duration::from_millis(100)).is_err());
+            drop(held);
+            published.recv_timeout(Duration::from_secs(5)).unwrap();
+            pruned.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+    }
+
+    #[test]
+    #[ignore = "requires root to exercise service-owned promotion cache"]
+    fn promotion_lock_refuses_incomplete_entries_and_symlinked_locks() {
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("vms");
+        let (shared, _) = install_artifact(&root, "deadbeef", DIGEST_A);
+        assert!(
+            lock_checkpoint_entry_in(&root, &root.join("_shared"), &shared)
+                .unwrap()
+                .is_none()
+        );
+        fs::write(shared.join(".smolvm-extracted"), b"done").unwrap();
+        fs::remove_file(shared.with_extension("lock")).unwrap();
+        let outside = temp.path().join("outside");
+        fs::write(&outside, b"unchanged").unwrap();
+        std::os::unix::fs::symlink(&outside, shared.with_extension("lock")).unwrap();
+        assert!(lock_checkpoint_entry_in(&root, &root.join("_shared"), &shared).is_err());
+        assert_eq!(fs::read(outside).unwrap(), b"unchanged");
     }
 
     #[test]

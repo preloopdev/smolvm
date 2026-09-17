@@ -17,6 +17,48 @@ use crate::Result;
 /// from causing excessive memory allocation.
 const MAX_MANIFEST_SIZE: u64 = 16 * 1024 * 1024;
 
+fn artifact_parent(output: &Path) -> &Path {
+    output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn prepare_artifact_parent(parent: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    let mut missing = Vec::new();
+    #[cfg(unix)]
+    {
+        let mut directory = parent;
+        while !directory.try_exists()? {
+            missing.push(directory);
+            directory = artifact_parent(directory);
+        }
+    }
+    fs::create_dir_all(parent)?;
+    #[cfg(unix)]
+    for directory in missing {
+        // Persist newly created ancestors too, not just the final file's name.
+        File::open(directory)?.sync_all()?;
+        File::open(artifact_parent(directory))?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn publish_artifact(
+    temporary: tempfile::TempPath,
+    output: &Path,
+    sync_parent: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    temporary
+        .persist_noclobber(output)
+        .map_err(|error| error.error)?;
+    let parent = artifact_parent(output);
+    // The contents were synced before publication. Persist the new directory
+    // entry too; an error here must not be acknowledged as durable success.
+    sync_parent(parent)
+}
+
 struct DigestWriter<W> {
     inner: W,
     sha256: Option<DigestWorker>,
@@ -369,8 +411,8 @@ impl Packer {
         output: &Path,
         compute_digest: bool,
     ) -> Result<(PackedInfo, Option<PackedArtifactIdentity>)> {
-        let parent = output.parent().unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent)?;
+        let parent = artifact_parent(output);
+        prepare_artifact_parent(parent)?;
         let temp = tempfile::NamedTempFile::new_in(parent)?;
         let temp_path = temp.into_temp_path();
         let artifact = ChecksummedWriter::new(DigestWriter {
@@ -411,9 +453,13 @@ impl Packer {
         file.sync_all()?;
         let digest = artifact.sha256.map(DigestWorker::finish).transpose()?;
 
-        temp_path
-            .persist_noclobber(output)
-            .map_err(|error| error.error)?;
+        publish_artifact(temp_path, output, |parent| {
+            #[cfg(unix)]
+            File::open(parent)?.sync_all()?;
+            #[cfg(not(unix))]
+            let _ = parent;
+            Ok(())
+        })?;
         let identity = digest
             .map(|digest| {
                 Ok::<_, std::io::Error>(PackedArtifactIdentity {
@@ -998,6 +1044,69 @@ pub fn extract_assets(packed_path: impl AsRef<Path>, output_dir: impl AsRef<Path
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn artifact_parent_accepts_bare_names_and_creates_nested_directories() {
+        assert_eq!(
+            artifact_parent(Path::new("saved.smolcheckpoint")),
+            Path::new(".")
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("new").join("checkpoints");
+        prepare_artifact_parent(&nested).unwrap();
+        assert!(nested.is_dir());
+        prepare_artifact_parent(&nested).unwrap();
+        let file = nested.join("file");
+        fs::write(&file, b"not a directory").unwrap();
+        assert!(prepare_artifact_parent(&file.join("child")).is_err());
+    }
+
+    #[test]
+    fn artifact_publication_syncs_the_published_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut temporary = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+        temporary.write_all(b"checkpoint").unwrap();
+        temporary.as_file().sync_all().unwrap();
+        let output = directory.path().join("saved.smolcheckpoint");
+        let mut synced = false;
+        publish_artifact(temporary.into_temp_path(), &output, |parent| {
+            assert_eq!(parent, directory.path());
+            assert_eq!(fs::read(&output)?, b"checkpoint");
+            #[cfg(unix)]
+            File::open(parent)?.sync_all()?;
+            synced = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(synced);
+    }
+
+    #[test]
+    fn artifact_publication_does_not_hide_directory_sync_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let temporary = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+        let output = directory.path().join("saved.smolcheckpoint");
+        let error = publish_artifact(temporary.into_temp_path(), &output, |_| {
+            Err(std::io::Error::other("directory sync failed"))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "directory sync failed");
+        // Published bytes may be recoverable, but durability was not promised.
+        assert!(output.is_file());
+    }
+
+    #[test]
+    fn artifact_publication_never_overwrites_an_existing_checkpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let temporary = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+        let output = directory.path().join("saved.smolcheckpoint");
+        fs::write(&output, b"original").unwrap();
+        assert!(publish_artifact(temporary.into_temp_path(), &output, |_| {
+            panic!("failed publication must not reach the directory sync")
+        })
+        .is_err());
+        assert_eq!(fs::read(&output).unwrap(), b"original");
+    }
 
     #[test]
     fn test_pack_and_read() {

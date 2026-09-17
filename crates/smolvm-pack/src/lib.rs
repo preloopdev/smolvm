@@ -77,3 +77,42 @@ pub enum PackError {
 
 /// Result type for pack operations.
 pub type Result<T> = std::result::Result<T, PackError>;
+
+/// Return whether every byte is zero, without assuming alignment or padding.
+///
+/// Bounded slice comparisons allow the platform's optimized byte comparison
+/// implementation to scan sparse checkpoint data instead of branching per byte.
+pub fn is_zero_filled(bytes: &[u8]) -> bool {
+    static ZERO: [u8; 64 * 1024] = [0; 64 * 1024];
+    bytes
+        .chunks(ZERO.len())
+        .all(|chunk| chunk == &ZERO[..chunk.len()])
+}
+
+#[cfg(test)]
+mod zero_tests {
+    use super::is_zero_filled;
+
+    #[test]
+    fn zero_detection_preserves_unaligned_and_partial_chunk_boundaries() {
+        for len in [
+            0, 1, 7, 8, 15, 16, 63, 64, 65, 4095, 4096, 65535, 65536, 65537, 524301, 1048577,
+        ] {
+            for shift in 0..16 {
+                let mut storage = vec![0; len + shift];
+                let bytes = &mut storage[shift..];
+                assert!(is_zero_filled(bytes));
+                for position in [0, len / 2, len.saturating_sub(1), 65535, 65536] {
+                    if position >= len {
+                        continue;
+                    }
+                    for value in [1, 128, 255] {
+                        bytes[position] = value;
+                        assert_eq!(is_zero_filled(bytes), bytes.iter().all(|b| *b == 0));
+                        bytes[position] = 0;
+                    }
+                }
+            }
+        }
+    }
+}

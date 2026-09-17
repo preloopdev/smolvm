@@ -4,7 +4,7 @@
 //! (sidecar mode via `runpack`) and the standalone stub executable.
 
 use crate::format::{PackFooter, SIDECAR_EXTENSION};
-use sha2::{Digest, Sha256};
+use ring::digest::{Context, SHA256};
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -282,6 +282,142 @@ const MIN_STAGED_LAYERS_VERSION: (u64, u64, u64) = (1, 8, 1);
 /// defaulted field, so a pack without one necessarily predates it, and the
 /// conservative answer merely costs host-side extraction — while guessing "yes"
 /// costs a machine that will not boot.
+/// Packs built by this smolvm or later ship an agent that mounts the overlay
+/// with `userxattr` when the host declares it, which is what lets layers
+/// extracted on the host carry their opaque markers in a namespace an
+/// unprivileged VMM can serve. Older packs keep the in-guest unpack path.
+const MIN_HOST_LAYERS_VERSION: (u64, u64, u64) = (1, 16, 2);
+
+fn packed_agent_mounts_userxattr(version: &str) -> bool {
+    parse_pack_version(version).is_some_and(|parsed| parsed >= (MIN_HOST_LAYERS_VERSION, true))
+}
+
+/// Declares, beside host-extracted layers, that their opaque-directory markers
+/// live in the `user.overlay.*` namespace; the guest then mounts the overlay
+/// with `userxattr`. Read by the agent.
+pub const OPAQUE_XATTR_MARKER: &str = "opaque-xattr";
+/// The xattr libkrun's virtiofs server reads ownership and mode from (the
+/// rootless-containers convention, `uid:gid:0mode`). Writing it lets an
+/// unprivileged host hand the guest an image's exact owners, setuid bits and
+/// device nodes without being able to create any of them itself.
+const OVERRIDE_STAT_XATTR: &str = "user.containers.override_stat";
+const OVERLAY_OPAQUE_XATTR: &str = "user.overlay.opaque";
+/// Overlayfs whiteout: a character device with device number 0:0.
+const WHITEOUT_MODE: u32 = 0o020000;
+
+/// Whether this host should extract a pack's layers itself and describe their
+/// ownership to the guest through [`OVERRIDE_STAT_XATTR`], instead of staging
+/// the tars for the guest to unpack on every fresh machine. That needs a
+/// virtiofs server that honors the xattr (libkrun's macOS and Windows
+/// servers do; Linux once its passthrough gains the same), a pack whose agent
+/// mounts with `userxattr`, and a cache filesystem that stores user xattrs.
+/// `SMOLVM_HOST_LAYERS=on` waives the pack-version check (for packs built before
+/// the threshold); `off` disables the path; neither bypasses the server check.
+fn host_layers_via_override_stat(pack_version: Option<&str>, cache_dir: &Path) -> bool {
+    let server_honors_override = || {
+        cfg!(any(target_os = "macos", target_os = "windows"))
+            || HOST_LAYERS_PROBE.get().is_some_and(|probe| probe())
+    };
+    // The override can only relax the pack-version check: a server that
+    // cannot present the xattr would show every file as the host's user.
+    match std::env::var("SMOLVM_HOST_LAYERS").ok().as_deref() {
+        Some("off") => return false,
+        Some("on") => {}
+        _ => {
+            if !pack_version.is_some_and(packed_agent_mounts_userxattr) {
+                return false;
+            }
+        }
+    }
+    if !server_honors_override() {
+        return false;
+    }
+    // A root Linux host without the uid drop already reproduces owners on
+    // disk; nothing to fake there.
+    if host_unpack_preserves_ownership() {
+        return false;
+    }
+    user_xattrs_supported(cache_dir)
+}
+
+/// How the host learns whether its virtiofs server honors the override xattr
+/// on Linux: the embedding binary registers a probe (whether the libkrun it
+/// loads exports `krun_add_virtiofs4`). Never consulted on macOS or Windows,
+/// whose servers always honor it.
+static HOST_LAYERS_PROBE: std::sync::OnceLock<fn() -> bool> = std::sync::OnceLock::new();
+
+/// Register the probe described on [`HOST_LAYERS_PROBE`]. Later registrations
+/// are ignored.
+pub fn set_host_layers_probe(probe: fn() -> bool) {
+    let _ = HOST_LAYERS_PROBE.set(probe);
+}
+
+fn user_xattrs_supported(dir: &Path) -> bool {
+    let Ok(probe) = tempfile::NamedTempFile::new_in(dir) else {
+        return false;
+    };
+    set_user_xattr(probe.path(), OVERRIDE_STAT_XATTR, b"0:0:0644").is_ok()
+}
+
+/// Set a user xattr on `path` itself (never following a symlink).
+fn set_user_xattr(path: &Path, name: &str, value: &[u8]) -> std::io::Result<()> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path"))?;
+        let c_name = std::ffi::CString::new(name)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "xattr name"))?;
+        #[cfg(target_os = "macos")]
+        let rc = unsafe {
+            libc::setxattr(
+                c_path.as_ptr(),
+                c_name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+                libc::XATTR_NOFOLLOW,
+            )
+        };
+        #[cfg(target_os = "linux")]
+        let rc = unsafe {
+            libc::lsetxattr(
+                c_path.as_ptr(),
+                c_name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        // NTFS keeps xattrs as alternate data streams, which is where
+        // libkrun's Windows server reads the override from.
+        fs::write(format!("{}:{}", path.display(), name), value)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
+        let _ = (path, name, value);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "user xattrs are not supported on this host",
+        ))
+    }
+}
+
+fn record_override_stat(path: &Path, uid: u64, gid: u64, mode: u32) -> std::io::Result<()> {
+    set_user_xattr(
+        path,
+        OVERRIDE_STAT_XATTR,
+        format!("{uid}:{gid}:0{mode:o}").as_bytes(),
+    )
+}
+
 fn packed_agent_unpacks_staged_layers(version: &str) -> bool {
     let Some(parsed) = parse_pack_version(version) else {
         return false;
@@ -420,7 +556,7 @@ fn unpack_sparse<R: Read>(
             break;
         }
         let chunk = &buf[..n];
-        if chunk.iter().any(|&b| b != 0) {
+        if !crate::is_zero_filled(chunk) {
             file.seek(SeekFrom::Start(offset))?;
             file.write_all(chunk)?;
         }
@@ -589,7 +725,7 @@ fn safe_unpack_with_limits<R: Read>(
     dest: &Path,
     limits: &SafeUnpackLimits,
 ) -> std::io::Result<UnpackReport> {
-    safe_unpack_with_policy(archive, dest, limits, false)
+    safe_unpack_with_policy(archive, dest, limits, false, false)
 }
 
 // Both operations must succeed before returning the input to the installer. Do not join writeback
@@ -692,6 +828,7 @@ fn safe_unpack_with_policy<R: Read>(
     dest: &Path,
     limits: &SafeUnpackLimits,
     checkpoint: bool,
+    owner_xattr: bool,
 ) -> std::io::Result<UnpackReport> {
     let mut report = UnpackReport::default();
     // Use `normalize_path` (not `canonicalize`) for the containment base so it
@@ -778,6 +915,55 @@ fn safe_unpack_with_policy<R: Read>(
             ));
         }
 
+        // OCI whiteouts, translated here when the host describes ownership to
+        // the guest: overlayfs wants a 0:0 character device (faked through the
+        // override xattr on an empty file, since the host cannot mknod) and an
+        // opaque directory wants the `user.overlay.opaque` marker.
+        if owner_xattr {
+            if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
+                let parent_rel = entry_path.parent().unwrap_or(Path::new(""));
+                if name == ".wh..wh..opq" {
+                    let dir = dest.join(parent_rel);
+                    if !normalize_path(&dir).starts_with(&canonical_dest) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "tar entry '{}' escapes destination directory",
+                                entry_path.display()
+                            ),
+                        ));
+                    }
+                    fs::create_dir_all(&dir)?;
+                    set_user_xattr(&dir, OVERLAY_OPAQUE_XATTR, b"y")?;
+                    report.entries += 1;
+                    continue;
+                }
+                if let Some(victim) = name.strip_prefix(".wh.") {
+                    let target = dest.join(parent_rel).join(victim);
+                    if !normalize_path(&target).starts_with(&canonical_dest) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "tar entry '{}' escapes destination directory",
+                                entry_path.display()
+                            ),
+                        ));
+                    }
+                    if let Some(parent) = target.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    if let Some(parent) = target.parent() {
+                        set_mode(parent, 0o755);
+                    }
+                    let _ = fs::remove_file(&target);
+                    let _ = fs::remove_dir_all(&target);
+                    File::create(&target)?;
+                    record_override_stat(&target, 0, 0, WHITEOUT_MODE)?;
+                    report.entries += 1;
+                    continue;
+                }
+            }
+        }
         match entry_type {
             tar::EntryType::Regular
             | tar::EntryType::GNUSparse
@@ -930,7 +1116,10 @@ fn safe_unpack_with_policy<R: Read>(
                 entry.header().mode().unwrap_or(0o755) & 0o777
             };
             if mode != 0o755 {
-                deferred_dir_modes.push((full_path.clone(), mode));
+                deferred_dir_modes.push((
+                    full_path.clone(),
+                    if owner_xattr { mode | 0o700 } else { mode },
+                ));
             }
         }
 
@@ -1017,6 +1206,30 @@ fn safe_unpack_with_policy<R: Read>(
         }
         if host_runtime && is_regular {
             set_mode(&full_path, 0o600);
+        }
+        // Hard links share their target's xattr; symlinks cannot carry user
+        // xattrs on Linux and the server reads the host's stat for them anyway.
+        if owner_xattr
+            && entry_type != tar::EntryType::Link
+            && entry_type != tar::EntryType::Symlink
+        {
+            // The archived owner and mode (setuid bits included) go in the
+            // xattr the guest sees; the host copy stays readable so the VMM
+            // serving the files can open them.
+            let is_dir = entry_type == tar::EntryType::Directory;
+            let archived = entry
+                .header()
+                .mode()
+                .unwrap_or(if is_dir { 0o755 } else { 0o644 })
+                & 0o7777;
+            // Setting a user xattr needs write permission on the file, and
+            // the host copy must stay readable for the VMM, so the host mode
+            // always keeps owner read/write (the guest sees the archived one).
+            set_mode(
+                &full_path,
+                (archived & 0o777) | if is_dir { 0o700 } else { 0o600 },
+            );
+            record_override_stat(&full_path, uid, gid, archived)?;
         }
         report.entries += 1;
     }
@@ -1589,7 +1802,7 @@ pub fn retain_prepared_checkpoint_with_identity(
         return Ok(());
     }
     // Do not expose the completion marker until all payloads are durable.
-    post_process_extraction(prepared, &[], true, false)?;
+    post_process_extraction(prepared, &[], true, false, false)?;
     fs::set_permissions(
         prepared.join("checkpoint/memory.bin"),
         fs::Permissions::from_mode(0o600),
@@ -1956,7 +2169,7 @@ pub fn link_checkpoint_artifact(
 
 fn hash_artifact_sha256(sidecar_path: &Path) -> std::io::Result<String> {
     let mut source = File::open(sidecar_path)?;
-    let mut hasher = Sha256::new();
+    let mut hasher = Context::new(&SHA256);
     let mut buffer = vec![0_u8; 4 * 1024 * 1024];
     loop {
         let read = source.read(&mut buffer)?;
@@ -1966,10 +2179,27 @@ fn hash_artifact_sha256(sidecar_path: &Path) -> std::io::Result<String> {
         hasher.update(&buffer[..read]);
     }
     let mut digest = String::with_capacity(64);
-    for byte in hasher.finalize() {
+    for byte in hasher.finish().as_ref() {
         write!(&mut digest, "{byte:02x}").expect("writing to a String cannot fail");
     }
     Ok(digest)
+}
+
+#[test]
+fn artifact_hash_matches_existing_sha256_across_read_boundaries() {
+    use sha2::{Digest, Sha256};
+    let directory = tempfile::tempdir().unwrap();
+    let artifact = directory.path().join("artifact");
+    let bytes: Vec<u8> = (0..4 * 1024 * 1024 + 65)
+        .map(|index| (index % 251) as u8)
+        .collect();
+    for size in [0, 1, 63, 64, 65, bytes.len()] {
+        fs::write(&artifact, &bytes[..size]).unwrap();
+        assert_eq!(
+            hash_artifact_sha256(&artifact).unwrap(),
+            format!("{:x}", Sha256::digest(&bytes[..size]))
+        );
+    }
 }
 
 fn write_atomic_marker(path: &Path, contents: &[u8]) -> std::io::Result<()> {
@@ -2131,6 +2361,7 @@ fn extract_sidecar_inner(
         manifest
             .as_ref()
             .is_some_and(|manifest| manifest.checkpoint.is_some()),
+        false,
     )?;
 
     if debug {
@@ -2154,8 +2385,15 @@ fn extract_sidecar_inner(
         .unwrap_or_default();
 
     let pack_version = manifest.as_ref().map(|m| m.smolvm_version.as_str());
-    let guest_unpacks_layers = pack_version.is_some_and(packed_agent_unpacks_staged_layers);
-    if !guest_unpacks_layers && !host_unpack_preserves_ownership() && has_layer_tars(cache_dir) {
+    let host_layers =
+        has_layer_tars(cache_dir) && host_layers_via_override_stat(pack_version, cache_dir);
+    let guest_unpacks_layers =
+        !host_layers && pack_version.is_some_and(packed_agent_unpacks_staged_layers);
+    if !host_layers
+        && !guest_unpacks_layers
+        && !host_unpack_preserves_ownership()
+        && has_layer_tars(cache_dir)
+    {
         // Extracting here is what every smolvm did before staging existed, so
         // the pack runs exactly as it always has. Say why anyway: the ownership
         // this loses is silent at extraction time and only shows up later as a
@@ -2177,7 +2415,13 @@ fn extract_sidecar_inner(
         );
     }
 
-    post_process_extraction(cache_dir, &layer_order, guest_unpacks_layers, debug)?;
+    post_process_extraction(
+        cache_dir,
+        &layer_order,
+        guest_unpacks_layers,
+        debug,
+        host_layers,
+    )?;
     Ok(())
 }
 
@@ -2224,7 +2468,7 @@ pub fn extract_from_binary(
         // order from here, so let the agent fall back to a name sort. The stub
         // and the agent it carries were built by the same release, so staging
         // can never outrun the agent the way a sidecar from another version can.
-        post_process_extraction(cache_dir, &[], true, debug)?;
+        post_process_extraction(cache_dir, &[], true, debug, false)?;
         Ok(())
     }
 }
@@ -2266,7 +2510,7 @@ pub unsafe fn extract_from_section(
 
     // Mach-O section self-exec stub: same as embedded mode — name-sort fallback,
     // and likewise self-consistent on staging.
-    post_process_extraction(cache_dir, &[], true, debug)?;
+    post_process_extraction(cache_dir, &[], true, debug, false)?;
     Ok(())
 }
 
@@ -2314,6 +2558,7 @@ fn materialize_tar_dir(
     tar: &Path,
     final_dir: &Path,
     debug: bool,
+    owner_xattr: bool,
 ) -> std::io::Result<Option<UnpackReport>> {
     if final_dir.is_dir() {
         return Ok(None);
@@ -2332,7 +2577,13 @@ fn materialize_tar_dir(
     let unpacked = (|| {
         let tar_file = File::open(tar)?;
         let mut archive = tar::Archive::new(tar_file);
-        safe_unpack(&mut archive, &staging)
+        safe_unpack_with_policy(
+            &mut archive,
+            &staging,
+            &SafeUnpackLimits::from_env(),
+            false,
+            owner_xattr,
+        )
     })();
     let report = match unpacked {
         Ok(report) => report,
@@ -2445,6 +2696,7 @@ fn post_process_extraction(
     layer_order: &[String],
     guest_unpacks_layers: bool,
     debug: bool,
+    owner_xattr: bool,
 ) -> std::io::Result<()> {
     // Extract agent-rootfs.tar to agent-rootfs directory
     let rootfs_tar = cache_dir.join("agent-rootfs.tar");
@@ -2453,7 +2705,7 @@ fn post_process_extraction(
         if debug && !rootfs_dir.exists() {
             eprintln!("debug: extracting agent-rootfs.tar...");
         }
-        materialize_tar_dir(&rootfs_tar, &rootfs_dir, debug)?;
+        materialize_tar_dir(&rootfs_tar, &rootfs_dir, debug, false)?;
     }
 
     // Extract OCI layer tars to layers/{digest}/ directories.
@@ -2523,7 +2775,7 @@ fn post_process_extraction(
                     layer_dir.file_name().unwrap_or_default().to_string_lossy()
                 );
             }
-            if let Some(report) = materialize_tar_dir(tar, layer_dir, debug)? {
+            if let Some(report) = materialize_tar_dir(tar, layer_dir, debug, owner_xattr)? {
                 if debug && report.skipped > 0 {
                     eprintln!(
                         "debug: layer {}: {} entries the host could not represent were skipped",
@@ -2534,6 +2786,9 @@ fn post_process_extraction(
             }
         }
 
+        if owner_xattr {
+            fs::write(extract_dir.join(OPAQUE_XATTR_MARKER), "user\n")?;
+        }
         // Record the manifest's layer order so the guest stacks overlayfs
         // lowerdirs correctly (layer dirs are named by digest and don't sort
         // into stack order). Only ids backed by an extracted dir are written.
@@ -3307,7 +3562,7 @@ pub(crate) fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
             break;
         }
         let chunk = &buf[..n];
-        if chunk.iter().any(|&b| b != 0) {
+        if !crate::is_zero_filled(chunk) {
             dst_file.seek(SeekFrom::Start(offset))?;
             dst_file.write_all(chunk)?;
         }
@@ -3378,7 +3633,7 @@ fn copy_data_extents(src: &mut File, dst: &mut File, size: u64) -> std::io::Resu
             // An extent may be allocated yet zero-filled; keeping the zero test
             // means such regions stay holes in `dst` exactly as before.
             let chunk = &buf[..n];
-            if chunk.iter().any(|&b| b != 0) {
+            if !crate::is_zero_filled(chunk) {
                 dst.write_all(chunk)?;
             } else {
                 dst.seek(SeekFrom::Current(n as i64))?;
@@ -3652,7 +3907,7 @@ mod tests {
         let final_dir = dir.path().join("deadbeef");
 
         std::fs::write(&tar_path, truncated).unwrap();
-        let err = super::materialize_tar_dir(&tar_path, &final_dir, false)
+        let err = super::materialize_tar_dir(&tar_path, &final_dir, false, false)
             .expect_err("a truncated archive must not extract successfully");
         assert!(err.to_string().contains("nothing was kept"), "got: {err}");
         assert!(
@@ -3665,7 +3920,7 @@ mod tests {
         );
 
         std::fs::write(&tar_path, &intact).unwrap();
-        let report = super::materialize_tar_dir(&tar_path, &final_dir, false)
+        let report = super::materialize_tar_dir(&tar_path, &final_dir, false, false)
             .unwrap()
             .expect("a fresh extraction reports what it wrote");
         assert_eq!(report.entries, 2);
@@ -3689,7 +3944,7 @@ mod tests {
 
         let tar_path = dir.path().join("layer.tar");
         std::fs::write(&tar_path, tar_of(&[("usr/fresh", b"ok")])).unwrap();
-        super::materialize_tar_dir(&tar_path, &final_dir, false).unwrap();
+        super::materialize_tar_dir(&tar_path, &final_dir, false, false).unwrap();
 
         assert!(final_dir.join("usr/fresh").is_file());
         assert!(
@@ -3710,7 +3965,7 @@ mod tests {
         let tar_path = dir.path().join("layer.tar");
         std::fs::write(&tar_path, tar_of(&[("would-overwrite", b"no")])).unwrap();
 
-        let reused = super::materialize_tar_dir(&tar_path, &final_dir, false).unwrap();
+        let reused = super::materialize_tar_dir(&tar_path, &final_dir, false, false).unwrap();
         assert!(
             reused.is_none(),
             "nothing is extracted over a complete layer"
@@ -3812,7 +4067,7 @@ mod tests {
         std::fs::write(&tar_path, builder.into_inner().unwrap()).unwrap();
 
         let final_dir = mount.join("layer0");
-        let err = super::materialize_tar_dir(&tar_path, &final_dir, false)
+        let err = super::materialize_tar_dir(&tar_path, &final_dir, false, false)
             .expect_err("3 MB of entries cannot fit a 2 MB volume");
         assert!(
             err.raw_os_error() == Some(libc::ENOSPC)
@@ -3836,7 +4091,7 @@ mod tests {
 
         // With room to spare the very same call completes.
         let roomy = dir.path().join("roomy");
-        super::materialize_tar_dir(&tar_path, &roomy, false).unwrap();
+        super::materialize_tar_dir(&tar_path, &roomy, false, false).unwrap();
         assert!(roomy.join("d63/blob").is_file());
     }
 
@@ -4120,6 +4375,7 @@ mod tests {
             dir.path(),
             &SafeUnpackLimits::from_env(),
             true,
+            false,
         )
         .unwrap();
         let ram = fs::metadata(dir.path().join("checkpoint/memory.bin")).unwrap();
@@ -4898,6 +5154,202 @@ mod tests {
         );
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn host_layers_gate_needs_a_pack_whose_agent_mounts_userxattr() {
+        assert!(!packed_agent_mounts_userxattr("1.16.1"));
+        assert!(!packed_agent_mounts_userxattr("1.8.2"));
+        assert!(packed_agent_mounts_userxattr("1.16.2"));
+        assert!(packed_agent_mounts_userxattr("1.17.0"));
+        assert!(packed_agent_mounts_userxattr("2.0.0"));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn read_user_xattr(path: &Path, name: &str) -> Option<String> {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let c_name = std::ffi::CString::new(name).unwrap();
+        let mut buf = vec![0u8; 64];
+        #[cfg(target_os = "macos")]
+        let n = unsafe {
+            libc::getxattr(
+                c_path.as_ptr(),
+                c_name.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                0,
+                libc::XATTR_NOFOLLOW,
+            )
+        };
+        #[cfg(target_os = "linux")]
+        let n = unsafe {
+            libc::lgetxattr(
+                c_path.as_ptr(),
+                c_name.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        };
+        (n >= 0).then(|| String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+    }
+
+    /// Host-side extraction that describes ownership to the guest: every
+    /// entry's archived owner and mode land in libkrun's override xattr, the
+    /// host copy stays readable, OCI whiteouts become faked 0:0 character
+    /// devices and opaque markers become `user.overlay.opaque`.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn owner_xattr_extraction_records_owners_and_translates_whiteouts() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        if !user_xattrs_supported(root.path()) {
+            return;
+        }
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut add = |path: &str,
+                       kind: tar::EntryType,
+                       mode: u32,
+                       uid: u64,
+                       gid: u64,
+                       data: &[u8],
+                       link: Option<&str>| {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_mode(mode);
+            header.set_uid(uid);
+            header.set_gid(gid);
+            header.set_size(data.len() as u64);
+            if let Some(link) = link {
+                header.set_link_name(link).unwrap();
+            }
+            header.set_cksum();
+            builder.append_data(&mut header, path, data).unwrap();
+        };
+        add(
+            "private/",
+            tar::EntryType::Directory,
+            0o700,
+            1000,
+            1000,
+            b"",
+            None,
+        );
+        add(
+            "private/secret",
+            tar::EntryType::Regular,
+            0o600,
+            1000,
+            1000,
+            b"s",
+            None,
+        );
+        add("bin/", tar::EntryType::Directory, 0o755, 0, 0, b"", None);
+        add(
+            "bin/passwd",
+            tar::EntryType::Regular,
+            0o4755,
+            0,
+            0,
+            b"p",
+            None,
+        );
+        add(
+            "bin/ln",
+            tar::EntryType::Symlink,
+            0o777,
+            0,
+            0,
+            b"",
+            Some("passwd"),
+        );
+        add(
+            "bin/.wh.gone",
+            tar::EntryType::Regular,
+            0o644,
+            0,
+            0,
+            b"",
+            None,
+        );
+        add("ro/", tar::EntryType::Directory, 0o555, 0, 0, b"", None);
+        add(
+            "ro/readme",
+            tar::EntryType::Regular,
+            0o444,
+            0,
+            0,
+            b"r",
+            None,
+        );
+        add(
+            "ro/.wh.old",
+            tar::EntryType::Regular,
+            0o644,
+            0,
+            0,
+            b"",
+            None,
+        );
+        add(
+            "private/.wh..wh..opq",
+            tar::EntryType::Regular,
+            0o644,
+            0,
+            0,
+            b"",
+            None,
+        );
+        let tar_bytes = builder.into_inner().unwrap();
+
+        let dest = root.path().join("layer");
+        fs::create_dir(&dest).unwrap();
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        safe_unpack_with_policy(
+            &mut archive,
+            &dest,
+            &SafeUnpackLimits::from_env(),
+            false,
+            true,
+        )
+        .unwrap();
+
+        let xattr = |rel: &str| read_user_xattr(&dest.join(rel), OVERRIDE_STAT_XATTR);
+        assert_eq!(xattr("private").as_deref(), Some("1000:1000:0700"));
+        assert_eq!(xattr("private/secret").as_deref(), Some("1000:1000:0600"));
+        assert_eq!(xattr("bin/passwd").as_deref(), Some("0:0:04755"));
+        assert!(
+            dest.join("bin/ln").is_symlink(),
+            "symlinks are extracted, never stamped"
+        );
+        assert_eq!(
+            xattr("bin/gone").as_deref(),
+            Some("0:0:020000"),
+            "whiteout becomes a faked 0:0 char device"
+        );
+        assert_eq!(fs::metadata(dest.join("bin/gone")).unwrap().len(), 0);
+        assert!(!dest.join("bin/.wh.gone").exists());
+        assert!(!dest.join("private/.wh..wh..opq").exists());
+        assert_eq!(
+            read_user_xattr(&dest.join("private"), OVERLAY_OPAQUE_XATTR).as_deref(),
+            Some("y")
+        );
+        // The host copy is readable regardless of the archived mode.
+        let host_mode =
+            |rel: &str| fs::metadata(dest.join(rel)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(host_mode("private") & 0o500, 0o500);
+        assert_eq!(host_mode("private/secret") & 0o400, 0o400);
+        assert_eq!(
+            host_mode("bin/passwd") & 0o4000,
+            0,
+            "setuid is virtual, never on the host copy"
+        );
+        // Read-only entries in the archive still take the xattr and stay writable on the host.
+        assert_eq!(xattr("ro").as_deref(), Some("0:0:0555"));
+        assert_eq!(xattr("ro/readme").as_deref(), Some("0:0:0444"));
+        assert_eq!(xattr("ro/old").as_deref(), Some("0:0:020000"));
+        assert_eq!(host_mode("ro") & 0o700, 0o700);
+        assert_eq!(host_mode("ro/readme") & 0o600, 0o600);
     }
 
     #[cfg(unix)]

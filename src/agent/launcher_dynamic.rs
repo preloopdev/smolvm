@@ -816,17 +816,40 @@ pub fn launch_agent_vm_dynamic(
             path_to_cstring(config.layers_dir),
             "layers dir path contains null byte"
         );
+        // Layers the host extracted itself carry their ownership in the
+        // override xattr; the Linux server presents it only when asked.
+        let override_stat = cfg!(target_os = "linux")
+            && config
+                .layers_dir
+                .join(smolvm_pack::extract::OPAQUE_XATTR_MARKER)
+                .is_file();
         // SAFETY: ctx is valid, tag and path are valid C strings
-        if unsafe {
-            add_virtiofs3(
-                ctx,
-                layers_tag.as_ptr(),
-                layers_path.as_ptr(),
-                super::virtiofs::packed_layers_dax_window(),
-                false,
-            )
-        } < 0
-        {
+        let added = if override_stat {
+            let Some(add_virtiofs4) = krun.add_virtiofs4 else {
+                free_ctx_on_err!("host-extracted layers require libkrun with krun_add_virtiofs4");
+            };
+            unsafe {
+                add_virtiofs4(
+                    ctx,
+                    layers_tag.as_ptr(),
+                    layers_path.as_ptr(),
+                    super::virtiofs::packed_layers_dax_window(),
+                    false,
+                    super::krun::KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT,
+                )
+            }
+        } else {
+            unsafe {
+                add_virtiofs3(
+                    ctx,
+                    layers_tag.as_ptr(),
+                    layers_path.as_ptr(),
+                    super::virtiofs::packed_layers_dax_window(),
+                    false,
+                )
+            }
+        };
+        if added < 0 {
             free_ctx_on_err!("krun_add_virtiofs failed for packed layers");
         }
     }

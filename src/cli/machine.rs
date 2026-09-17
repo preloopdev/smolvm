@@ -3925,8 +3925,7 @@ impl CreateCmd {
 
             println!("Extracting .smolmachine assets...");
             let result = if stored {
-                smolvm::checkpoint_store::materialize(sidecar_path, &cache_dir)
-                    .map_err(|e| smolvm::Error::agent("materialize checkpoint", e.to_string()))?;
+                smolvm::portable_checkpoint::materialize_for_restore(sidecar_path, &cache_dir)?;
                 Ok((cache_dir.clone(), None))
             } else if smolvm_pack::extract::shared_extract_enabled() {
                 #[cfg(target_os = "linux")]

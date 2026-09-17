@@ -1739,12 +1739,24 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 return Err(Error::agent("restore RAM", "invalid input descriptor"));
             }
             let input = OwnedFd::from_raw_fd(fd);
-            let set_memory = try_or_free_ctx!(
-                krun.set_snapshot_memory_fd.ok_or(()),
-                "restore RAM",
-                "libkrun lacks read-only snapshot memory support"
-            );
-            let result = set_memory(ctx, input.as_raw_fd());
+            // This descriptor comes from open_readonly_memory: verified
+            // service-owned input beneath a private directory, never a guest
+            // writable file. Its bytes remain immutable; cleanup only unlinks
+            // names, while libkrun and descendants retain their descriptors.
+            let (result, backend) = if let Some(set_memory) = krun.set_snapshot_memory_fd2 {
+                const IMMUTABLE: u32 = 1;
+                (
+                    set_memory(ctx, input.as_raw_fd(), IMMUTABLE),
+                    "immutable-file",
+                )
+            } else {
+                let set_memory = try_or_free_ctx!(
+                    krun.set_snapshot_memory_fd.ok_or(()),
+                    "restore RAM",
+                    "libkrun lacks read-only snapshot memory support"
+                );
+                (set_memory(ctx, input.as_raw_fd()), "private-copy")
+            };
             if result < 0 {
                 krun_free_ctx(ctx);
                 return Err(Error::agent(
@@ -1752,6 +1764,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     format!("libkrun rejected read-only input: {result}"),
                 ));
             }
+            tracing::info!(backend, "configured checkpoint RAM backing");
         }
         if let Ok(snap_dir) = std::env::var("SMOLVM_SNAPSHOT_DIR") {
             if !snap_dir.is_empty() {
@@ -1871,21 +1884,45 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             if layers_dir.exists() {
                 let tag = cstr("smolvm_layers");
                 let host_path = path_to_cstring(layers_dir)?;
-                let Some(add_virtiofs3) = krun_add_virtiofs3 else {
-                    krun_free_ctx(ctx);
-                    return Err(Error::agent(
-                        "add packed layers virtiofs",
-                        "packed-layer DAX requires libkrun with krun_add_virtiofs3",
-                    ));
+                // Layers the host extracted itself carry their ownership in the
+                // override xattr; the Linux server presents it only when asked.
+                let override_stat = cfg!(target_os = "linux")
+                    && layers_dir
+                        .join(smolvm_pack::extract::OPAQUE_XATTR_MARKER)
+                        .is_file();
+                let added = if override_stat {
+                    let Some(add_virtiofs4) = krun.add_virtiofs4 else {
+                        krun_free_ctx(ctx);
+                        return Err(Error::agent(
+                            "add packed layers virtiofs",
+                            "host-extracted layers require libkrun with krun_add_virtiofs4",
+                        ));
+                    };
+                    add_virtiofs4(
+                        ctx,
+                        tag.as_ptr(),
+                        host_path.as_ptr(),
+                        super::virtiofs::packed_layers_dax_window(),
+                        false,
+                        super::krun::KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT,
+                    )
+                } else {
+                    let Some(add_virtiofs3) = krun_add_virtiofs3 else {
+                        krun_free_ctx(ctx);
+                        return Err(Error::agent(
+                            "add packed layers virtiofs",
+                            "packed-layer DAX requires libkrun with krun_add_virtiofs3",
+                        ));
+                    };
+                    add_virtiofs3(
+                        ctx,
+                        tag.as_ptr(),
+                        host_path.as_ptr(),
+                        super::virtiofs::packed_layers_dax_window(),
+                        false,
+                    )
                 };
-                if add_virtiofs3(
-                    ctx,
-                    tag.as_ptr(),
-                    host_path.as_ptr(),
-                    super::virtiofs::packed_layers_dax_window(),
-                    false,
-                ) < 0
-                {
+                if added < 0 {
                     krun_free_ctx(ctx);
                     return Err(Error::agent(
                         "add packed layers virtiofs",

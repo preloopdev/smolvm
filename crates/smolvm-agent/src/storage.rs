@@ -762,6 +762,37 @@ const GUEST_LAYERS_DIR: &str = "packed-layers";
 /// set's signature so a restart reuses the work and a changed pack redoes it.
 const GUEST_LAYERS_MARKER: &str = ".extracted";
 
+/// Written by the host beside layers it extracted itself, declaring that their
+/// opaque-directory markers use `user.overlay.*`. Absent means `trusted.*`,
+/// which every existing `.smolmachine` uses, so older artifacts are untouched.
+const OPAQUE_XATTR_MARKER: &str = "opaque-xattr";
+
+/// Whether the packed layers carry `user.overlay.*` opaque markers, which the
+/// overlay must be mounted with `userxattr` to honor. Getting this pairing
+/// wrong fails silently (stale lower content shows through), so the producer
+/// declares it rather than the consumer guessing.
+/// `,userxattr` when the packed layers need it, for the mount(8) fallback.
+fn userxattr_mount_suffix() -> &'static str {
+    if packed_layers_use_userxattr() {
+        ",userxattr"
+    } else {
+        ""
+    }
+}
+
+pub fn packed_layers_use_userxattr() -> bool {
+    static USERXATTR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *USERXATTR.get_or_init(|| {
+        get_packed_layers_dir()
+            .map(|dir| {
+                std::fs::read_to_string(dir.join(OPAQUE_XATTR_MARKER))
+                    .map(|value| value.trim() == "user")
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    })
+}
+
 /// The layer tars a host staged for us rather than unpacking itself, if any.
 ///
 /// A `.tar` whose sibling directory already exists was unpacked by the host, so
@@ -4491,6 +4522,12 @@ fn mount_overlay_fsconfig(
     // Preserve prior semantics: index=off disables the inode-index feature.
     fsconfig_set_string(fs.as_fd(), "index", "off")
         .map_err(|e| StorageError::new(format!("fsconfig index=off failed: {e}")))?;
+    // Host-extracted layers mark opaque dirs in the `user.*` namespace; the
+    // kernel only consults it when mounted with `userxattr`.
+    if packed_layers_use_userxattr() {
+        rustix::mount::fsconfig_set_flag(fs.as_fd(), "userxattr")
+            .map_err(|e| StorageError::new(format!("fsconfig userxattr failed: {e}")))?;
+    }
 
     fsconfig_create(fs.as_fd())
         .map_err(|e| StorageError::new(format!("fsconfig create (overlay) failed: {e}")))?;
@@ -4759,10 +4796,11 @@ fn mount_overlay_sequential(
     // If only one layer, mount directly
     if lowerdirs.len() == 1 {
         let mount_opts = format!(
-            "lowerdir={},upperdir={},workdir={},index=off",
+            "lowerdir={},upperdir={},workdir={},index=off{}",
             lowerdirs[0],
             upper_path.display(),
-            work_path.display()
+            work_path.display(),
+            userxattr_mount_suffix()
         );
 
         let output = Command::new("mount")
@@ -4836,10 +4874,11 @@ fn mount_overlay_sequential(
 
     // Now mount a simple overlay with just the merged directory as lowerdir
     let mount_opts = format!(
-        "lowerdir={},upperdir={},workdir={},index=off",
+        "lowerdir={},upperdir={},workdir={},index=off{}",
         merged_layers_dir.display(),
         upper_path.display(),
-        work_path.display()
+        work_path.display(),
+        userxattr_mount_suffix()
     );
 
     let output = Command::new("mount")

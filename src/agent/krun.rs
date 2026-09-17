@@ -8,6 +8,28 @@
 use crate::util::{libkrun_filename, libkrunfw_filename};
 use std::path::{Path, PathBuf};
 
+/// Serve ownership and mode from the `user.containers.override_stat` xattr
+/// (see libkrun's `KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT`).
+pub const KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT: u32 = 1 << 0;
+
+/// Whether the libkrun this binary would load can serve host-extracted image
+/// layers with their recorded ownership: on macOS and Windows the server
+/// always does; on Linux it needs `krun_add_virtiofs4`. Registered with the
+/// pack crate so extraction can choose that path.
+pub fn host_layers_supported() -> bool {
+    if cfg!(any(target_os = "macos", target_os = "windows")) {
+        return true;
+    }
+    let Some(lib_dir) = crate::agent::launcher::find_lib_dir() else {
+        return false;
+    };
+    // SAFETY: loading libkrun has no side effects beyond dlopen; nothing is
+    // called through the loaded functions here.
+    unsafe { KrunFunctions::load(&lib_dir) }
+        .map(|krun| krun.add_virtiofs4.is_some())
+        .unwrap_or(false)
+}
+
 /// Function pointers loaded from libkrun.
 ///
 /// Required symbols are loaded eagerly. Optional symbols are exposed as
@@ -55,6 +77,11 @@ pub struct KrunFunctions {
     pub add_virtiofs: unsafe extern "C" fn(u32, *const libc::c_char, *const libc::c_char) -> i32,
     pub add_virtiofs3: Option<
         unsafe extern "C" fn(u32, *const libc::c_char, *const libc::c_char, u64, bool) -> i32,
+    >,
+    /// `krun_add_virtiofs3` with per-share flags; `KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT`
+    /// makes the Linux server present ownership from the override xattr.
+    pub add_virtiofs4: Option<
+        unsafe extern "C" fn(u32, *const libc::c_char, *const libc::c_char, u64, bool, u32) -> i32,
     >,
     pub start_enter: unsafe extern "C" fn(u32) -> i32,
     pub get_last_error: Option<unsafe extern "C" fn() -> *const libc::c_char>,
@@ -121,6 +148,8 @@ pub struct KrunFunctions {
     /// VM's RAM + restore state instead of cold-booting).
     pub set_snapshot: Option<unsafe extern "C" fn(u32, *const libc::c_char) -> i32>,
     pub set_snapshot_memory_fd: Option<unsafe extern "C" fn(u32, i32) -> i32>,
+    /// Opt into immutable backing retained across restored branches.
+    pub set_snapshot_memory_fd2: Option<unsafe extern "C" fn(u32, i32, u32) -> i32>,
     /// Create a qcow2 copy-on-write overlay backed by an existing disk image
     /// (used for fork-clone block disks). Pure filesystem op; takes no ctx.
     pub create_disk_overlay:
@@ -200,6 +229,7 @@ impl KrunFunctions {
         let add_vsock_port2 = load_sym!(krun_add_vsock_port2);
         let add_virtiofs = load_sym!(krun_add_virtiofs);
         let add_virtiofs3 = load_optional_sym!("krun_add_virtiofs3");
+        let add_virtiofs4 = load_optional_sym!("krun_add_virtiofs4");
         let start_enter = load_sym!(krun_start_enter);
         let get_last_error = load_optional_sym!("krun_get_last_error");
         let add_vsock = load_sym!(krun_add_vsock);
@@ -217,6 +247,7 @@ impl KrunFunctions {
         let set_control_socket = load_optional_sym!("krun_set_control_socket");
         let set_snapshot = load_optional_sym!("krun_set_snapshot");
         let set_snapshot_memory_fd = load_optional_sym!("krun_set_snapshot_memory_fd");
+        let set_snapshot_memory_fd2 = load_optional_sym!("krun_set_snapshot_memory_fd2");
         let create_disk_overlay = load_optional_sym!("krun_create_disk_overlay");
 
         Ok(Self {
@@ -236,6 +267,7 @@ impl KrunFunctions {
             add_vsock_port2,
             add_virtiofs,
             add_virtiofs3,
+            add_virtiofs4,
             start_enter,
             get_last_error,
             add_vsock,
@@ -253,6 +285,7 @@ impl KrunFunctions {
             set_control_socket,
             set_snapshot,
             set_snapshot_memory_fd,
+            set_snapshot_memory_fd2,
             create_disk_overlay,
         })
     }

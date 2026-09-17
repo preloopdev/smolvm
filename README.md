@@ -354,18 +354,23 @@ ANGLE (Intel, Vulkan 1.4 (Virtio-GPU Venus (Intel(R) UHD Graphics ...)), venus)
 
 ```bash
 # CLI
-smolvm machine run --gpu --image alpine -- vulkaninfo --summary
+smolvm machine run --net --gpu --image alpine -- sh -c '
+  apk add --no-cache mesa-vulkan-virtio vulkan-loader vulkan-tools
+  vulkaninfo --summary | grep deviceName
+'
+# → deviceName = Virtio-GPU Venus (Apple M1 Pro)
 
 # Smolfile
 # gpu = true
 # gpu_vram = 2048   # MiB, default 4096
 ```
 
-The guest Vulkan loader must be pointed at the virtio ICD:
-
-```bash
-export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.x86_64.json
-```
+Nothing needs to set `VK_ICD_FILENAMES`: the guest's Mesa installs an ICD
+manifest the Vulkan loader finds on its own, and on a glibc image smolvm also
+bind-mounts its own Venus driver and points the loader at it. Set the variable
+only to override that choice — and note the manifest name carries the
+architecture (`virtio_icd.x86_64.json` / `virtio_icd.aarch64.json`), so a
+hardcoded path is wrong on the other arch.
 
 ### Headless browser example
 

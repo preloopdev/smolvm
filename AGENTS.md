@@ -331,9 +331,8 @@ Not available on Windows (WHP) — `--gpu` has no effect there.
 
 ```bash
 # One-shot GPU workload
-smolvm machine run --gpu --image alpine -- sh -c '
-  apk add --no-cache mesa-vulkan-virtio vulkan-tools
-  VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.x86_64.json \
+smolvm machine run --net --gpu --image alpine -- sh -c '
+  apk add --no-cache mesa-vulkan-virtio vulkan-loader vulkan-tools
   vulkaninfo --summary 2>/dev/null | grep deviceName
 '
 # → deviceName = Virtio-GPU Venus (Intel(R) UHD Graphics ...)
@@ -346,12 +345,16 @@ smolvm machine exec --name browser -- \
     --screenshot=/tmp/out.png --window-size=1280,800 https://example.com
 ```
 
-The guest must set `VK_ICD_FILENAMES` so the Vulkan loader finds the virtio ICD. Put it in `env` in a Smolfile to avoid repeating it on every exec:
+The guest does not need `VK_ICD_FILENAMES`: Mesa's ICD manifest is where the
+Vulkan loader already looks, and on a glibc image smolvm bind-mounts its own
+Venus driver and pins the loader to it. Setting the variable overrides that
+pin, and the manifest name is architecture-specific
+(`virtio_icd.x86_64.json` / `virtio_icd.aarch64.json`), so a hardcoded path
+breaks on the other arch:
 
 ```toml
 gpu = true
 gpu_vram = 2048
-env = ["VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.x86_64.json"]
 ```
 
 For a complete working example see [`examples/headless-browser/browser.smolfile`](examples/headless-browser/browser.smolfile).

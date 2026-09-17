@@ -406,6 +406,12 @@ pub fn machine_layers_cache_dir(name: &str) -> PathBuf {
     vm_data_dir(name).join("pack")
 }
 
+/// A pristine clone of the most recently restored checkpoint, kept so the
+/// next restore only writes the chunks that differ from it.
+pub fn restore_base_dir() -> PathBuf {
+    vm_cache_root().join("_restore-base")
+}
+
 /// Filename of the shared-pack pointer dropped beside a machine's
 /// [`machine_layers_cache_dir`] when create extracted the pack into the node's
 /// shared content-addressed store (`_shared/<checksum>`) instead of a private

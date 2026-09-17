@@ -41,9 +41,11 @@
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
-# mesa-vulkan-virtio (the guest virtio Vulkan ICD) is not in Alpine 3.21 stable.
-# Use edge until Alpine 3.22 is released.
-image = "alpine:edge"
+# Stable Alpine carries mesa-vulkan-virtio (the guest virtio Vulkan ICD), so
+# there is no reason to track edge. Edge is a rolling tag: it moves onto Mesa
+# releases nobody has run against this host stack yet, which is how a working
+# example quietly turns into an ERROR_OUT_OF_HOST_MEMORY report.
+image = "alpine:latest"
 
 cpus = 4
 memory = 4096
@@ -51,14 +53,12 @@ gpu = true
 gpu_vram = 2048
 net = true
 
-# Venus Vulkan ICD — tells the Vulkan loader where to find the virtio GPU driver.
-# The path is architecture-specific. Change x86_64 → aarch64 on ARM hosts.
-#
-#   x86_64:  VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.x86_64.json
-#   aarch64: VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.aarch64.json
-env = [
-    "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.x86_64.json",
-]
+# No VK_ICD_FILENAMES here on purpose. mesa-vulkan-virtio installs an ICD
+# manifest the Vulkan loader finds on its own, and the manifest name carries
+# the architecture (virtio_icd.x86_64.json / virtio_icd.aarch64.json), so any
+# hardcoded path is wrong on the other arch. Pinning it also opts the workload
+# out of the patched Venus driver smolvm injects into --gpu containers, since
+# an explicit driver choice always wins (crates/smolvm-agent/src/vulkan.rs).
 
 [dev]
 # Install Chromium and the Mesa Venus Vulkan driver.
