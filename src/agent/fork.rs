@@ -846,11 +846,18 @@ pub fn rejuvenate_clone(clone: &str) -> Result<()> {
 fn rejuvenate_once(sock: &Path, script: &str) -> std::result::Result<(), String> {
     let mut client =
         AgentClient::connect_with_retry(sock).map_err(|e| format!("agent connect: {e}"))?;
+    // The re-mint script regenerates SSH host keys (), and
+    // RSA keygen under concurrent fork load routinely exceeds 10s — the exec
+    // deadline then SIGKILLs mid-script and the fail-closed retry loop burns
+    // all attempts the same way (observed: 10-way pool fork on a Mac Studio,
+    // every clone died at rejuvenate-stage=identity). 75s covers the slowest
+    // observed keygen with headroom; the script itself is idempotent so a
+    // longer budget cannot corrupt state.
     match client.vm_exec(
         vec!["/bin/sh".into(), "-c".into(), script.to_string()],
         vec![],
         None,
-        Some(std::time::Duration::from_secs(10)),
+        Some(std::time::Duration::from_secs(75)),
         None,
     ) {
         Ok((0, _, _)) => Ok(()),
