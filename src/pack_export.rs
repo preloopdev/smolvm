@@ -630,9 +630,14 @@ fn prepare_export_layer_mount(
         && features.packed_layers_dir.is_some()
     {
         let helper_layers = helper_dir.join("pack");
-        let lease = crate::artifact_cache::copy_shared_pack_lease(&source_layers, &helper_layers)
-            .map_err(|error| Error::agent("lease export layers", error.to_string()))?
-            .ok_or_else(|| Error::agent("lease export layers", "source lease disappeared"))?;
+        // No sidecar: an export leases a source whose entry resolved a moment
+        // ago, so an entry that is gone now is a real race and must fail rather
+        // than re-extract under the exporter — or, worse, quietly fall back to
+        // private layers and export something the source is not.
+        let lease =
+            crate::artifact_cache::copy_shared_pack_lease(&source_layers, &helper_layers, None)
+                .map_err(|error| Error::agent("lease export layers", error.to_string()))?
+                .ok_or_else(|| Error::agent("lease export layers", "source lease disappeared"))?;
         // The helper drops to the source UID; root-owned shared layers must
         // reach it through an idmapped mount, not the private cache path.
         features.packed_layers_dir = Some(helper_layers);

@@ -336,27 +336,29 @@ pub struct LaunchFeatures {
     pub uid_share_dir: Option<std::path::PathBuf>,
 }
 
-/// Whether a shared-pack-store `layers/` dir actually holds image layers — i.e.
-/// contains at least one subdirectory (a digest layer dir). A shared entry whose
-/// dir survives but whose `layers/` is missing or holds no layer dirs would boot
-/// an empty `/packed_layers` and make the guest fail "no layer directories
-/// found"; this drives the self-heal re-extract in `with_packed_layers`.
-/// Whether the pack at `sidecar` carries OCI image layers. Reads only its
-/// manifest. When the manifest can't be read, assume it does, so the launch
-/// self-heal still gets its chance (it is best-effort and reports failures).
-fn pack_has_image_layers(sidecar: &Path) -> bool {
-    smolvm_pack::packer::read_manifest_from_sidecar(sidecar)
-        .map(|manifest| !manifest.assets.layers.is_empty())
-        .unwrap_or(true)
-}
-
-fn shared_layers_populated(layers: &Path) -> bool {
-    std::fs::read_dir(layers)
-        .map(|rd| rd.flatten().any(|e| e.path().is_dir()))
-        .unwrap_or(false)
-}
-
 impl LaunchFeatures {
+    /// Point the launch at a shared store entry the machine leases.
+    ///
+    /// `layers_cache_dir` is the machine's own `pack` mountpoint and `shared` the
+    /// leased `_shared/<checksum>` entry. The guest stacks image layers from the
+    /// entry's `layers/` subdir — its `layer-order` index and digest dirs live
+    /// there. Present that subdir, NOT the entry root: otherwise the guest
+    /// name-sorts the root's entries and mis-stacks `agent-rootfs/` as an image
+    /// layer alongside `layers/`, surfacing the pack's internals (`<digest>/`,
+    /// `<digest>.tar`, `layer-order`) at the container `/` and running the agent
+    /// rootfs instead of the real image. A VM-mode entry has no `layers/` at all
+    /// (it boots from disks), so the root itself is the mount source there.
+    #[cfg(target_os = "linux")]
+    fn mount_shared_pack(&mut self, layers_cache_dir: &Path, shared: &Path) {
+        let layers = shared.join("layers");
+        self.packed_layers_dir = Some(layers_cache_dir.to_path_buf());
+        self.pack_idmap_source = Some(if layers.is_dir() {
+            layers
+        } else {
+            shared.to_path_buf()
+        });
+    }
+
     /// Fold an image's own registry into the enforced DNS egress filter so a
     /// scoped machine's in-guest base-image pull isn't blocked by its own
     /// allow-list.
@@ -441,50 +443,42 @@ impl LaunchFeatures {
         // `agent-rootfs/` as an image layer alongside `layers/`, surfacing the
         // pack's internals (`<digest>/`, `<digest>.tar`, `layer-order`) at the
         // container `/` and running the agent rootfs instead of the real image.
-        if let Some(shared) = super::read_shared_pack_pointer(layers_cache_dir) {
-            let layers = shared.join("layers");
-            // Self-heal: the shared entry's dir survived but its `layers/` holds
-            // no layer subdirs (a partial extraction, or an older binary that
-            // size-evicted the shared store's contents out from under this VM).
-            // Booting over that mounts an empty `/packed_layers` and the guest
-            // fails "no layer directories found in /packed_layers" (exit 255 on
-            // connect/exec). Re-extract the pack into the shared store from the
-            // sidecar first — idempotent + flock-serialized (a healthy entry is a
-            // cheap no-op via the `.smolvm-extracted` marker). Best-effort: if the
-            // sidecar is gone we proceed and surface the original error rather than
-            // masking it.
-            //
-            // A VM-mode pack carries disks, not image layers, so its `layers/`
-            // is empty by design: only a pack that has layers can have lost them.
-            // Without this check every launch of a VM-mode machine (each start,
-            // each branch child) re-ran the extraction and its full-pack digest.
-            if !shared_layers_populated(&layers) && pack_has_image_layers(Path::new(sidecar_path)) {
-                let sidecar = Path::new(sidecar_path);
-                if sidecar.exists() {
-                    if let Ok(footer) = smolvm_pack::packer::read_footer_from_sidecar(sidecar) {
-                        if let Err(e) = smolvm_pack::extract::extract_sidecar_shared(
-                            sidecar,
-                            &super::shared_pack_cache_root(),
-                            &footer,
-                            false,
-                        ) {
-                            tracing::warn!(
-                                error = %e,
-                                shared = %shared.display(),
-                                "shared pack re-extract (self-heal) failed"
-                            );
-                        } else {
-                            tracing::info!(
-                                shared = %shared.display(),
-                                "re-extracted evicted shared pack before launch"
-                            );
-                        }
-                    }
+        //
+        // Resolution also repairs a store entry that was evicted out from under
+        // this machine (pruned, or removed by an out-of-band sweep) from the
+        // source pack, under the artifact-cache lock: without that, booting a
+        // machine whose pointer dangles re-extracts the pack PRIVATELY into its
+        // own `pack/`, duplicating a multi-gigabyte extraction per machine.
+        // A pointer that cannot be restored (no source pack, or a different
+        // artifact) falls through to that private extraction, which keeps the
+        // machine bootable; a malformed pointer is an error.
+        //
+        // The store is a Linux-only layout (create writes the pointer only when
+        // `shared_extract_enabled`), so on macOS the pointer is left alone and
+        // the machine takes its private path.
+        #[cfg(target_os = "linux")]
+        {
+            let machine_dir = layers_cache_dir.parent().ok_or_else(|| {
+                Error::agent(
+                    "start machine",
+                    format!(
+                        "packed layers cache has no machine directory: {}",
+                        layers_cache_dir.display()
+                    ),
+                )
+            })?;
+            match crate::artifact_cache::resolve_machine_pack(
+                machine_dir,
+                Some(Path::new(sidecar_path)),
+            )
+            .map_err(|e| Error::agent("resolve shared pack", e.to_string()))?
+            {
+                crate::artifact_cache::PackSource::Shared(lease) => {
+                    self.mount_shared_pack(layers_cache_dir, &lease.shared_dir);
+                    return Ok(self);
                 }
+                crate::artifact_cache::PackSource::Private => {}
             }
-            self.packed_layers_dir = Some(layers_cache_dir.to_path_buf());
-            self.pack_idmap_source = Some(if layers.is_dir() { layers } else { shared });
-            return Ok(self);
         }
 
         let marker_present = smolvm_pack::extract::is_extracted(layers_cache_dir);
@@ -2840,28 +2834,6 @@ fn spawn_idle_reclaim(ctl: PathBuf, memory_mib: u32, idle_minutes: u64) {
 
 #[cfg(test)]
 mod tests {
-    /// A VM-mode pack has no image layers, so launching its machines must not
-    /// treat the empty `layers/` as evicted and re-extract the pack (#1454).
-    #[test]
-    fn layerless_packs_skip_the_launch_self_heal() {
-        let dir = tempfile::tempdir().unwrap();
-        let pack = dir.path().join("vm.smolmachine");
-        let manifest = smolvm_pack::format::PackManifest::new(
-            "vm://saved".into(),
-            "none".into(),
-            "linux/amd64".into(),
-            "linux/amd64".into(),
-        );
-        smolvm_pack::packer::Packer::new(manifest)
-            .pack_artifact_with_identity(&pack)
-            .unwrap();
-        assert!(!super::pack_has_image_layers(&pack));
-        // An unreadable pack keeps the best-effort self-heal.
-        assert!(super::pack_has_image_layers(
-            &dir.path().join("missing.smolmachine")
-        ));
-    }
-
     use super::*;
     use std::fs;
 
@@ -3052,34 +3024,22 @@ mod tests {
         assert_eq!(f.dns_filter_hosts.unwrap(), vec!["api.anthropic.com"]);
     }
 
-    /// Build a machine `pack` dir plus a `.pack-shared` pointer in its parent that
-    /// names `shared`, mirroring what create writes when the pack lands in the
-    /// node's content-addressed store. Returns the layers cache dir to pass to
-    /// [`LaunchFeatures::with_packed_layers`].
-    fn machine_with_pointer(root: &Path, shared: &Path) -> PathBuf {
-        let layers_cache_dir = root.join("vm").join("pack");
-        fs::create_dir_all(&layers_cache_dir).unwrap();
-        let pointer = super::super::shared_pack_pointer_path(&layers_cache_dir);
-        fs::write(&pointer, shared.to_string_lossy().as_bytes()).unwrap();
-        layers_cache_dir
-    }
-
-    // Regression: the shared-store branch must present the `layers/` SUBDIR of the
-    // shared copy as the idmap source, not the store root. Carrying the root let
-    // the guest name-sort `agent-rootfs/` + `layers/` and mis-stack the agent
-    // rootfs as an image layer, surfacing pack internals (`<digest>/`, `.tar`,
-    // `layer-order`) at the container `/`.
+    // Regression: a shared-store entry must present its `layers/` SUBDIR as the
+    // idmap source, not the store root. Carrying the root let the guest
+    // name-sort `agent-rootfs/` + `layers/` and mis-stack the agent rootfs as an
+    // image layer, surfacing pack internals (`<digest>/`, `.tar`, `layer-order`)
+    // at the container `/`.
     #[test]
+    #[cfg(target_os = "linux")]
     fn shared_pack_idmap_source_targets_layers_subdir() {
         let tmp = tempfile::tempdir().unwrap();
-        let shared = tmp.path().join("_shared").join("ea92da8fcheck");
+        let shared = tmp.path().join("_shared").join("ea92da8f");
         fs::create_dir_all(shared.join("layers").join("25f1d6b1951a")).unwrap();
         fs::create_dir_all(shared.join("agent-rootfs")).unwrap();
-        let layers_cache_dir = machine_with_pointer(tmp.path(), &shared);
+        let layers_cache_dir = tmp.path().join("vm").join("pack");
 
-        let features = LaunchFeatures::default()
-            .with_packed_layers(&layers_cache_dir, Some("dummy.smolmachine"))
-            .unwrap();
+        let mut features = LaunchFeatures::default();
+        features.mount_shared_pack(&layers_cache_dir, &shared);
 
         // The guest mounts the per-machine `pack` mountpoint...
         assert_eq!(
@@ -3093,20 +3053,20 @@ mod tests {
         );
     }
 
-    // A shared copy with no `layers/` subdir (hypothetical/legacy layout) falls
-    // back to the store root so boot still has a valid idmap source rather than
-    // pointing at a path that doesn't exist (internal_boot fails closed on a
-    // missing source).
+    // A shared copy with no `layers/` subdir (a VM-mode entry, or a legacy
+    // layout) falls back to the store root so boot still has a valid idmap
+    // source rather than pointing at a path that doesn't exist (internal_boot
+    // fails closed on a missing source).
     #[test]
+    #[cfg(target_os = "linux")]
     fn shared_pack_idmap_falls_back_to_root_without_layers_subdir() {
         let tmp = tempfile::tempdir().unwrap();
-        let shared = tmp.path().join("_shared").join("deadbeefcheck");
+        let shared = tmp.path().join("_shared").join("deadbeef");
         fs::create_dir_all(&shared).unwrap();
-        let layers_cache_dir = machine_with_pointer(tmp.path(), &shared);
+        let layers_cache_dir = tmp.path().join("vm").join("pack");
 
-        let features = LaunchFeatures::default()
-            .with_packed_layers(&layers_cache_dir, Some("dummy.smolmachine"))
-            .unwrap();
+        let mut features = LaunchFeatures::default();
+        features.mount_shared_pack(&layers_cache_dir, &shared);
 
         assert_eq!(
             features.pack_idmap_source.as_deref(),
