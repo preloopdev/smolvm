@@ -14,7 +14,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -28,6 +28,16 @@ pub struct SharedPackLease {
     pub shared_dir: PathBuf,
     /// Full SHA-256 used to key immutable COW disk bases.
     pub artifact_sha256: String,
+}
+
+/// Where a machine's packed layers are extracted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PackSource {
+    /// The machine leases an entry in the node's shared pack store.
+    Shared(SharedPackLease),
+    /// The machine extracts, or has already extracted, the pack under its own
+    /// `pack/` directory (`machine_layers_cache_dir`).
+    Private,
 }
 
 /// One unused artifact selected by reference-aware cache pruning.
@@ -154,7 +164,27 @@ fn is_lower_hex(value: &str, len: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+/// Resolve the shared store entry a pointer names.
+///
+/// The pointer must name one content-addressed directory directly under the
+/// store root. That shape is checked without requiring the entry (or the store)
+/// to exist, so a target that is merely gone — an evicted extraction, or a store
+/// removed out from under a live machine — reports [`io::ErrorKind::NotFound`]
+/// and may be re-materialized, while a pointer that names anything else stays
+/// [`io::ErrorKind::InvalidData`].
 fn canonical_shared_dir(shared_dir: &Path, shared_root: &Path) -> io::Result<PathBuf> {
+    let (shared, present) = canonical_shared_entry(shared_dir, shared_root)?;
+    if !present {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("shared pack entry is missing: {}", shared.display()),
+        ));
+    }
+    Ok(shared)
+}
+
+/// [`canonical_shared_dir`] plus whether the entry it names is still on disk.
+fn canonical_shared_entry(shared_dir: &Path, shared_root: &Path) -> io::Result<(PathBuf, bool)> {
     if !shared_dir.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -164,18 +194,49 @@ fn canonical_shared_dir(shared_dir: &Path, shared_root: &Path) -> io::Result<Pat
             ),
         ));
     }
-    validate_real_cache_root(shared_root)?;
-    let original_metadata = fs::symlink_metadata(shared_dir)?;
-    if !original_metadata.file_type().is_dir() || original_metadata.file_type().is_symlink() {
+    // Reject `.` and `..` before touching the filesystem. Letting
+    // `canonicalize_allow_missing` resolve them first would make a lexical
+    // escape — `_shared/missing/../deadbeef` — report itself as a *missing*
+    // entry when `missing` does not exist, and a missing entry is exactly the
+    // state callers re-materialize.
+    if shared_dir
+        .components()
+        .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "shared pack target is not a real directory: {}",
+                "shared pack pointer has a non-normal component: {}",
                 shared_dir.display()
             ),
         ));
     }
-    let root = shared_root.canonicalize().map_err(|error| {
+    match fs::symlink_metadata(shared_root) {
+        Ok(_) => validate_real_cache_root(shared_root)?,
+        // The store itself is gone: the entry it held is missing, not malformed.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let present = match fs::symlink_metadata(shared_dir) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "shared pack target is not a real directory: {}",
+                        shared_dir.display()
+                    ),
+                ));
+            }
+            true
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    // `canonicalize` needs every component to exist, so canonicalize the part
+    // that does and re-append the rest: an entry removed after it was published
+    // must still be recognized as the store entry this pointer names.
+    let root = canonicalize_allow_missing(shared_root).map_err(|error| {
         io::Error::new(
             error.kind(),
             format!(
@@ -184,7 +245,7 @@ fn canonical_shared_dir(shared_dir: &Path, shared_root: &Path) -> io::Result<Pat
             ),
         )
     })?;
-    let shared = shared_dir.canonicalize().map_err(|error| {
+    let shared = canonicalize_allow_missing(shared_dir).map_err(|error| {
         io::Error::new(
             error.kind(),
             format!("canonicalize shared pack {}: {error}", shared_dir.display()),
@@ -203,7 +264,36 @@ fn canonical_shared_dir(shared_dir: &Path, shared_root: &Path) -> io::Result<Pat
             ),
         ));
     }
-    Ok(shared)
+    Ok((shared, present))
+}
+
+/// Canonicalize `path` as far as it exists and re-append the components that do
+/// not, so a path whose tail was removed can still be compared with one that is
+/// still on disk.
+fn canonicalize_allow_missing(path: &Path) -> io::Result<PathBuf> {
+    let mut missing = Vec::new();
+    let mut current = path;
+    loop {
+        match current.canonicalize() {
+            Ok(canonical) => {
+                return Ok(missing
+                    .iter()
+                    .rev()
+                    .fold(canonical, |base, name| base.join(name)));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let Some(name) = current.file_name() else {
+                    return Err(error);
+                };
+                missing.push(name.to_os_string());
+                match current.parent() {
+                    Some(parent) if !parent.as_os_str().is_empty() => current = parent,
+                    _ => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn read_artifact_digest(shared_dir: &Path) -> io::Result<String> {
@@ -259,15 +349,38 @@ fn read_lease_from_machine_dir(
     let Some(shared_dir) = read_leased_shared_dir(machine_dir, shared_root)? else {
         return Ok(None);
     };
-    let artifact_sha256 = read_artifact_digest(&shared_dir)?;
-    Ok(Some(SharedPackLease {
-        shared_dir,
-        artifact_sha256,
-    }))
+    read_lease(&shared_dir).map(Some)
+}
+
+/// The lease one existing store entry describes.
+fn read_lease(shared_dir: &Path) -> io::Result<SharedPackLease> {
+    Ok(SharedPackLease {
+        shared_dir: shared_dir.to_path_buf(),
+        artifact_sha256: read_artifact_digest(shared_dir)?,
+    })
 }
 
 /// The shared extraction a machine directory's pointer names, if it has one.
 fn read_leased_shared_dir(machine_dir: &Path, shared_root: &Path) -> io::Result<Option<PathBuf>> {
+    match read_pointer_entry(machine_dir, shared_root)? {
+        None => Ok(None),
+        Some((shared, true)) => Ok(Some(shared)),
+        Some((shared, false)) => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("shared pack entry is missing: {}", shared.display()),
+        )),
+    }
+}
+
+/// The store entry a machine's `.pack-shared` pointer names and whether it is
+/// still on disk, or `None` when the machine has no pointer.
+///
+/// The pointer shape is validated here, so every caller — a boot, a fork, a
+/// prune — sees the same target: an entry directly under the store root.
+fn read_pointer_entry(
+    machine_dir: &Path,
+    shared_root: &Path,
+) -> io::Result<Option<(PathBuf, bool)>> {
     let pointer = machine_dir.join(SHARED_PACK_POINTER);
     let metadata = match fs::symlink_metadata(&pointer) {
         Ok(metadata) => metadata,
@@ -291,7 +404,7 @@ fn read_leased_shared_dir(machine_dir: &Path, shared_root: &Path) -> io::Result<
             format!("empty shared pack pointer: {}", pointer.display()),
         ));
     }
-    canonical_shared_dir(Path::new(target), shared_root).map(Some)
+    canonical_shared_entry(Path::new(target), shared_root).map(Some)
 }
 
 fn touch_lease(lease: &SharedPackLease) {
@@ -488,17 +601,110 @@ pub fn open_prepared_checkpoint(reference: &str) -> io::Result<PreparedCheckpoin
     Ok(PreparedCheckpoint { path, _lock: lock })
 }
 
+/// Resolve where a machine's packed layers come from.
+///
+/// `machine_dir` is the machine's data directory — the `.pack-shared` pointer's
+/// parent — and `sidecar` is the pack it was created from, when the caller knows
+/// it. A machine with no pointer is `Private` (macOS, a pre-shared-store machine,
+/// or a machine created with the shared store disabled).
+///
+/// A well-formed pointer whose store entry is missing, partial, or has lost its
+/// lease markers is not an error: pruning, or an out-of-band removal, can evict a
+/// store entry out from under the machines that lease it, and every boot and
+/// fork of those machines would fail on the dangling pointer forever. When
+/// `sidecar` parses and names the pointer's artifact, the entry is re-extracted
+/// under the cache lock and the machine keeps sharing it; otherwise the machine
+/// takes its private path, which is `Private` — never an error, so a stale
+/// pointer cannot wedge a machine that still holds the pack privately.
+///
+/// A malformed pointer — relative, symlinked, escaping the store root, not one
+/// content-addressed entry, or carrying `.`/`..` — is an error, not a fallback.
+pub fn resolve_machine_pack(machine_dir: &Path, sidecar: Option<&Path>) -> io::Result<PackSource> {
+    resolve_machine_pack_in(
+        &vm_cache_root(),
+        &shared_pack_cache_root(),
+        machine_dir,
+        sidecar,
+    )
+}
+
+fn resolve_machine_pack_in(
+    vm_root: &Path,
+    shared_root: &Path,
+    machine_dir: &Path,
+    sidecar: Option<&Path>,
+) -> io::Result<PackSource> {
+    let _lock = lock_artifact_cache(vm_root, false)?;
+    resolve_machine_pack_locked(shared_root, machine_dir, sidecar)
+}
+
+/// [`resolve_machine_pack`] with the caller's artifact-cache lock already held,
+/// so a resolution and whatever is published from it (a fork clone's pointer)
+/// stay one unit against pruning.
+fn resolve_machine_pack_locked(
+    shared_root: &Path,
+    machine_dir: &Path,
+    sidecar: Option<&Path>,
+) -> io::Result<PackSource> {
+    let Some((entry, present)) = read_pointer_entry(machine_dir, shared_root)? else {
+        return Ok(PackSource::Private);
+    };
+    if present && shared_entry_complete(&entry, sidecar) {
+        match read_lease(&entry) {
+            Ok(lease) => return Ok(PackSource::Shared(lease)),
+            // The lease's SHA marker is part of the entry. An entry that lost it
+            // is restored below, which also puts the marker back.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    match restore_shared_entry(shared_root, &entry, sidecar)? {
+        Some(lease) => Ok(PackSource::Shared(lease)),
+        None => Ok(PackSource::Private),
+    }
+}
+
+/// Whether a store entry that is on disk holds what the pack it was extracted
+/// from needs.
+///
+/// Only a pack that carries image layers can lose them: a VM-mode pack's empty
+/// `layers/` is complete by design, and the launch path has always skipped its
+/// self-heal there. A pack that cannot be read, or that the caller did not
+/// provide, cannot tell an empty-by-design entry from an evicted one, so the
+/// entry stands: there is nothing to re-extract from either way.
+fn shared_entry_complete(entry: &Path, sidecar: Option<&Path>) -> bool {
+    let Some(sidecar) = sidecar else {
+        return true;
+    };
+    let Ok(manifest) = smolvm_pack::packer::read_manifest_from_sidecar(sidecar) else {
+        return true;
+    };
+    manifest.assets.layers.is_empty() || smolvm_pack::extract::cached_layers_usable(entry)
+}
+
 /// Copy a golden machine's shared artifact lease to a fork clone atomically.
 ///
-/// Returns `None` when the golden uses a private extraction rather than the
-/// Linux shared store. A malformed existing pointer is an error, not a fallback.
+/// Returns `None` when the golden has no shared lease to copy — a private
+/// extraction, or a pointer whose entry could not be restored. `golden_sidecar`
+/// is the pack the golden was created from, and is what a dangling pointer is
+/// re-materialized from (see [`resolve_machine_pack`]). A malformed pointer is an
+/// error, not a fallback. The clone's pointer is published while the resolution's
+/// cache lock is still held, so a concurrent prune sees either no clone pointer
+/// or a complete one.
 pub fn copy_shared_pack_lease(
     golden_layers_dir: &Path,
     clone_layers_dir: &Path,
+    golden_sidecar: Option<&Path>,
 ) -> io::Result<Option<SharedPackLease>> {
     let vm_root = vm_cache_root();
     let shared_root = shared_pack_cache_root();
-    copy_shared_pack_lease_in(&vm_root, &shared_root, golden_layers_dir, clone_layers_dir)
+    copy_shared_pack_lease_in(
+        &vm_root,
+        &shared_root,
+        golden_layers_dir,
+        clone_layers_dir,
+        golden_sidecar,
+    )
 }
 
 fn copy_shared_pack_lease_in(
@@ -506,12 +712,19 @@ fn copy_shared_pack_lease_in(
     shared_root: &Path,
     golden_layers_dir: &Path,
     clone_layers_dir: &Path,
+    golden_sidecar: Option<&Path>,
 ) -> io::Result<Option<SharedPackLease>> {
     let _lock = lock_artifact_cache(vm_root, false)?;
     let golden_machine_dir = golden_layers_dir.parent().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "golden pack dir has no parent")
     })?;
-    let Some(lease) = read_lease_from_machine_dir(golden_machine_dir, shared_root)? else {
+    let PackSource::Shared(lease) =
+        resolve_machine_pack_locked(shared_root, golden_machine_dir, golden_sidecar)?
+    else {
+        tracing::warn!(
+            golden = %golden_machine_dir.display(),
+            "no shared pack lease to copy; forking onto private layers instead"
+        );
         return Ok(None);
     };
     fs::create_dir_all(clone_layers_dir)?;
@@ -521,6 +734,82 @@ fn copy_shared_pack_lease_in(
     )?;
     touch_lease(&lease);
     Ok(Some(lease))
+}
+
+/// Re-extract the store entry a machine's pointer names from the pack it was
+/// created from, and return the restored lease.
+///
+/// Only called for a well-formed pointer whose entry is missing, incomplete, or
+/// has lost its lease markers. The re-extraction is keyed by the pack footer's
+/// checksum, so it restores the entry only when the pack on disk really is the
+/// artifact this pointer names; a pack that is gone, unreadable, or a different
+/// artifact leaves the entry as it was and yields `None` (best-effort, like the
+/// launch self-heal — a caller that still holds the layers privately must not be
+/// wedged by it). The caller holds the artifact-cache lock.
+fn restore_shared_entry(
+    shared_root: &Path,
+    entry: &Path,
+    sidecar: Option<&Path>,
+) -> io::Result<Option<SharedPackLease>> {
+    let Some(sidecar) = sidecar else {
+        tracing::warn!(
+            entry = %entry.display(),
+            "shared pack entry is unusable and no source pack is known; using private layers"
+        );
+        return Ok(None);
+    };
+    let footer = match smolvm_pack::packer::read_footer_from_sidecar(sidecar) {
+        Ok(footer) => footer,
+        Err(error) => {
+            tracing::warn!(
+                pack = %sidecar.display(),
+                entry = %entry.display(),
+                %error,
+                "shared pack entry is unusable and its source pack is unreadable; using private layers"
+            );
+            return Ok(None);
+        }
+    };
+    // The entry's name is its artifact's checksum: extracting a different pack
+    // here would fill the store with an entry nothing points at, while this
+    // machine's entry stayed gone.
+    let expected = format!("{:08x}", footer.checksum);
+    if entry.file_name().and_then(|name| name.to_str()) != Some(expected.as_str()) {
+        tracing::warn!(
+            pack = %sidecar.display(),
+            entry = %entry.display(),
+            "source pack is a different artifact than the shared entry; using private layers"
+        );
+        return Ok(None);
+    }
+    if let Err(error) =
+        smolvm_pack::extract::extract_sidecar_shared(sidecar, shared_root, &footer, false)
+    {
+        tracing::warn!(
+            pack = %sidecar.display(),
+            %error,
+            "re-extracting the shared pack failed; using private layers"
+        );
+        return Ok(None);
+    }
+    match read_lease(entry) {
+        Ok(lease) => {
+            tracing::info!(
+                shared = %lease.shared_dir.display(),
+                pack = %sidecar.display(),
+                "re-extracted an evicted shared pack entry"
+            );
+            Ok(Some(lease))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            tracing::warn!(
+                entry = %entry.display(),
+                "re-extraction did not restore the shared entry's lease; using private layers"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub(crate) fn validate_cow_lease(
@@ -1146,6 +1435,44 @@ mod tests {
         atomic_publish_pointer(&machine.join(SHARED_PACK_POINTER), shared).unwrap();
     }
 
+    /// Write a real `.smolmachine` sidecar the resolver can extract from.
+    /// `layers` makes it an image pack, whose `layers/` can be evicted; without
+    /// it, a VM-mode pack, whose empty `layers/` is complete by design. `label`
+    /// keeps two packs in one test distinct artifacts.
+    fn write_pack(path: &Path, label: &str, layers: bool) -> smolvm_pack::PackFooter {
+        let mut collector =
+            smolvm_pack::assets::AssetCollector::new(path.with_extension("staging")).unwrap();
+        if layers {
+            collector
+                .add_layer("sha256:abc123def456", b"layer content")
+                .unwrap();
+        }
+        let manifest = smolvm_pack::format::PackManifest::new(
+            format!("resolver://{label}"),
+            "sha256:none".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        smolvm_pack::packer::Packer::new(manifest)
+            .with_assets(collector)
+            .pack_artifact(path)
+            .unwrap();
+        smolvm_pack::packer::read_footer_from_sidecar(path).unwrap()
+    }
+
+    fn store_entry_names(shared_root: &Path) -> Vec<String> {
+        let mut names: Vec<String> = match fs::read_dir(shared_root) {
+            Ok(entries) => entries
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => panic!("read store: {error}"),
+        };
+        names.sort();
+        names
+    }
+
     #[test]
     #[ignore = "requires root to exercise service-owned promotion cache"]
     fn promotion_serializes_publishers_and_excludes_pruning() {
@@ -1543,6 +1870,7 @@ mod tests {
             &shared_root,
             &golden.join("pack"),
             &clone.join("pack"),
+            None,
         )
         .unwrap()
         .unwrap();
@@ -1552,6 +1880,346 @@ mod tests {
                 .unwrap(),
             lease
         );
+    }
+
+    /// A complete entry resolves to its own lease without touching the pack
+    /// store — the launch path's "populated entry" case.
+    #[test]
+    fn resolver_uses_a_populated_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("vms");
+        let shared_root = root.join("_shared");
+        let sidecar = temp.path().join("golden.smolmachine");
+        let footer = write_pack(&sidecar, "golden", true);
+        let shared =
+            smolvm_pack::extract::extract_sidecar_shared(&sidecar, &shared_root, &footer, false)
+                .unwrap();
+        assert!(smolvm_pack::extract::cached_layers_usable(&shared));
+        let machine = machine_dir(&root, "01");
+        publish_test_lease(&machine, &shared);
+
+        let source =
+            resolve_machine_pack_in(&root, &shared_root, &machine, Some(&sidecar)).unwrap();
+        assert_eq!(source, PackSource::Shared(read_lease(&shared).unwrap()));
+
+        // An unreadable pack cannot trigger a repair either: there is nothing
+        // wrong with the entry, and re-extracting is the expensive path.
+        let source = resolve_machine_pack_in(
+            &root,
+            &shared_root,
+            &machine,
+            Some(&temp.path().join("missing.smolmachine")),
+        )
+        .unwrap();
+        assert_eq!(source, PackSource::Shared(read_lease(&shared).unwrap()));
+    }
+
+    /// An entry that was evicted — the whole directory removed, or left behind
+    /// with its `layers/` empty — is re-extracted from the pack the machine was
+    /// created from, so boot and fork both keep sharing it.
+    #[test]
+    fn resolver_heals_an_evicted_entry() {
+        for partial in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("vms");
+            let shared_root = root.join("_shared");
+            let sidecar = temp.path().join("golden.smolmachine");
+            let footer = write_pack(&sidecar, "golden", true);
+            let shared = smolvm_pack::extract::shared_pack_dir(&shared_root, footer.checksum);
+            if partial {
+                // A partial extraction: the entry's markers survive, the layers
+                // it needs do not.
+                smolvm_pack::extract::extract_sidecar_shared(
+                    &sidecar,
+                    &shared_root,
+                    &footer,
+                    false,
+                )
+                .unwrap();
+                fs::remove_dir_all(shared.join("layers")).unwrap();
+            } else {
+                assert!(!shared.exists());
+            }
+            let machine = machine_dir(&root, "01");
+            publish_test_lease(&machine, &shared);
+
+            let source =
+                resolve_machine_pack_in(&root, &shared_root, &machine, Some(&sidecar)).unwrap();
+            let PackSource::Shared(lease) = source else {
+                panic!("entry was not healed: {source:?}");
+            };
+            assert!(smolvm_pack::extract::is_extracted(&shared));
+            assert!(smolvm_pack::extract::cached_layers_usable(&shared));
+            assert_eq!(lease, read_lease(&shared).unwrap());
+            assert_eq!(lease.shared_dir, shared.canonicalize().unwrap());
+        }
+    }
+
+    /// Without a pack that names the entry's artifact there is nothing to
+    /// re-extract from, so resolution reports `Private` — the machine's own
+    /// extraction path — and leaves the store exactly as it was.
+    #[test]
+    fn resolver_falls_back_to_private_without_a_usable_pack() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("vms");
+        let shared_root = root.join("_shared");
+        let golden_sidecar = temp.path().join("golden.smolmachine");
+        let golden_footer = write_pack(&golden_sidecar, "golden", true);
+        let other_sidecar = temp.path().join("other.smolmachine");
+        let other_footer = write_pack(&other_sidecar, "other", true);
+        assert_ne!(golden_footer.checksum, other_footer.checksum);
+        let golden_entry =
+            smolvm_pack::extract::shared_pack_dir(&shared_root, golden_footer.checksum);
+        let other_entry =
+            smolvm_pack::extract::shared_pack_dir(&shared_root, other_footer.checksum);
+        let machine = machine_dir(&root, "01");
+        // The pointer outlives the extraction it names.
+        publish_test_lease(&machine, &golden_entry);
+        let before = store_entry_names(&shared_root);
+
+        // No pack at all, and a pack that is not on disk.
+        for sidecar in [None, Some(temp.path().join("absent.smolmachine"))] {
+            assert_eq!(
+                resolve_machine_pack_in(&root, &shared_root, &machine, sidecar.as_deref()).unwrap(),
+                PackSource::Private
+            );
+        }
+        // A readable pack for a *different* artifact must never be extracted
+        // under this entry's name (or into an entry of its own).
+        assert_eq!(
+            resolve_machine_pack_in(&root, &shared_root, &machine, Some(&other_sidecar)).unwrap(),
+            PackSource::Private
+        );
+        assert!(!golden_entry.exists());
+        assert!(!other_entry.exists());
+        assert_eq!(store_entry_names(&shared_root), before);
+    }
+
+    /// A VM-mode pack carries no image layers, so its entry's empty `layers/`
+    /// is complete: resolution must not re-extract it on every boot (#1454).
+    #[test]
+    fn resolver_keeps_a_vm_mode_entry_without_layers() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("vms");
+        let shared_root = root.join("_shared");
+        let sidecar = temp.path().join("saved.smolmachine");
+        let footer = write_pack(&sidecar, "saved", false);
+        let shared =
+            smolvm_pack::extract::extract_sidecar_shared(&sidecar, &shared_root, &footer, false)
+                .unwrap();
+        // Even without the extraction marker the entry resolves as it stands:
+        // a VM-mode machine has no layers to lose, and the launch path must not
+        // re-extract the pack (and its full digest) on every start.
+        fs::remove_file(shared.join(".smolvm-extracted")).unwrap();
+        let machine = machine_dir(&root, "01");
+        publish_test_lease(&machine, &shared);
+
+        let source =
+            resolve_machine_pack_in(&root, &shared_root, &machine, Some(&sidecar)).unwrap();
+        assert!(matches!(source, PackSource::Shared(_)));
+        assert!(
+            !smolvm_pack::extract::is_extracted(&shared),
+            "the entry was re-extracted"
+        );
+    }
+
+    /// The repaired entry is what a fork's clone leases: the clone pointer is
+    /// published onto the restored extraction, and the golden's own pointer
+    /// resolves again for its next boot.
+    #[test]
+    fn healed_entry_is_shared_by_the_clone() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("vms");
+        let shared_root = root.join("_shared");
+        let golden = machine_dir(&root, "01");
+        let clone = machine_dir(&root, "02");
+        let sidecar = temp.path().join("golden.smolmachine");
+        let footer = write_pack(&sidecar, "golden", true);
+        let shared = smolvm_pack::extract::shared_pack_dir(&shared_root, footer.checksum);
+        publish_test_lease(&golden, &shared);
+        assert!(!shared.exists());
+
+        let lease = copy_shared_pack_lease_in(
+            &root,
+            &shared_root,
+            &golden.join("pack"),
+            &clone.join("pack"),
+            Some(&sidecar),
+        )
+        .unwrap()
+        .expect("the pack on disk re-materializes the evicted entry");
+        assert!(smolvm_pack::extract::is_extracted(&shared));
+        assert_eq!(lease.shared_dir, shared.canonicalize().unwrap());
+        assert_eq!(
+            read_lease_from_machine_dir(&clone, &shared_root)
+                .unwrap()
+                .unwrap(),
+            lease
+        );
+        assert_eq!(
+            read_lease_from_machine_dir(&golden, &shared_root)
+                .unwrap()
+                .unwrap(),
+            lease
+        );
+    }
+
+    /// A dangling pointer handed no pack is a hard failure for the copy, never
+    /// a fallback: `pack_export` leases a source that resolved a moment ago, so
+    /// an entry that is gone now is a race — not an invitation to re-extract (a
+    /// full pack extraction can outlive the export) or to quietly export
+    /// different layers. The strict callers keep failing closed the same way.
+    #[test]
+    fn dangling_pointer_fails_the_lease_copy_without_re_extraction() {
+        for remove_store in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("vms");
+            let shared_root = root.join("_shared");
+            let golden = machine_dir(&root, "01");
+            let clone = machine_dir(&root, "02");
+            let sidecar = temp.path().join("golden.smolmachine");
+            let footer = write_pack(&sidecar, "golden", true);
+            let shared = smolvm_pack::extract::extract_sidecar_shared(
+                &sidecar,
+                &shared_root,
+                &footer,
+                false,
+            )
+            .unwrap();
+            publish_test_lease(&golden, &shared);
+            // A sweep removes the whole store; a prune removes only the entry.
+            if remove_store {
+                fs::remove_dir_all(&shared_root).unwrap();
+            } else {
+                fs::remove_dir_all(&shared).unwrap();
+            }
+
+            assert_eq!(
+                resolve_machine_pack_in(&root, &shared_root, &golden, None).unwrap(),
+                PackSource::Private,
+                "a dangling pointer is not a lease"
+            );
+            let copied = copy_shared_pack_lease_in(
+                &root,
+                &shared_root,
+                &golden.join("pack"),
+                &clone.join("pack"),
+                None,
+            )
+            .unwrap();
+            assert!(copied.is_none());
+            assert!(!clone.join(SHARED_PACK_POINTER).exists());
+            assert!(!shared.exists(), "an export lease must not re-extract");
+            // A COW base must never be published against an extraction that is
+            // not there.
+            let error =
+                validate_cow_lease_in(&golden, &shared, DIGEST_A, &shared_root).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        }
+    }
+
+    /// Only a missing *entry* is repairable. A pointer that names anything other
+    /// than one content-addressed entry directly under the store root stays
+    /// fatal, target present or not: the lease is what keeps a cache entry and
+    /// its COW bases alive, so it must not be silently dropped.
+    #[test]
+    fn resolver_rejects_malformed_pointers() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("vms");
+        let shared_root = root.join("_shared");
+        let golden = machine_dir(&root, "01");
+        fs::create_dir_all(&golden).unwrap();
+
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(outside.join("deadbeef")).unwrap();
+        let outside_file = outside.join("cafebabe");
+        fs::write(&outside_file, b"x").unwrap();
+        let symlink_target = temp.path().join("symlinked");
+        fs::create_dir_all(symlink_target.join("deadbeef")).unwrap();
+        let symlink_pointer = shared_root.join("deadbeef");
+        fs::create_dir_all(&shared_root).unwrap();
+        std::os::unix::fs::symlink(&symlink_target, &symlink_pointer).unwrap();
+
+        // Every path below is absent except where it leads outside the store.
+        for pointer in [
+            format!("{}\n", outside.join("12345678").display()),
+            format!("{}\n", outside_file.display()),
+            format!("{}\n", shared_root.join("nothash1").display()),
+            format!("{}\n", shared_root.join("shorter").display()),
+            format!(
+                "{}\n",
+                shared_root.join("deadbeef").join("nested").display()
+            ),
+            // `.`/`..` are rejected before any filesystem call: with `missing`
+            // absent, resolving it would itself report NotFound and read as an
+            // evictable entry.
+            format!(
+                "{}\n",
+                shared_root
+                    .join("missing")
+                    .join("..")
+                    .join("deadbeef")
+                    .display()
+            ),
+            format!(
+                "{}\n",
+                shared_root
+                    .join("..")
+                    .join("_shared")
+                    .join("deadbeef")
+                    .display()
+            ),
+            "../../escape\n".to_string(),
+            "\n".to_string(),
+        ] {
+            fs::write(golden.join(SHARED_PACK_POINTER), pointer.as_bytes()).unwrap();
+            let error = resolve_machine_pack_in(&root, &shared_root, &golden, None).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidData,
+                "pointer {pointer:?} must stay malformed"
+            );
+        }
+
+        // A pointer file that is itself a symlink is not a pointer.
+        let link = temp.path().join("link");
+        fs::write(
+            &link,
+            format!("{}\n", shared_root.join("deadbeef").display()),
+        )
+        .unwrap();
+        let pointer = golden.join(SHARED_PACK_POINTER);
+        fs::remove_file(&pointer).unwrap();
+        std::os::unix::fs::symlink(&link, &pointer).unwrap();
+        let error = resolve_machine_pack_in(&root, &shared_root, &golden, None).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        // The fork's lease copy inherits the same judgement.
+        let clone = machine_dir(&root, "02");
+        let error = copy_shared_pack_lease_in(
+            &root,
+            &shared_root,
+            &golden.join("pack"),
+            &clone.join("pack"),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!clone.join(SHARED_PACK_POINTER).exists());
+
+        // A symlinked store root must never be traversed, even to classify.
+        fs::remove_file(&pointer).unwrap();
+        let elsewhere = temp.path().join("elsewhere");
+        fs::create_dir_all(elsewhere.join("deadbeef")).unwrap();
+        fs::remove_dir_all(&shared_root).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &shared_root).unwrap();
+        fs::write(
+            &pointer,
+            format!("{}\n", shared_root.join("deadbeef").display()),
+        )
+        .unwrap();
+        let error = resolve_machine_pack_in(&root, &shared_root, &golden, None).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

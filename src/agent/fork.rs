@@ -2832,9 +2832,18 @@ fn prepare_clone_from_snapshot(
         #[cfg(target_os = "linux")]
         {
             let clone_layers = crate::agent::machine_layers_cache_dir(clone);
-            let copied_shared_lease =
-                crate::artifact_cache::copy_shared_pack_lease(&golden_layers, &clone_layers)
-                    .map_err(|e| Error::agent("copy shared pack lease", e.to_string()))?;
+            // The clone inherits the golden's `.pack-shared` lease. A pointer
+            // whose store entry was evicted (pruned, or removed out from under
+            // the machine) is restored from the pack the golden was created from,
+            // under the artifact-cache lock; when it cannot be, the clone forgoes
+            // the shared extraction and boots from layers the golden still has
+            // on disk, or privately from the same pack.
+            let copied_shared_lease = crate::artifact_cache::copy_shared_pack_lease(
+                &golden_layers,
+                &clone_layers,
+                golden_rec.source_smolmachine.as_deref().map(Path::new),
+            )
+            .map_err(|e| Error::agent("copy shared pack lease", e.to_string()))?;
             if copied_shared_lease.is_none() && smolvm_pack::extract::is_extracted(&golden_layers) {
                 std::os::unix::fs::symlink(&golden_layers, &clone_layers)
                     .map_err(|e| Error::agent("link clone pack dir", e.to_string()))?;
