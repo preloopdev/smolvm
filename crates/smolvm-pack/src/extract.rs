@@ -650,9 +650,15 @@ fn safe_unpack<R: Read>(
 struct SafeUnpackLimits {
     /// Max number of tar entries before erroring (inode-flood guard).
     max_entries: u64,
-    /// Max total apparent (header-declared) bytes before erroring
-    /// (disk-exhaustion / decompression-bomb guard).
+    /// Max total bytes stored in the archive before erroring
+    /// (disk-exhaustion / decompression-bomb guard). Sparse entries are
+    /// charged their stored bytes (`entry_size`), not their logical size.
     max_total_bytes: u64,
+    /// Max logical (declared) size of a single sparse entry. The payload
+    /// cap above cannot see a sparse file that stores one byte but declares
+    /// exabytes of holes; this bounds the file a hostile archive can expand
+    /// to on disk.
+    max_sparse_file_bytes: u64,
     /// Regular files with a header size >= this use the sparse-write path.
     sparse_threshold: u64,
 }
@@ -662,6 +668,7 @@ impl SafeUnpackLimits {
         Self {
             max_entries: max_extract_entries(),
             max_total_bytes: max_extract_total_bytes(),
+            max_sparse_file_bytes: max_sparse_file_bytes(),
             sparse_threshold: SPARSE_WRITE_THRESHOLD,
         }
     }
@@ -954,6 +961,20 @@ fn safe_unpack_skipping<R: Read>(
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("tar archive exceeds max total size ({max_total_bytes} bytes)"),
+            ));
+        }
+        // The payload cap above cannot see a sparse entry that stores almost
+        // nothing yet declares an enormous logical size; bound that size so a
+        // hostile archive cannot expand to exabytes of holes on disk.
+        if entry_type == tar::EntryType::GNUSparse
+            && entry.header().size().unwrap_or(0) > limits.max_sparse_file_bytes
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "sparse entry exceeds max file size ({} bytes)",
+                    limits.max_sparse_file_bytes
+                ),
             ));
         }
 
@@ -1684,13 +1705,30 @@ fn max_extract_entries() -> u64 {
         .unwrap_or(DEFAULT)
 }
 
-/// Maximum total apparent (header-declared) size `safe_unpack` will extract from
-/// a single archive before erroring (disk-exhaustion / decompression-bomb
-/// guard). Override with `SMOLVM_PACK_MAX_EXTRACT_BYTES`; default 128 GiB —
-/// generous enough for several large (sparse) overlay disks yet finite.
+/// Maximum total bytes stored in a single archive that `safe_unpack` will
+/// extract before erroring (disk-exhaustion / decompression-bomb guard).
+/// Sparse entries are charged their stored bytes, not their logical size.
+/// Override with `SMOLVM_PACK_MAX_EXTRACT_BYTES`; default 128 GiB — generous
+/// enough for several large (sparse) overlay disks yet finite.
 fn max_extract_total_bytes() -> u64 {
     const DEFAULT: u64 = 128 * 1024 * 1024 * 1024;
     std::env::var("SMOLVM_PACK_MAX_EXTRACT_BYTES")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT)
+}
+
+/// Maximum logical size a single sparse entry may declare before erroring.
+/// The payload cap counts stored bytes, so it cannot see a sparse file that
+/// stores one byte but declares exabytes of holes; this bounds the size the
+/// entry expands to on disk. Override with
+/// `SMOLVM_PACK_MAX_SPARSE_FILE_BYTES`; default 4 TiB — several times the
+/// largest disk the golden bake produces. `0`/invalid falls back to the
+/// default, matching the other extraction limits.
+fn max_sparse_file_bytes() -> u64 {
+    const DEFAULT: u64 = 4 * 1024 * 1024 * 1024 * 1024;
+    std::env::var("SMOLVM_PACK_MAX_SPARSE_FILE_BYTES")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&n| n > 0)
@@ -6392,6 +6430,7 @@ mod tests {
         let limits = SafeUnpackLimits {
             max_entries: 1_000,
             max_total_bytes: 1 << 30,
+            max_sparse_file_bytes: u64::MAX,
             sparse_threshold: 512, // 4096-byte payload takes the sparse path
         };
         let result = safe_unpack_with_limits(&mut archive, &dest, &limits);
@@ -6488,6 +6527,7 @@ mod tests {
         let limits = SafeUnpackLimits {
             max_entries: 3,
             max_total_bytes: 1 << 30,
+            max_sparse_file_bytes: u64::MAX,
             sparse_threshold: SPARSE_WRITE_THRESHOLD,
         };
         let err = safe_unpack_with_limits(&mut archive, &dest, &limits).unwrap_err();
@@ -6511,6 +6551,7 @@ mod tests {
         let limits = SafeUnpackLimits {
             max_entries: 1_000,
             max_total_bytes: 1024, // 4096-byte entry exceeds this
+            max_sparse_file_bytes: u64::MAX,
             sparse_threshold: SPARSE_WRITE_THRESHOLD,
         };
         let err = safe_unpack_with_limits(&mut archive, &dest, &limits).unwrap_err();
@@ -6549,12 +6590,53 @@ mod tests {
         let limits = SafeUnpackLimits {
             max_entries: 1_000,
             max_total_bytes: 1024 * 1024, // far below the 64 MiB declared size
+            max_sparse_file_bytes: u64::MAX,
             sparse_threshold: SPARSE_WRITE_THRESHOLD,
         };
         safe_unpack_with_limits(&mut archive, &dest, &limits).unwrap();
         let out = dest.join("checkpoint/disks/storage/1");
         assert_eq!(fs::metadata(&out).unwrap().len(), LOGICAL);
         assert_eq!(&fs::read(&out).unwrap()[..4096], &data[..]);
+    }
+
+    /// A sparse entry can store almost nothing yet declare an enormous
+    /// logical size; the payload cap cannot see that, so the per-entry
+    /// logical ceiling rejects it before a single hole is written.
+    #[test]
+    fn a_sparse_entry_declaring_past_the_logical_cap_is_rejected() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest = temp_dir.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+        const LOGICAL: u64 = 1024 * 1024 * 1024 * 1024; // 1 TiB of holes
+        let data = vec![9u8; 4096];
+        let mut archive_bytes = Vec::new();
+        {
+            let mut header = tar::Header::new_gnu();
+            header.set_path("checkpoint/disks/storage/1").unwrap();
+            header.set_mode(0o644);
+            header.set_mtime(0);
+            let stored = crate::assets::write_sparse_header(
+                &mut archive_bytes,
+                header,
+                LOGICAL,
+                &[(0, 4096)],
+            )
+            .unwrap();
+            assert_eq!(stored, 4096);
+            archive_bytes.extend_from_slice(&data);
+            archive_bytes.extend(std::iter::repeat_n(0u8, 1024 * 2));
+        }
+        let mut archive = tar::Archive::new(archive_bytes.as_slice());
+        let limits = SafeUnpackLimits {
+            max_entries: 1_000,
+            max_total_bytes: u64::MAX, // stored bytes are not the problem
+            max_sparse_file_bytes: 64 * 1024 * 1024, // far below 1 TiB declared
+            sparse_threshold: SPARSE_WRITE_THRESHOLD,
+        };
+        let err = safe_unpack_with_limits(&mut archive, &dest, &limits).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("max file size"));
+        assert!(!dest.join("checkpoint/disks/storage/1").exists());
     }
 
     #[cfg(target_os = "macos")]
