@@ -300,6 +300,16 @@ pub const OPAQUE_XATTR_MARKER: &str = "opaque-xattr";
 /// unpacked on the host with its ownership recorded in the override xattr.
 /// A cache hit reads this instead of listing (and on macOS mounting) the
 /// layers to learn that nothing is left to upgrade.
+///
+/// The marker speaks for the extraction as a whole and carries no vintage: an
+/// entry unpacked before symlink owners were recorded keeps it, and those links
+/// keep showing the host's stat. Re-stamping them here is not cheap — an owner
+/// lives in the layer tar, not on the tree, so it would mean streaming every
+/// staged tar again, under the cache lock, on a boot path. Such a cache is
+/// refreshed by removing the extraction and making it again: on macOS it is the
+/// machine's own directory, so `machine delete` and a fresh create; in the
+/// shared store, `smolvm pack prune --all` (plain `prune` keeps the newest five
+/// entries, so it may remove nothing) with no machine leasing the entry.
 const HOST_LAYERS_MARKER: &str = ".smolvm-host-layers";
 /// The xattr libkrun's virtiofs server reads ownership and mode from (the
 /// rootless-containers convention, `uid:gid:0mode`). Writing it lets an
@@ -364,7 +374,10 @@ fn user_xattrs_supported(dir: &Path) -> bool {
     set_user_xattr(probe.path(), OVERRIDE_STAT_XATTR, b"0:0:0644").is_ok()
 }
 
-/// Set a user xattr on `path` itself (never following a symlink).
+/// Set a user xattr on `path` itself. On Unix that is `lsetxattr` (Linux) /
+/// `setxattr` with `XATTR_NOFOLLOW` (macOS), so a symlink is never followed;
+/// the Windows arm writes an alternate data stream instead, which a reparse
+/// point *would* redirect to its target, so callers must not hand it a link.
 fn set_user_xattr(path: &Path, name: &str, value: &[u8]) -> std::io::Result<()> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
@@ -421,6 +434,38 @@ fn record_override_stat(path: &Path, uid: u64, gid: u64, mode: u32) -> std::io::
         OVERRIDE_STAT_XATTR,
         format!("{uid}:{gid}:0{mode:o}").as_bytes(),
     )
+}
+
+/// Record a symlink entry's archived owner in the override xattr, on the link
+/// itself, best effort.
+///
+/// `set_user_xattr` is `lsetxattr` (Linux) / `setxattr` with `XATTR_NOFOLLOW`
+/// (macOS), so this never dereferences the link — a dangling link keeps its
+/// own record rather than creating, or re-owning, its target.
+///
+/// The mode is the 0777 that `symlink(2)` always gives a link, not the archived
+/// one: a mode is not settable on a symlink, so this matches what unpacking the
+/// same layer inside the guest produces, and what the guest sees when the
+/// layers are read through virtiofs or through the packed image's own unpack.
+///
+/// Failure is ignored on purpose. Linux's `user.*` namespace does not cover
+/// symlinks at all (`EPERM`), and there the server reads the host's stat as it
+/// always did — the extraction, the link and the rest of the tree are
+/// unaffected. Where the filesystem does store user xattrs on links (APFS does)
+/// the guest gets the archived owner.
+///
+/// Unix only: `set_user_xattr`'s Windows arm writes an alternate data stream,
+/// and on a reparse point that write lands on the *target*, which would give
+/// the target its link's owner whenever the link is extracted after it.
+fn record_symlink_override_stat(path: &Path, uid: u64, gid: u64) {
+    #[cfg(unix)]
+    {
+        let _ = record_override_stat(path, uid, gid, 0o777);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, uid, gid);
+    }
 }
 
 fn packed_agent_unpacks_staged_layers(version: &str) -> bool {
@@ -1249,29 +1294,34 @@ fn safe_unpack_skipping<R: Read>(
         if host_runtime && is_regular {
             set_mode(&full_path, 0o600);
         }
-        // Hard links share their target's xattr; symlinks cannot carry user
-        // xattrs on Linux and the server reads the host's stat for them anyway.
-        if owner_xattr
-            && entry_type != tar::EntryType::Link
-            && entry_type != tar::EntryType::Symlink
-        {
-            // The archived owner and mode (setuid bits included) go in the
-            // xattr the guest sees; the host copy stays readable so the VMM
-            // serving the files can open them.
-            let is_dir = entry_type == tar::EntryType::Directory;
-            let archived = entry
-                .header()
-                .mode()
-                .unwrap_or(if is_dir { 0o755 } else { 0o644 })
-                & 0o7777;
-            // Setting a user xattr needs write permission on the file, and
-            // the host copy must stay readable for the VMM, so the host mode
-            // always keeps owner read/write (the guest sees the archived one).
-            set_mode(
-                &full_path,
-                (archived & 0o777) | if is_dir { 0o700 } else { 0o600 },
-            );
-            record_override_stat(&full_path, uid, gid, archived)?;
+        // Hard links share their target's inode and xattr, so the target's own
+        // record covers them. A symlink is the case the host must describe
+        // itself: it cannot chown a link it does not own (no root), and the
+        // server presents the host's stat when no record exists — so every
+        // symlink in a packed image reached the guest owned by the host user,
+        // `/bin/sh` included, while the regular files beside it were right.
+        if owner_xattr && entry_type != tar::EntryType::Link {
+            if entry_type == tar::EntryType::Symlink {
+                record_symlink_override_stat(&full_path, uid, gid);
+            } else {
+                // The archived owner and mode (setuid bits included) go in the
+                // xattr the guest sees; the host copy stays readable so the VMM
+                // serving the files can open them.
+                let is_dir = entry_type == tar::EntryType::Directory;
+                let archived = entry
+                    .header()
+                    .mode()
+                    .unwrap_or(if is_dir { 0o755 } else { 0o644 })
+                    & 0o7777;
+                // Setting a user xattr needs write permission on the file, and
+                // the host copy must stay readable for the VMM, so the host mode
+                // always keeps owner read/write (the guest sees the archived one).
+                set_mode(
+                    &full_path,
+                    (archived & 0o777) | if is_dir { 0o700 } else { 0o600 },
+                );
+                record_override_stat(&full_path, uid, gid, archived)?;
+            }
         }
         report.entries += 1;
         if required_here {
@@ -7111,7 +7161,7 @@ mod tests {
         assert_eq!(xattr("bin/passwd").as_deref(), Some("0:0:04755"));
         assert!(
             dest.join("bin/ln").is_symlink(),
-            "symlinks are extracted, never stamped"
+            "symlinks are extracted, never mode-stamped"
         );
         assert_eq!(
             xattr("bin/gone").as_deref(),
@@ -7141,6 +7191,94 @@ mod tests {
         assert_eq!(xattr("ro/old").as_deref(), Some("0:0:020000"));
         assert_eq!(host_mode("ro") & 0o700, 0o700);
         assert_eq!(host_mode("ro/readme") & 0o600, 0o600);
+    }
+
+    /// A symlink entry's archived owner reaches the guest through the override
+    /// xattr, on the link itself. Without it the server presents the host's own
+    /// stat, so an unprivileged host extraction (macOS: no chown) showed every
+    /// symlink in the image owned by the host user — `/bin/sh` as `502:20`
+    /// while the regular file it points at was correctly `0:0`.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn owner_xattr_extraction_records_a_symlinks_owner_on_the_link() {
+        let root = tempfile::tempdir().unwrap();
+        if !user_xattrs_supported(root.path()) {
+            return;
+        }
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut add =
+            |path: &str, kind: tar::EntryType, mode: u32, uid: u64, gid: u64, link: &str| {
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(kind);
+                header.set_mode(mode);
+                header.set_uid(uid);
+                header.set_gid(gid);
+                header.set_size(0);
+                if !link.is_empty() {
+                    header.set_link_name(link).unwrap();
+                }
+                header.set_cksum();
+                builder.append_data(&mut header, path, &[][..]).unwrap();
+            };
+        // `bin/sh` points at a file that exists (so a write that followed the
+        // link would land on that file's xattr), `bin/dangling` at one that
+        // does not. Their header mode is deliberately not 0777: a link's mode
+        // is not settable, so the record must say 0777 either way.
+        add("bin/busybox", tar::EntryType::Regular, 0o755, 0, 0, "");
+        add(
+            "bin/sh",
+            tar::EntryType::Symlink,
+            0o755,
+            1001,
+            1001,
+            "busybox",
+        );
+        add(
+            "bin/dangling",
+            tar::EntryType::Symlink,
+            0o644,
+            1001,
+            1001,
+            "missing",
+        );
+        let tar_bytes = builder.into_inner().unwrap();
+
+        let dest = root.path().join("layer");
+        fs::create_dir(&dest).unwrap();
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        safe_unpack_with_policy(
+            &mut archive,
+            &dest,
+            &SafeUnpackLimits::from_env(),
+            false,
+            true,
+        )
+        .unwrap();
+
+        for link in ["bin/sh", "bin/dangling"] {
+            let path = dest.join(link);
+            assert!(path.is_symlink(), "{link} is still a symlink");
+            let xattr = read_user_xattr(&path, OVERRIDE_STAT_XATTR);
+            // APFS stores user xattrs on symlinks, and libkrun's server reads
+            // this one there. The mode is the 0777 a link always reports, not
+            // the archived 0755/0644, matching an in-guest unpack of the same
+            // layer.
+            #[cfg(target_os = "macos")]
+            assert_eq!(xattr.as_deref(), Some("1001:1001:0777"), "{link}");
+            // Linux's user.* namespace does not cover symlinks: the write
+            // fails with EPERM and is ignored, so nothing is recorded and the
+            // host's own stat shows through — exactly the pre-fix behaviour.
+            #[cfg(target_os = "linux")]
+            assert_eq!(xattr, None, "user.* xattrs are not allowed on symlinks");
+        }
+        // The link's record is the link's own: `bin/sh` points at `bin/busybox`,
+        // which keeps the record of its own entry, and a stamp that followed
+        // would have overwritten it with the link's owner.
+        assert_eq!(
+            read_user_xattr(&dest.join("bin/busybox"), OVERRIDE_STAT_XATTR).as_deref(),
+            Some("0:0:0755")
+        );
+        assert!(!dest.join("bin/missing").exists(), "no target was created");
     }
 
     #[cfg(unix)]
