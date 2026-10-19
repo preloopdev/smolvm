@@ -2,20 +2,22 @@
 //! their diff_id, and a pack that carries a layer the store already has costs a
 //! fan-out of hard links instead of another extraction.
 //!
-//! The store's own tests run everywhere (an install is just a zstd tar with a
-//! digest). The pack-level tests are Linux-only: that is the one platform whose
-//! entries and store share a filesystem and an owner, which is what makes
-//! linking a layer in sound rather than a copy.
-#![cfg(target_os = "linux")]
+//! The store's own tests run on every Unix host an install can reach: an
+//! install is just a zstd tar with a digest, and on macOS it lands in the
+//! store's case-sensitive volume. The pack-level tests are Linux-only: that is
+//! the one platform whose entries and store share a filesystem and an owner,
+//! which is what makes linking a layer in sound rather than a copy.
+#![cfg(unix)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
+#[cfg(target_os = "linux")]
+use smolvm_pack::extract::{collect_layer_store_with, force_detach_layers_volume};
 use smolvm_pack::extract::{
-    collect_layer_store, collect_layer_store_with, force_detach_layers_volume,
-    install_layer_from_stream, layer_present, shared_layers_dir, PARTIAL_DIR_SUFFIX,
-    STREAMED_LAYERS_FILE,
+    collect_layer_store, install_layer_from_stream, layer_present, shared_layers_dir,
+    PARTIAL_DIR_SUFFIX, STREAMED_LAYERS_FILE,
 };
 
 /// The staging name a layer is unpacked under before it takes its own.
@@ -27,8 +29,14 @@ fn staging_dir(layer_dir: &Path) -> PathBuf {
 }
 
 fn scratch(prefix: &str) -> tempfile::TempDir {
-    let root = Path::new(env!("CARGO_TARGET_TMPDIR"));
-    fs::create_dir_all(root).unwrap();
+    // macOS mounts the store's case-sensitive volume at a directory inside
+    // this one, and only allows a mount point on the boot volume.
+    let root = if cfg!(target_os = "macos") {
+        std::env::temp_dir()
+    } else {
+        Path::new(env!("CARGO_TARGET_TMPDIR")).to_path_buf()
+    };
+    fs::create_dir_all(&root).unwrap();
     tempfile::Builder::new()
         .prefix(prefix)
         .tempdir_in(root)
@@ -376,7 +384,10 @@ impl std::io::Read for HeldStream {
 
 /// Dry runs describe the same selection and remove nothing; a real run reports
 /// the bytes it frees, which exclude any file an entry still links.
-#[cfg(unix)]
+///
+/// Linux-only: the entry links the store's file, and on macOS the store lives
+/// in a different volume than the entry, so there is no link to test.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_collection_reports_the_bytes_it_frees_and_dry_runs_change_nothing() {
     use std::os::unix::fs::MetadataExt;

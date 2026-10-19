@@ -2,12 +2,13 @@
 //! (`extract_sidecar_shared`) against a *real* `.smolmachine` sidecar — real
 //! zstd stream, real tar, real footer/checksum — on a real filesystem.
 //!
-//! Linux-only: the shared store backs the Linux fleet's per-VM idmapped bind
-//! mount (kernel ≥5.12); macOS uses a per-machine case-sensitive sparse image,
-//! so the whole module compiles to nothing elsewhere. This validates the
-//! *extraction half* (extract-once, content-addressed, locked down); the mount
-//! half is validated by the root crate's `tests/idmap_mount.rs`.
-#![cfg(target_os = "linux")]
+//! Runs on Unix. The shared store backs the Linux fleet's per-VM idmapped bind
+//! mount; macOS extracts the same tree into the shared entry, with its layers
+//! in a per-entry case-sensitive volume (the sparse image itself is the only
+//! file whose bytes differ between a shared and a plain extraction). This
+//! validates the *extraction half* (extract-once, content-addressed, locked
+//! down); the mount half is validated by the root crate's `tests/idmap_mount.rs`.
+#![cfg(unix)]
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -15,9 +16,11 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 use smolvm_pack::assets::AssetCollector;
+#[cfg(target_os = "linux")]
+use smolvm_pack::extract::shared_extract_enabled;
 use smolvm_pack::extract::{
     extract_sidecar, extract_sidecar_shared, read_shared_artifact_sha256,
-    shared_artifact_sha256_path, shared_extract_enabled,
+    shared_artifact_sha256_path,
 };
 use smolvm_pack::format::PackManifest;
 use smolvm_pack::{read_footer_from_sidecar, sidecar_path_for, Packer};
@@ -87,6 +90,13 @@ fn file_map(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
             if ft.is_dir() {
                 stack.push(p);
             } else if ft.is_file() {
+                // The case-sensitive volume macOS extracts layers into is a
+                // sparse disk image; its on-disk bytes are metadata, not image
+                // content, and two extractions of the same pack write different
+                // images. Everything the layer trees hold is compared below.
+                if p.extension().is_some_and(|extension| extension == "sparseimage") {
+                    continue;
+                }
                 let rel = p.strip_prefix(root).unwrap().to_string_lossy().to_string();
                 out.insert(rel, fs::read(&p).unwrap());
             }
@@ -168,6 +178,7 @@ fn shared_extraction_is_content_addressed_idempotent_and_locked_down() {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn kill_switch_disables_the_shared_store() {
     // The handler consults `shared_extract_enabled()` to choose the shared vs

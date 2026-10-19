@@ -167,12 +167,13 @@ fn entry_layers(pack_dir: &Path) -> PathBuf {
 }
 
 /// Where streaming installs the trees: the node's digest-keyed store on Linux,
-/// the entry's own volume on macOS.
+/// the entry's own volume everywhere else (macOS cannot link across its
+/// volumes, and Windows has no shared extraction path).
 fn streamed_into(shared_root: &Path, pack_dir: &Path) -> PathBuf {
-    if cfg!(target_os = "macos") {
-        entry_layers(pack_dir)
-    } else {
+    if cfg!(target_os = "linux") {
         shared_root.join("layers")
+    } else {
+        entry_layers(pack_dir)
     }
 }
 
