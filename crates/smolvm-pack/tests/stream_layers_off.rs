@@ -19,8 +19,15 @@ use smolvm_pack::format::PackManifest;
 use smolvm_pack::{read_footer_from_sidecar, sidecar_path_for, Packer};
 
 fn scratch() -> tempfile::TempDir {
-    let root = Path::new(env!("CARGO_TARGET_TMPDIR"));
-    fs::create_dir_all(root).unwrap();
+    // macOS mounts the case-sensitive volume at a directory inside this one,
+    // and only allows a mount point on the boot volume; a target dir on an
+    // external volume would fail at `hdiutil attach`.
+    let root = if cfg!(target_os = "macos") {
+        std::env::temp_dir()
+    } else {
+        Path::new(env!("CARGO_TARGET_TMPDIR")).to_path_buf()
+    };
+    fs::create_dir_all(&root).unwrap();
     tempfile::Builder::new()
         .prefix("stream-layers-off-")
         .tempdir_in(root)

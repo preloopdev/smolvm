@@ -36,13 +36,35 @@ fn host_that_streams_layers() {
 /// A directory on a filesystem that stores user xattrs: the streaming path
 /// needs them for the archived owners, and `TMPDIR` may be a tmpfs without
 /// them. `CARGO_TARGET_TMPDIR` is inside the crate's target dir.
+///
+/// macOS mounts the case-sensitive volume *at* a directory inside this one, and
+/// only allows a mount point on the boot volume — so a `CARGO_TARGET_DIR` on an
+/// external volume makes every streaming test fail at `hdiutil attach`.
 fn scratch() -> tempfile::TempDir {
-    let root = Path::new(env!("CARGO_TARGET_TMPDIR"));
-    fs::create_dir_all(root).unwrap();
+    let root = if cfg!(target_os = "macos") {
+        std::env::temp_dir()
+    } else {
+        Path::new(env!("CARGO_TARGET_TMPDIR")).to_path_buf()
+    };
+    fs::create_dir_all(&root).unwrap();
     tempfile::Builder::new()
         .prefix("stream-layers-")
         .tempdir_in(root)
         .unwrap()
+}
+
+/// Whether `dir` can hold `a` and `A` as two entries. NTFS and a default APFS
+/// volume cannot, so an image whose paths differ only in case cannot survive
+/// extraction there — a limitation of the host filesystem, not of streaming.
+fn stores_case_distinct_names(dir: &Path) -> bool {
+    let lower = dir.join("case-probe-a");
+    let upper = dir.join("case-probe-A");
+    let distinct = fs::write(&lower, b"lower").is_ok()
+        && fs::write(&upper, b"upper").is_ok()
+        && fs::read(&lower).is_ok_and(|bytes| bytes == b"lower");
+    let _ = fs::remove_file(&lower);
+    let _ = fs::remove_file(&upper);
+    distinct
 }
 
 /// Release the case-sensitive volume a streaming macOS test left mounted, so
@@ -143,12 +165,13 @@ fn entry_layers(pack_dir: &Path) -> PathBuf {
 }
 
 /// Where streaming installs the trees: the node's digest-keyed store on Linux,
-/// the entry's own volume on macOS.
+/// the entry's own volume everywhere else (macOS cannot link across its
+/// volumes, and Windows has no shared extraction path).
 fn streamed_into(shared_root: &Path, pack_dir: &Path) -> PathBuf {
-    if cfg!(target_os = "macos") {
-        entry_layers(pack_dir)
-    } else {
+    if cfg!(target_os = "linux") {
         shared_root.join("layers")
+    } else {
+        entry_layers(pack_dir)
     }
 }
 
@@ -524,6 +547,10 @@ fn a_case_colliding_layer_survives_streaming() {
         return;
     }
     let tmp = scratch();
+    if !stores_case_distinct_names(tmp.path()) {
+        eprintln!("SKIP: this filesystem is case-insensitive; the paths cannot coexist");
+        return;
+    }
     let layer = layer_tar(&[
         ("usr/lib/GDebi/data.txt", b"upper"),
         ("usr/lib/gdebi/data.txt", b"lower"),
