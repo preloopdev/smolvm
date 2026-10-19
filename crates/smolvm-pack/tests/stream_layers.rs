@@ -3,9 +3,12 @@
 //! written and read back, and the tree still only appears under its own name
 //! once the whole archive and its digest have matched.
 //!
-//! Every platform runs these. The trees land in the entry's own `layers/` on
-//! Linux and Windows, and on macOS inside the entry's case-sensitive volume,
-//! which is what the case-colliding check relies on.
+//! Every platform runs these. Where the trees physically land differs, and the
+//! tests say where: on Linux the node's digest-keyed store (`<shared>/layers`),
+//! with the entry holding a fan-out of hard links; on macOS the case-sensitive
+//! volume inside the entry, which is what the case-colliding check relies on.
+//! Readers always look at the entry's own view ([`entry_layers`]), so the
+//! assertions about what a machine sees hold on both.
 //!
 //! Its own test binary: `set_host_layers_probe` is process-wide, and the other
 //! integration tests must keep the decision of the engine that runs them.
@@ -152,7 +155,7 @@ fn layer_id(layer: &[u8]) -> String {
 }
 
 /// Where readers of an entry find its layer trees: the entry's own `layers/` on
-/// Linux and Windows, the case-sensitive volume on macOS.
+/// Linux (a fan-out of the store), the case-sensitive volume on macOS.
 fn entry_layers(pack_dir: &Path) -> PathBuf {
     if cfg!(target_os = "macos") {
         host_layer_store(pack_dir, false).expect("the layer volume must resolve")
@@ -161,11 +164,15 @@ fn entry_layers(pack_dir: &Path) -> PathBuf {
     }
 }
 
-/// Where streaming installs the trees: the entry's own volume (`layers/`, or the
-/// case-sensitive volume on macOS). Readers see the same place: see
-/// [`entry_layers`].
-fn streamed_into(_shared_root: &Path, pack_dir: &Path) -> PathBuf {
-    entry_layers(pack_dir)
+/// Where streaming installs the trees: the node's digest-keyed store on Linux,
+/// the entry's own volume everywhere else (macOS cannot link across its
+/// volumes, and Windows has no shared extraction path).
+fn streamed_into(shared_root: &Path, pack_dir: &Path) -> PathBuf {
+    if cfg!(target_os = "linux") {
+        shared_root.join("layers")
+    } else {
+        entry_layers(pack_dir)
+    }
 }
 
 /// A pack entry's directory for a shared extraction, and the store root.
@@ -228,11 +235,11 @@ fn a_streamed_layer_lands_without_staging_its_tar() {
     assert!(view.join(&id).join("etc/streamed.conf").is_file());
 }
 
-/// A layer whose bytes do not hash to the name the pack gives it is not kept as
-/// a streamed layer, and the pack still extracts: the whole extraction falls
-/// back to the staged layout every smolvm before streaming produced, with a
-/// warning. Single-layer exports re-create their tar, so their names are not
-/// content addresses, and refusing them would break those packs.
+/// A layer whose bytes do not hash to the name the pack gives it is not kept in
+/// the node's content-addressed store, and the pack still extracts: the whole
+/// extraction falls back to the staged layout every smolvm before streaming
+/// produced, with a warning. Single-layer exports re-create their tar, so their
+/// names are not content addresses, and refusing them would break those packs.
 #[test]
 fn a_streamed_layer_whose_name_lies_falls_back_to_the_staged_layout() {
     host_that_streams_layers();
@@ -365,8 +372,8 @@ fn a_resumed_extraction_leaves_the_layers_that_finished_alone() {
     let before_dir = fs::metadata(&finished).unwrap();
 
     // The state a kill during the second layer leaves behind: the interrupted
-    // layer still under its `.partial` name, no tree of its own, and no
-    // completion marker for the extraction as a whole.
+    // layer still under its `.partial` name, no tree of its own in the store
+    // or the entry, and no completion marker for the extraction as a whole.
     let interrupted = streamed.join(&second_id);
     fs::remove_dir_all(&interrupted).unwrap();
     let _ = fs::remove_dir_all(entry_layers(&pack_dir).join(&second_id));

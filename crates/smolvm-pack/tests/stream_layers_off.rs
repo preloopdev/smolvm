@@ -1,11 +1,12 @@
 //! What an extraction leaves behind with both new paths switched off.
 //!
-//! `SMOLVM_STREAM_LAYERS=off` has to reproduce the staged-tar layout a pack has always been extracted into: the
+//! `SMOLVM_STREAM_LAYERS=off` and `SMOLVM_DISABLE_LAYER_STORE=1` have to
+//! reproduce the staged-tar layout a pack has always been extracted into: the
 //! tar next to the layer's name, the tree the host unpacks beside it, and no
 //! streamed-layers record. That layout is what every other reader (`pack export
 //! --from-vm`, the in-guest unpack, `cached_layers_usable`) resolves against.
 //!
-//! Its own test binary: the env var and the host-layers probe are process-wide,
+//! Its own test binary: the env vars and the host-layers probe are process-wide,
 //! and the streaming tests in `stream_layers.rs` set them the other way.
 
 use std::fs;
@@ -42,8 +43,9 @@ impl Drop for LayersVolume {
 }
 
 #[test]
-fn an_extraction_with_streaming_off_keeps_the_staged_tar_layout() {
+fn an_extraction_with_both_paths_off_keeps_the_staged_tar_layout() {
     std::env::set_var("SMOLVM_STREAM_LAYERS", "off");
+    std::env::set_var("SMOLVM_DISABLE_LAYER_STORE", "1");
     smolvm_pack::extract::set_host_layers_probe(|| true);
 
     let tmp = scratch();
@@ -96,6 +98,10 @@ fn an_extraction_with_streaming_off_keeps_the_staged_tar_layout() {
     assert!(
         !pack_dir.join("layers").join(STREAMED_LAYERS_FILE).exists(),
         "a staged extraction must not record streamed layers"
+    );
+    assert!(
+        !shared_root.join("layers").exists(),
+        "with the store disabled no node-wide layer store may be created"
     );
     assert!(
         smolvm_pack::extract::cached_layers_usable(&pack_dir),
