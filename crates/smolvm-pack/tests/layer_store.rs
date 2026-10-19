@@ -6,6 +6,7 @@
 //! digest). The pack-level tests are Linux-only: that is the one platform whose
 //! entries and store share a filesystem and an owner, which is what makes
 //! linking a layer in sound rather than a copy.
+#![cfg(target_os = "linux")]
 
 use std::fs;
 use std::path::{Path, PathBuf};

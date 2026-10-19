@@ -1739,12 +1739,6 @@ fn copy_user_xattrs(from: &Path, to: &Path) {
     }
 }
 
-/// Windows stores these attributes as alternate data streams rather than in a
-/// `user.*` namespace, and macOS keeps its attributes on the volume it links
-/// nothing into; both only ever build the store by unpacking.
-#[cfg(not(all(unix, not(target_os = "macos"))))]
-fn copy_user_xattrs(_from: &Path, _to: &Path) {}
-
 /// [`set_user_xattr`] with the name and value as bytes, so a whole attribute
 /// set can be replayed rather than one known constant.
 #[cfg(all(unix, not(target_os = "macos")))]

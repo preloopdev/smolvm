@@ -255,10 +255,10 @@ fn a_streamed_layer_whose_name_lies_falls_back_to_the_staged_layout() {
     smolvm_pack::extract::extract_sidecar_shared(&sidecar, &shared_root, &footer, false)
         .expect("a pack whose names are not digests must still extract");
     assert!(
-        !streamed_into(&shared_root, &pack_dir)
-            .join("0".repeat(64))
+        !entry_layers(&pack_dir)
+            .join(format!("{}{PARTIAL_DIR_SUFFIX}", "0".repeat(64)))
             .exists(),
-        "the content-addressed store must never take a layer that fails its name"
+        "the failed streamed attempt must leave no staging tree behind"
     );
     assert!(
         pack_dir
