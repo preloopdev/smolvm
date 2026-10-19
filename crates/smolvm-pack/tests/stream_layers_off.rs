@@ -26,7 +26,7 @@ fn scratch() -> tempfile::TempDir {
     } else {
         Path::new(env!("CARGO_TARGET_TMPDIR")).to_path_buf()
     };
-    fs::create_dir_all(root).unwrap();
+    fs::create_dir_all(&root).unwrap();
     tempfile::Builder::new()
         .prefix("stream-layers-off-")
         .tempdir_in(root)
