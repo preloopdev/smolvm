@@ -82,6 +82,25 @@ pub fn incoming_dir(store_dir: &Path) -> PathBuf {
     store_dir.join(INCOMING_DIR)
 }
 
+/// Directory a downloader stages verified layer blobs in, beside the pack.
+///
+/// A split pack's layers are not in the pack, so whoever downloads it has the
+/// bytes before anything extracts them: an engine asked to boot `<pack>` finds
+/// them at `<pack>.layers` without any environment or control-plane wiring —
+/// the same place, derived from the same path, at both ends.
+pub fn staged_layer_dir(pack: &Path) -> PathBuf {
+    let mut name = pack.as_os_str().to_owned();
+    name.push(".layers");
+    PathBuf::from(name)
+}
+
+/// Path of one staged layer blob: the zstd-compressed tar, named by the layer's
+/// uncompressed digest.
+pub fn staged_layer_blob(pack: &Path, diff_id: &str) -> PathBuf {
+    let hex = diff_id_hex(diff_id).unwrap_or("invalid-layer-digest");
+    staged_layer_dir(pack).join(format!("{}.tar.zst", hex.to_ascii_lowercase()))
+}
+
 /// Install one layer whose tar is read from `reader`, under `<store_dir>/<diff_id>/`.
 ///
 /// The bytes are unpacked into a `.partial` sibling and renamed into place, so
@@ -109,6 +128,13 @@ pub fn install_layer_from_reader<R: Read>(
         bytes: 0,
     };
     let installed = materialize_layer_from_reader(&mut hashing, &final_dir, owner_xattr);
+    // The unpacker stops at the archive's terminating zero blocks, but the tar's
+    // trailing padding is part of the layer's bytes: drain the rest of the
+    // (decompressed) stream through the hasher so the digest covers exactly the
+    // tar a publisher hashed, not just the entries an unpacker happened to read.
+    if installed.is_ok() {
+        let _ = std::io::copy(&mut hashing, &mut std::io::sink());
+    }
     let actual = format!("sha256:{:x}", hashing.hasher.finalize());
     match installed {
         Err(error) => Err(error),
@@ -416,14 +442,14 @@ mod tests {
     fn a_partial_install_is_not_a_layer() {
         let temp = tempfile::tempdir().unwrap();
         let store = temp.path().join("layers");
-        let diff_id = format!("sha256:{}", "ab".repeat(32));
+        let tar = tar_with("opt/hello.txt", b"hello");
+        let diff_id = format!("sha256:{:x}", Sha256::digest(&tar));
         let staging = store.join(format!("{}{}", diff_id_hex(&diff_id).unwrap(), PARTIAL_SUFFIX));
         std::fs::create_dir_all(staging.join("opt")).unwrap();
         std::fs::write(staging.join("opt/half.txt"), b"half").unwrap();
 
         assert!(!layer_present(&store, &diff_id));
 
-        let tar = tar_with("opt/hello.txt", b"hello");
         install_layer_from_reader(&store, &diff_id, Cursor::new(tar), false).unwrap();
 
         assert!(layer_present(&store, &diff_id));

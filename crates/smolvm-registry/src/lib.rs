@@ -64,7 +64,7 @@ pub struct OciManifest {
 }
 
 /// OCI content descriptor.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OciDescriptor {
     pub media_type: String,

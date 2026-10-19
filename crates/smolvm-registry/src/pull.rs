@@ -252,7 +252,6 @@ async fn pull_unrecorded(
         .filter(|layer| !layers.layer_present(&layer.diff_id))
         .cloned()
         .collect();
-    let skipped = split_layers.len() - missing.len();
     let grand_total = size + missing.iter().map(|layer| layer.size).sum::<u64>();
 
     // 3. Wait out any other pull of this blob, then check the cache: a pull that
@@ -363,7 +362,7 @@ async fn pull_unrecorded(
         size,
         cached: pack_cached,
         layers_fetched: installed.fetched,
-        layers_skipped: skipped + installed.skipped,
+        layers_skipped: installed.skipped,
         layer_bytes: installed.bytes,
     })
 }
@@ -618,50 +617,125 @@ async fn download_blob(
     let resumable = tokio::fs::try_exists(&partial_path).await.unwrap_or(false);
     if size >= plan.parallel_min_bytes && !resumable {
         let started = std::time::Instant::now();
-        match fetch_ranged(client, repo, digest, size, &ranged_path, plan, on_progress).await {
-            Ok(true) => {
-                let actual = hash_file(&ranged_path).await?;
-                if actual != *digest {
-                    discard_partial(&ranged_path).await;
-                    return Err(RegistryError::DigestMismatch {
-                        expected: digest.to_string(),
-                        actual,
-                    });
+        // A transient fault resumes the ranged file where it stopped: parts
+        // already on disk are not requested again, so a failed attempt on a
+        // multi-GiB layer costs the parts in flight, not the whole layer.
+        let mut attempt = 1;
+        loop {
+            match fetch_ranged(client, repo, digest, size, &ranged_path, plan, on_progress).await {
+                Ok(true) => {
+                    let actual = hash_file(&ranged_path).await?;
+                    if actual != *digest {
+                        discard_ranged(&ranged_path).await;
+                        return Err(RegistryError::DigestMismatch {
+                            expected: digest.to_string(),
+                            actual,
+                        });
+                    }
+                    tracing::info!(
+                        digest = %digest,
+                        size,
+                        streams = plan.streams,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "blob downloaded in ranged parts"
+                    );
+                    let _ = tokio::fs::remove_file(ranged_parts_path(&ranged_path)).await;
+                    tokio::fs::rename(&ranged_path, &partial_path).await?;
+                    return finish_download(digest, size, output, cache).await;
                 }
-                tracing::info!(
-                    digest = %digest,
-                    size,
-                    streams = plan.streams,
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "blob downloaded in ranged parts"
-                );
-                tokio::fs::rename(&ranged_path, &partial_path).await?;
-                return finish_download(digest, size, output, cache).await;
-            }
-            Ok(false) => {
-                tracing::info!(digest = %digest, "registry does not serve ranges; using one stream");
-            }
-            Err(error) => {
-                tracing::warn!(digest = %digest, %error, "ranged blob download failed; retrying as one stream");
-                discard_partial(&ranged_path).await;
+                Ok(false) => {
+                    tracing::info!(digest = %digest, "registry does not serve ranges; using one stream");
+                    break;
+                }
+                Err(error) if attempt < MAX_ATTEMPTS && is_retryable(&error) => {
+                    tracing::warn!(
+                        digest = %digest,
+                        attempt,
+                        %error,
+                        "ranged blob download interrupted; resuming its missing parts"
+                    );
+                    tokio::time::sleep(RETRY_BACKOFF * 2u32.pow(attempt - 1)).await;
+                    attempt += 1;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        digest = %digest,
+                        %error,
+                        "ranged blob download failed; continuing as one stream"
+                    );
+                    break;
+                }
             }
         }
     }
     download_with_resume(client, repo, digest, size, output, cache, on_progress).await
 }
 
-/// Fetch the blob into `partial_path` as `plan.part_bytes` parts over
-/// `plan.streams` concurrent ranged requests, each written in place.
+/// The record of which parts of a ranged download are on disk: one little-endian
+/// `u64` start offset per part, appended once that part's bytes are synced.
 ///
-/// The first part goes alone: it settles the registry token every other part
-/// reuses, and a registry answering it with the whole blob (200) means ranges
-/// are unsupported, reported as `Ok(false)` before any file is created.
+/// A part missing from the record is fetched again, which is always safe; a part
+/// in the record is never fetched again. That is what lets an interrupted layer
+/// resume where it stopped instead of starting over.
+fn ranged_parts_path(ranged_path: &Path) -> PathBuf {
+    ranged_path.with_extension("parts.partial")
+}
+
+/// Parts a previous attempt finished, from the record beside `ranged_path`.
+///
+/// Nothing is resumable unless the ranged file is there at the blob's full
+/// length; a record without its file, or a file without a record, starts over.
+async fn completed_ranged_parts(ranged_path: &Path, size: u64) -> std::collections::HashSet<u64> {
+    let parts_path = ranged_parts_path(ranged_path);
+    let sized = tokio::fs::metadata(ranged_path)
+        .await
+        .is_ok_and(|meta| meta.len() == size);
+    if !sized {
+        let _ = tokio::fs::remove_file(&parts_path).await;
+        return std::collections::HashSet::new();
+    }
+    tokio::fs::read(&parts_path)
+        .await
+        .unwrap_or_default()
+        .chunks_exact(8)
+        .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("8-byte chunk")))
+        .collect()
+}
+
+/// Record that the part starting at `start` is on disk.
+async fn record_ranged_part(ranged_path: &Path, start: u64) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut record = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(ranged_parts_path(ranged_path))
+        .await?;
+    record.write_all(&start.to_le_bytes()).await?;
+    record.flush().await?;
+    Ok(())
+}
+
+/// Remove a ranged file and its record, after a digest that does not match.
+async fn discard_ranged(ranged_path: &Path) {
+    discard_partial(ranged_path).await;
+    let _ = tokio::fs::remove_file(ranged_parts_path(ranged_path)).await;
+}
+
+/// Fetch the blob into `ranged_path` as `plan.part_bytes` parts over
+/// `plan.streams` concurrent ranged requests, each written in place and recorded
+/// once it is on disk.
+///
+/// A file an earlier attempt left is resumed: parts already in the record are
+/// not requested again. The first part still to fetch goes alone: it settles the
+/// registry token every other part reuses, and a registry answering it with the
+/// whole blob (200) means ranges are unsupported, reported as `Ok(false)` before
+/// any file is created.
 async fn fetch_ranged(
     client: &RegistryClient,
     repo: &str,
     digest: &str,
     size: u64,
-    partial_path: &Path,
+    ranged_path: &Path,
     plan: RangedPlan,
     on_progress: &mut (dyn FnMut(u64, u64) + Send),
 ) -> Result<bool> {
@@ -669,17 +743,38 @@ async fn fetch_ranged(
         .step_by(plan.part_bytes as usize)
         .map(|start| (start, (start + plan.part_bytes).min(size) - 1))
         .collect();
-    let Some(first) = fetch_part(client, repo, digest, parts[0]).await? else {
+    let completed = completed_ranged_parts(ranged_path, size).await;
+    let mut done: u64 = parts
+        .iter()
+        .filter(|(start, _)| completed.contains(start))
+        .map(|(start, end)| end - start + 1)
+        .sum();
+    on_progress(done, size);
+    let pending: Vec<(u64, u64)> = parts
+        .iter()
+        .copied()
+        .filter(|(start, _)| !completed.contains(start))
+        .collect();
+    let Some(&probe) = pending.first() else {
+        return Ok(true);
+    };
+    let Some(first) = fetch_part(client, repo, digest, probe).await? else {
         return Ok(false);
     };
-    let file = tokio::fs::File::create(partial_path).await?;
-    file.set_len(size).await?;
-    drop(file);
-    write_part(partial_path, 0, &first).await?;
-    let mut done = first.len() as u64;
+    if completed.is_empty() {
+        // Sized up front so every part lands at its own offset. A file with no
+        // record behind it is rebuilt from zero, never built on.
+        let file = tokio::fs::File::create(ranged_path).await?;
+        file.set_len(size).await?;
+        drop(file);
+        let _ = tokio::fs::remove_file(ranged_parts_path(ranged_path)).await;
+    }
+    write_part(ranged_path, probe.0, &first).await?;
+    record_ranged_part(ranged_path, probe.0).await?;
+    done += first.len() as u64;
     on_progress(done, size);
 
-    let mut rest = futures_util::stream::iter(parts[1..].iter().copied())
+    let mut rest = futures_util::stream::iter(pending[1..].iter().copied())
         .map(|(start, end)| async move {
             let bytes = fetch_part(client, repo, digest, (start, end))
                 .await?
@@ -687,7 +782,8 @@ async fn fetch_ranged(
                     status: 200,
                     body: "registry stopped serving ranges mid-download".into(),
                 })?;
-            write_part(partial_path, start, &bytes).await?;
+            write_part(ranged_path, start, &bytes).await?;
+            record_ranged_part(ranged_path, start).await?;
             Ok::<u64, RegistryError>(bytes.len() as u64)
         })
         .buffer_unordered(plan.streams);
@@ -717,13 +813,16 @@ async fn fetch_part(
     }
 }
 
-/// Write `bytes` into `path` at `offset`.
+/// Write `bytes` into `path` at `offset`, synced to disk before it returns.
 async fn write_part(path: &Path, offset: u64, bytes: &[u8]) -> Result<()> {
     use tokio::io::AsyncSeekExt;
     let mut file = tokio::fs::OpenOptions::new().write(true).open(path).await?;
     file.seek(std::io::SeekFrom::Start(offset)).await?;
     file.write_all(bytes).await?;
     file.flush().await?;
+    // A part is recorded as on disk only once its bytes are: a record must never
+    // name bytes that a crash could still lose.
+    file.sync_data().await?;
     Ok(())
 }
 
@@ -1218,9 +1317,10 @@ mod tests {
         let cache = BlobCache::open(tmp.path().to_path_buf(), 16 * 1024 * 1024).unwrap();
         let client = RegistryClient::new(server.uri());
 
+        let store = store_in(tmp.path());
         let (a, b) = tokio::join!(
-            pull(&client, "myrepo", "latest", None, &cache, &[], &store_in(tmp.path())),
-            pull(&client, "myrepo", "latest", None, &cache, &[], &store_in(tmp.path())),
+            pull(&client, "myrepo", "latest", None, &cache, &[], &store),
+            pull(&client, "myrepo", "latest", None, &cache, &[], &store),
         );
         let (a, b) = (a.expect("first pull"), b.expect("second pull"));
         assert_eq!(
@@ -1653,6 +1753,114 @@ mod tests {
         assert_eq!(tokio::fs::read(&cached).await.unwrap(), data);
     }
 
+    /// A registry that serves ranges until `budget` requests are answered, then
+    /// refuses every request: a connection that dies midway through a blob.
+    struct DyingRangeServer {
+        data: Vec<u8>,
+        budget: std::sync::atomic::AtomicUsize,
+        seen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl wiremock::Respond for DyingRangeServer {
+        fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
+            self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let served = self
+                .budget
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |left| left.checked_sub(1),
+                )
+                .is_ok();
+            if !served {
+                return ResponseTemplate::new(404);
+            }
+            RangeServer {
+                data: self.data.clone(),
+                fail_first: 0,
+                seen: Default::default(),
+            }
+            .respond(req)
+        }
+    }
+
+    /// A ranged download cut off midway resumes the parts it has not got: parts
+    /// already recorded on disk are not requested again.
+    #[tokio::test]
+    async fn a_ranged_download_resumes_the_parts_it_has_not_got() {
+        let (data, digest) = test_blob();
+        let total_parts = data.len().div_ceil(300);
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
+        let ranged_path = cache
+            .blob_path_for(&digest)
+            .with_extension(RANGED_PARTIAL_EXTENSION);
+
+        // First attempt: the connection dies after about half the parts.
+        let first_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/myrepo/blobs/{digest}")))
+            .respond_with(DyingRangeServer {
+                data: data.clone(),
+                budget: std::sync::atomic::AtomicUsize::new(total_parts / 2),
+                seen: Default::default(),
+            })
+            .mount(&first_server)
+            .await;
+        let first = download_blob(
+            &RegistryClient::new(first_server.uri()),
+            "myrepo",
+            &digest,
+            data.len() as u64,
+            None,
+            &cache,
+            small_plan(),
+            &mut |_, _| {},
+        )
+        .await;
+        assert!(first.is_err(), "the cut-off attempt must not report success");
+        let recorded = std::fs::metadata(ranged_parts_path(&ranged_path))
+            .unwrap()
+            .len()
+            / 8;
+        assert!(
+            recorded >= 1 && (recorded as usize) < total_parts,
+            "recorded {recorded} of {total_parts} parts"
+        );
+
+        // Second attempt against a healthy registry: only unrecorded parts go out.
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let second_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/myrepo/blobs/{digest}")))
+            .respond_with(RangeServer {
+                data: data.clone(),
+                fail_first: 0,
+                seen: seen.clone(),
+            })
+            .mount(&second_server)
+            .await;
+        download_blob(
+            &RegistryClient::new(second_server.uri()),
+            "myrepo",
+            &digest,
+            data.len() as u64,
+            None,
+            &cache,
+            small_plan(),
+            &mut |_, _| {},
+        )
+        .await
+        .expect("the resumed download must complete");
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            total_parts - recorded as usize,
+            "the resumed attempt must request exactly the parts not yet on disk"
+        );
+        let cached = cache.get(&digest).expect("blob must be adopted into cache");
+        assert_eq!(tokio::fs::read(&cached).await.unwrap(), data);
+    }
+
     /// A registry that ignores ranges is read once as a whole, not once per part.
     #[tokio::test]
     async fn a_registry_without_ranges_falls_back_to_one_stream() {
@@ -1903,6 +2111,10 @@ mod tests {
         let cache = BlobCache::open(tmp.path().join("cache"), 1 << 30).unwrap();
         let store = store_in(tmp.path());
         install_layer(&store, present);
+        assert!(
+            store.layer_present(&present.diff_id),
+            "the pre-installed layer must read as present in the store"
+        );
 
         let result = pull(
             &RegistryClient::new(server.uri()),
@@ -1916,7 +2128,11 @@ mod tests {
         .await
         .expect("split pull must succeed");
 
-        assert_eq!(result.layers_fetched, 1);
+        assert_eq!(
+            (result.layers_fetched, result.layers_skipped),
+            (1, 1),
+            "expected one fetched and one already-present layer"
+        );
         assert_eq!(result.layers_skipped, 1);
         assert_eq!(result.layer_bytes, missing.blob_size);
         assert!(store.layer_present(&present.diff_id));
@@ -1944,12 +2160,13 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_bytes(first.blob_bytes.clone()))
             .mount(&server)
             .await;
-        // The registry hands back bytes that are not the blob the manifest
-        // promised.
+        // The registry hands back bytes of the promised length that are not the
+        // blob the manifest promised.
         Mock::given(method("GET"))
             .and(path(format!("/v2/myrepo/blobs/{}", corrupt.blob_digest)))
             .respond_with(
-                ResponseTemplate::new(200).set_body_bytes(corrupt.blob_bytes[..8].to_vec()),
+                ResponseTemplate::new(200)
+                    .set_body_bytes(vec![0x58_u8; corrupt.blob_bytes.len()]),
             )
             .mount(&server)
             .await;
@@ -2015,6 +2232,7 @@ mod tests {
 
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorder = seen.clone();
+        let resumed_bytes = resumed.blob_bytes.clone();
         Mock::given(method("GET"))
             .and(path(format!("/v2/myrepo/blobs/{}", resumed.blob_digest)))
             .respond_with(move |request: &wiremock::Request| {
@@ -2030,9 +2248,7 @@ mod tests {
                     .and_then(|rest| rest.strip_suffix('-'))
                     .and_then(|value| value.parse::<usize>().ok())
                     .unwrap_or(0);
-                ResponseTemplate::new(206).set_body_bytes(
-                    resumed.blob_bytes[offset..].to_vec(),
-                )
+                ResponseTemplate::new(206).set_body_bytes(resumed_bytes[offset..].to_vec())
             })
             .expect(1)
             .mount(&server)

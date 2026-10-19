@@ -220,6 +220,12 @@ mod tests {
         }
     }
 
+    /// A full-width digest for a one- or two-character seed, so fixture
+    /// manifests carry digests the client will actually accept.
+    fn digest(seed: &str) -> String {
+        format!("sha256:{}", seed.repeat(32))
+    }
+
     fn layer_annotated(digest: &str, diff_id: &str) -> OciDescriptor {
         OciDescriptor {
             annotations: Some(BTreeMap::from([(
@@ -239,12 +245,12 @@ mod tests {
     fn a_single_blob_manifest_classifies_as_single() {
         let layout = classify(&manifest(
             Some(LAYER_MEDIA_TYPE),
-            vec![OciDescriptor::new(LAYER_MEDIA_TYPE, "sha256:aa", 7)],
+            vec![OciDescriptor::new(LAYER_MEDIA_TYPE, &digest("aa"), 7)],
         ))
         .unwrap();
         match layout {
             ArtifactLayout::Single { layer } => {
-                assert_eq!(layer.digest, "sha256:aa");
+                assert_eq!(layer.digest, digest("aa"));
                 assert_eq!(layer.size, 7);
             }
             other => panic!("expected a single blob, got {other:?}"),
@@ -258,13 +264,13 @@ mod tests {
         let manifest = manifest(
             Some(SPLIT_ARTIFACT_TYPE),
             vec![
-                OciDescriptor::new(SPLIT_BASE_MEDIA_TYPE, "sha256:base", 99),
-                layer_annotated("sha256:b1", &format!("sha256:{}", hex("11"))),
-                layer_annotated("sha256:b2", &hex("22")),
+                OciDescriptor::new(SPLIT_BASE_MEDIA_TYPE, &digest("ba"), 99),
+                layer_annotated(&digest("b1"), &format!("sha256:{}", hex("11"))),
+                layer_annotated(&digest("b2"), &hex("22")),
             ],
         );
         let layout = classify(&manifest).unwrap();
-        assert_eq!(layout.pack_descriptor().digest, "sha256:base");
+        assert_eq!(layout.pack_descriptor().digest, digest("ba"));
         assert_eq!(
             layout.layer_diff_ids(),
             vec![
@@ -283,9 +289,9 @@ mod tests {
         let layout = classify(&manifest(
             Some(SPLIT_ARTIFACT_TYPE),
             vec![
-                OciDescriptor::new(SPLIT_BASE_MEDIA_TYPE, "sha256:base", 99),
-                layer_annotated("sha256:b1", &first),
-                layer_annotated("sha256:b2", &second),
+                OciDescriptor::new(SPLIT_BASE_MEDIA_TYPE, &digest("ba"), 99),
+                layer_annotated(&digest("b1"), &first),
+                layer_annotated(&digest("b2"), &second),
             ],
         ))
         .unwrap();
@@ -300,7 +306,7 @@ mod tests {
             Some("application/vnd.smolmachines.smolmachine.v3+something"),
             vec![OciDescriptor::new(
                 "application/vnd.smolmachines.smolmachine.v3",
-                "sha256:aa",
+                &digest("aa"),
                 1,
             )],
         ))
@@ -317,8 +323,8 @@ mod tests {
         let error = classify(&manifest(
             Some(SPLIT_ARTIFACT_TYPE),
             vec![
-                OciDescriptor::new(SPLIT_BASE_MEDIA_TYPE, "sha256:base", 99),
-                OciDescriptor::new(SPLIT_LAYER_MEDIA_TYPE, "sha256:b1", 10),
+                OciDescriptor::new(SPLIT_BASE_MEDIA_TYPE, &digest("ba"), 99),
+                OciDescriptor::new(SPLIT_LAYER_MEDIA_TYPE, &digest("b1"), 10),
             ],
         ))
         .unwrap_err();
@@ -335,8 +341,8 @@ mod tests {
         let error = classify(&manifest(
             Some(SPLIT_ARTIFACT_TYPE),
             vec![
-                OciDescriptor::new(SPLIT_BASE_MEDIA_TYPE, "sha256:base", 99),
-                layer_annotated("sha256:b1", "sha256:../../etc/passwd"),
+                OciDescriptor::new(SPLIT_BASE_MEDIA_TYPE, &digest("ba"), 99),
+                layer_annotated(&digest("b1"), "sha256:../../etc/passwd"),
             ],
         ))
         .unwrap_err();
@@ -349,7 +355,7 @@ mod tests {
     fn a_split_manifest_without_a_base_fails_closed() {
         let error = classify(&manifest(
             Some(SPLIT_ARTIFACT_TYPE),
-            vec![layer_annotated("sha256:b1", &hex("11"))],
+            vec![layer_annotated(&digest("b1"), &hex("11"))],
         ))
         .unwrap_err();
         assert!(error.to_string().contains(SPLIT_BASE_MEDIA_TYPE), "{error}");
@@ -362,9 +368,9 @@ mod tests {
         let error = classify(&manifest(
             Some(SPLIT_ARTIFACT_TYPE),
             vec![
-                OciDescriptor::new(SPLIT_BASE_MEDIA_TYPE, "sha256:base", 99),
-                layer_annotated("sha256:b1", &hex("11")),
-                OciDescriptor::new("application/vnd.example.layer", "sha256:b2", 3),
+                OciDescriptor::new(SPLIT_BASE_MEDIA_TYPE, &digest("ba"), 99),
+                layer_annotated(&digest("b1"), &hex("11")),
+                OciDescriptor::new("application/vnd.example.layer", &digest("b2"), 3),
             ],
         ))
         .unwrap_err();

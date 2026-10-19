@@ -188,7 +188,7 @@ pub fn split_pack(pack: &Path, cache: &SplitCache) -> Result<SplitPack> {
     let collector = AssetCollector::new(staging.clone())?;
     let packed = Packer::new(base_manifest)
         .with_asset_collector(collector)
-        .pack_artifact(base_tmp)?;
+        .pack_artifact(&base_tmp)?;
     debug_assert_eq!(packed.sidecar_path.as_deref(), Some(base_tmp.as_path()));
     fs::rename(&base_tmp, &base_path)?;
     let _ = fs::remove_dir_all(&staging);
@@ -273,13 +273,11 @@ fn derive_layers(
     let mut file = fs::File::open(pack)?;
     file.seek(SeekFrom::Start(footer.assets_offset))?;
     let assets = file.take(footer.assets_size);
-    let decoder = zstd::stream::read::Decoder::new(BufReader::new(assets))
-        .map_err(|error| PackError::Compression(error.to_string()))?;
 
     let mut layers: Vec<SplitLayer> = Vec::new();
     let mut failure: Option<PackError> = None;
     unpack_assets_skipping(
-        decoder,
+        BufReader::new(assets),
         staging,
         |path| is_layer_member(path),
         |path, reader| {
@@ -315,7 +313,7 @@ fn is_layer_member(path: &Path) -> bool {
 /// A layer whose blob is already cached at the same digest is reused: the
 /// compressed bytes are identical by construction, so the freshly compressed
 /// copy is dropped rather than replacing an identical file.
-fn compress_one_layer<R: Read>(
+fn compress_one_layer<R: Read + ?Sized>(
     member_path: &Path,
     member: &mut R,
     cache: &SplitCache,
@@ -330,7 +328,8 @@ fn compress_one_layer<R: Read>(
     let _ = fs::remove_file(&temp);
     let layer: CompressedLayer = compress_layer_blob(member, &temp)?;
     let hex = diff_id_hex(&layer.diff_id)
-        .ok_or_else(|| PackError::Compression("a layer hashed to a non-sha256 identity".into()))?;
+        .ok_or_else(|| PackError::Compression("a layer hashed to a non-sha256 identity".into()))?
+        .to_owned();
     let blob_file = format!("{hex}.tar.zst");
     let blob_path = cache.blobs_dir().join(&blob_file);
     let record_path = cache.blobs_dir().join(format!("{hex}.json"));
@@ -417,6 +416,28 @@ fn reconcile_with_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest as _;
+
+    /// The member paths of a pack's assets archive, in tar order.
+    fn assets_members(pack: &Path) -> Vec<String> {
+        let footer = read_footer_from_sidecar(pack).unwrap();
+        let mut file = std::fs::File::open(pack).unwrap();
+        file.seek(SeekFrom::Start(footer.assets_offset)).unwrap();
+        let decoder = zstd::stream::read::Decoder::new(file.take(footer.assets_size)).unwrap();
+        let mut archive = tar::Archive::new(decoder);
+        archive
+            .entries()
+            .unwrap()
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .path()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    }
 
     /// A tar of one file, as a layer's bytes.
     fn layer_tar(name: &str, body: &[u8]) -> Vec<u8> {
@@ -483,22 +504,27 @@ mod tests {
         assert!(!split.cached);
         assert_eq!(split.layers.len(), 3);
 
-        // Every layer blob exists, and its bytes are the layer's tar.
-        for layer in &split.layers {
+        // Every layer blob exists, holds the layer's own tar, and is named and
+        // digested by that tar's content (not by the digest the pack happened to
+        // record for it).
+        for (layer, (_, expected)) in split.layers.iter().zip(layers.iter()) {
             let blob = layer.blob_path(&cache.blobs_dir());
             let bytes = std::fs::read(&blob).unwrap();
             assert_eq!(bytes.len() as u64, layer.blob_size);
+            let (blob_digest, blob_size) =
+                crate::layer_store::sha256_reader(std::io::Cursor::new(&bytes)).unwrap();
+            assert_eq!(blob_digest, layer.blob_digest);
+            assert_eq!(blob_size, layer.blob_size);
             let decoded: Vec<u8> = zstd::stream::read::Decoder::new(&bytes[..])
                 .unwrap()
                 .bytes()
                 .collect::<std::io::Result<_>>()
                 .unwrap();
-            let expected = layers
-                .iter()
-                .find(|(digest, _)| format!("sha256:{digest}") == layer.diff_id)
-                .map(|(_, bytes)| bytes.clone())
-                .unwrap();
-            assert_eq!(decoded, expected);
+            assert_eq!(&decoded, expected);
+            assert_eq!(
+                layer.diff_id,
+                format!("sha256:{:x}", sha2::Sha256::digest(expected))
+            );
         }
 
         // The base is a valid pack that names every layer and carries none.
@@ -514,14 +540,17 @@ mod tests {
             assert_eq!(entry.path, format!("layers/{}.tar", diff_id_hex(&layer.diff_id).unwrap()));
             assert_eq!(entry.size, layer.uncompressed_size);
         }
-        let extracted = temp.path().join("base-assets");
-        crate::packer::extract_assets(&split.base_path, &extracted).unwrap();
-        assert!(extracted.join("agent-rootfs.tar").is_file());
-        assert!(!extracted.join("layers").read_dir().unwrap().any(|entry| entry
-            .unwrap()
-            .path()
-            .extension()
-            .is_some_and(|ext| ext == "tar")));
+        let members = assets_members(&split.base_path);
+        assert!(
+            members.iter().any(|member| member == "agent-rootfs.tar"),
+            "the base keeps every non-layer member: {members:?}"
+        );
+        assert!(
+            !members
+                .iter()
+                .any(|member| member.starts_with("layers/") && member.ends_with(".tar")),
+            "the base must carry no layer tars: {members:?}"
+        );
         // The base pack is complete on its own: its assets and manifest hash to
         // the checksum in its footer.
         assert!(crate::packer::verify_sidecar_checksum(
@@ -546,7 +575,10 @@ mod tests {
         assert!(!first.cached);
         let second = split_pack(&pack, &cache).unwrap();
         assert!(second.cached);
-        assert_eq!(first, second);
+        assert_eq!(first.base_digest, second.base_digest);
+        assert_eq!(first.base_size, second.base_size);
+        assert_eq!(first.layers, second.layers);
+        assert!(!first.cached);
 
         // A truncated blob stops being a cache hit rather than shipping a
         // half-written layer.
