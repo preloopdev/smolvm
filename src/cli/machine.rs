@@ -541,6 +541,13 @@ pub struct RunCmd {
     #[arg(short = 'I', long, value_name = "IMAGE", value_parser = parse_image)]
     pub image: Option<String>,
 
+    /// Keep a local image archive's layers apart instead of flattening them on
+    /// import (only meaningful with an archive or rootfs directory image). The
+    /// guest's lowerdirs then are the image's own layers, so
+    /// `pack create --from-vm --preserve-layers` can copy them unchanged.
+    #[arg(long)]
+    pub preserve_image_layers: bool,
+
     /// Raise the max accepted local image-archive size (e.g. 16GiB, 512M, or a
     /// raw byte count); default 8GiB. For legitimately large images — sets
     /// SMOLVM_MAX_IMAGE_BYTES for this run.
@@ -1540,6 +1547,9 @@ impl RunCmd {
         params.disks = parse_attached_disks(&self.disk)?;
         params.cache_disk = parse_cache_disk(self.cache_disk.as_deref())?;
         params.allow_system_mounts = self.allow_system_mounts;
+        if self.preserve_image_layers {
+            params.preserve_image_layers = true;
+        }
         if self.auto_graph {
             smolvm::util::enable_cuda_auto_graph_env_specs(&mut params.env);
             params.cuda = true;
@@ -2026,6 +2036,7 @@ impl RunCmd {
             ssh_agent_socket,
             cuda: self.cuda || params.cuda,
             expose_docker: self.docker_socket || params.docker_socket,
+            preserve_image_layers: params.preserve_image_layers,
             dns_filter_hosts: params.dns_filter_hosts.clone(),
             credentials: params.credential_policy.as_ref().and_then(|policy| {
                 smolvm::credentials::CredentialLaunch::from_parts(
@@ -4465,6 +4476,13 @@ pub struct CreateCmd {
     #[arg(short = 'I', long, value_name = "IMAGE", value_parser = parse_image)]
     pub image: Option<String>,
 
+    /// Keep a local image archive's layers apart instead of flattening them on
+    /// import (only meaningful with an archive or rootfs directory image). The
+    /// guest's lowerdirs then are the image's own layers, so
+    /// `pack create --from-vm --preserve-layers` can copy them unchanged.
+    #[arg(long)]
+    pub preserve_image_layers: bool,
+
     /// Raise the max accepted local image-archive size (e.g. 16GiB, 512M, or a
     /// raw byte count); default 8GiB. For legitimately large images — sets
     /// SMOLVM_MAX_IMAGE_BYTES for this run.
@@ -4973,6 +4991,9 @@ impl CreateCmd {
             });
         }
         params.allow_system_mounts = self.allow_system_mounts;
+        if self.preserve_image_layers {
+            params.preserve_image_layers = true;
+        }
         if self.auto_graph {
             smolvm::util::enable_cuda_auto_graph_env_specs(&mut params.env);
             params.cuda = true;
@@ -5466,6 +5487,7 @@ impl CreateCmd {
             cuda_fork_pool_size: None,
             cuda_vram_limit_mib: None,
             docker_socket: self.docker_socket,
+            preserve_image_layers: self.preserve_image_layers,
             dns_filter_hosts,
             published_sockets: parse_published_sockets(&self.expose_socket, &self.mount_socket)?,
             gpu: manifest.gpu,

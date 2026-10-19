@@ -1971,6 +1971,26 @@ impl AgentClient {
         self.receive_stream_to_path(local_path, cap, on_progress, "flatten layers")
     }
 
+    /// Stream a guest directory out as an OCI image layer tar into `local_path`.
+    ///
+    /// Unlike [`Self::flatten_layers_to_path`] this does not merge: the directory
+    /// (an overlayfs upper) is written as one layer, with its overlay markers in
+    /// OCI form. An agent that predates the request rejects it as an unknown
+    /// variant, which is reported as version skew rather than a generic failure.
+    pub fn export_directory_layer_to_path<F: FnMut(u64)>(
+        &mut self,
+        source: &str,
+        local_path: &std::path::Path,
+        cap: u64,
+        on_progress: F,
+    ) -> Result<u64> {
+        let _timeout_guard = self.set_extended_read_timeout(flatten_timeout())?;
+        self.send_raw(&AgentRequest::ExportDirectoryLayer {
+            source: source.to_string(),
+        })?;
+        self.receive_stream_to_path(local_path, cap, on_progress, "export directory layer")
+    }
+
     /// Get storage status.
     ///
     /// Reports current guest storage usage, independently of configured limits.

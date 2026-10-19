@@ -18,6 +18,16 @@
 //! decompression stays pure-Rust (gzip via `flate2`/miniz_oxide, zstd via
 //! `ruzstd`), so both callers share this one copy.
 
+mod archive;
+// Writing a layer from a directory needs the unix metadata and overlay xattrs.
+// Only the Linux guest (and its unix test hosts) ever calls it.
+#[cfg(unix)]
+mod export;
+
+pub use archive::{for_each_archive_layer, read_archive_layers, ArchiveLayer};
+#[cfg(unix)]
+pub use export::{export_layer_tar, ExportStats};
+
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -240,15 +250,26 @@ pub fn extract_oci_layer<R: Read>(reader: R, dest: &Path) -> std::io::Result<()>
 /// entries. Computing this while tar headers are already in hand avoids a full
 /// post-extraction directory walk, which is especially costly inside a VM for
 /// package-heavy images containing hundreds of thousands of files.
+///
+/// Layers arrive gzip- or zstd-compressed (or, rarely, plain). Decompress
+/// transparently so a zstd layer no longer breaks extraction.
 pub fn extract_oci_layer_with_size<R: Read>(reader: R, dest: &Path) -> std::io::Result<u64> {
+    let reader = decompress_layer_reader(reader)?;
+    extract_oci_layer_tar_with_size(reader, dest)
+}
+
+/// [`extract_oci_layer_with_size`] for a reader that is already an uncompressed
+/// layer tar.
+///
+/// A caller that has to see the *uncompressed* tar bytes — to hash them into the
+/// layer's diff id while extracting, say — decompresses once itself and calls
+/// this, rather than decompressing twice or duplicating the extraction.
+pub fn extract_oci_layer_tar_with_size<R: Read>(reader: R, dest: &Path) -> std::io::Result<u64> {
     #[cfg(unix)]
     use std::collections::{HashMap, HashSet};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    // Layers arrive gzip- or zstd-compressed (or, rarely, plain). Decompress
-    // transparently so a zstd layer no longer breaks extraction.
-    let reader = decompress_layer_reader(reader)?;
     let mut archive = tar::Archive::new(reader);
     archive.set_preserve_permissions(true);
     archive.set_preserve_mtime(true);
