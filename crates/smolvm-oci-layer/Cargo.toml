@@ -18,6 +18,9 @@ path = "src/lib.rs"
 tar = "0.4"
 flate2 = "1"
 ruzstd = "0.9.1"
+# Reading an image archive's manifest/index/config members (docker-save and OCI
+# layout both describe their layers as JSON).
+serde_json = "1"
 tracing = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -29,3 +32,5 @@ libc = "0.2"
 tempfile = "3"
 # C-backed zstd is fine in tests (host-only, no musl link) for encoding fixtures.
 zstd = "0.13"
+# Fixture layer digests (blob and diff ids) in the archive tests.
+sha2 = "0.10"

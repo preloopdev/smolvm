@@ -710,6 +710,13 @@ pub struct VmRecord {
     #[serde(default)]
     pub docker_socket: bool,
 
+    /// Keep a local image archive's layers as separate layers, one directory each
+    /// named by diff id, instead of flattening them into one rootfs. Set at
+    /// `machine create --preserve-image-layers`; a machine built this way can be
+    /// exported with `pack create --from-vm --preserve-layers`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub preserve_image_layers: bool,
+
     /// Hostnames for DNS filtering. When set, the guest DNS proxy filters
     /// queries against this allowlist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -958,6 +965,7 @@ impl VmRecord {
             cuda_vram_limit_mib: None,
             cuda_preload_modules: false,
             docker_socket: false,
+            preserve_image_layers: false,
             dns_filter_hosts: None,
             credential_policy: None,
             external_interceptor_required: false,
@@ -1056,6 +1064,7 @@ impl VmRecord {
             cuda_vram_limit_mib: None,
             cuda_preload_modules: false,
             docker_socket: false,
+            preserve_image_layers: false,
             dns_filter_hosts: None,
             credential_policy: None,
             external_interceptor_required: false,

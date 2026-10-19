@@ -3574,6 +3574,8 @@ dependencies = [
  "flate2",
  "libc",
  "ruzstd",
+ "serde_json",
+ "sha2",
  "tar",
  "tempfile",
  "tracing",

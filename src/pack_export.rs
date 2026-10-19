@@ -39,6 +39,10 @@ pub struct FromVmExportOptions {
     /// Rebuild base layers from `vm.image` (re-pull from the registry)
     /// instead of preserving the machine's cached or imported layers.
     pub rebase_from_image: bool,
+    /// Keep the machine's image layers as layers of their own, and ship the
+    /// machine's own writes as one new top layer, instead of flattening
+    /// everything into a single layer.
+    pub preserve_layers: bool,
     /// Also capture the machine's `/workspace` so a machine made from the pack
     /// starts with those files. It lives on the storage disk, which container
     /// packs otherwise never carry, so without this a pack silently loses it.
@@ -140,15 +144,27 @@ pub fn collect_from_vm_assets(
     let mut image_user: Option<String> = None;
 
     if is_artifact_sourced && !opts.rebase_from_image {
-        export_flattened_from_artifact_sourced(
-            collector,
-            vm_name,
-            &overlay_owner,
-            &vm_dir,
-            staging_dir,
-            vm.source_smolmachine.as_deref(),
-            opts.include_workspace,
-        )?;
+        if opts.preserve_layers {
+            export_preserved_from_artifact_sourced(
+                collector,
+                vm_name,
+                &overlay_owner,
+                &vm_dir,
+                staging_dir,
+                vm.source_smolmachine.as_deref(),
+                opts.include_workspace,
+            )?;
+        } else {
+            export_flattened_from_artifact_sourced(
+                collector,
+                vm_name,
+                &overlay_owner,
+                &vm_dir,
+                staging_dir,
+                vm.source_smolmachine.as_deref(),
+                opts.include_workspace,
+            )?;
+        }
     } else if is_image_based {
         let image = vm.image.clone().unwrap();
         // A locally-sourced image (`--image -` / `--image file.tar` / a rootfs
@@ -157,19 +173,42 @@ pub fn collect_from_vm_assets(
         // message instead of a confusing registry "UNAUTHORIZED" on
         // `local:<hash>`.
         if crate::data::image_source::is_local_ref(&image) {
-            // No registry manifest to re-pull, but the base rootfs is still
-            // reachable: an archive was flattened onto the machine's own storage
-            // disk at boot, and a rootfs dir is still the host directory the
-            // machine boots from. Either can be the lower layer.
-            export_flattened_from_local_image(
-                collector,
-                vm_name,
-                &overlay_owner,
-                &vm_dir,
-                &image,
-                opts.include_workspace,
-            )?;
+            // No registry manifest to re-pull, but the base is still reachable:
+            // an archive is on the host in the cache the machine booted from,
+            // and a rootfs dir is still the host directory the machine boots
+            // from. Either can be the base layers.
+            if opts.preserve_layers {
+                export_preserved_from_local_image(
+                    collector,
+                    vm_name,
+                    &overlay_owner,
+                    &vm_dir,
+                    &image,
+                    opts.include_workspace,
+                )?;
+            } else {
+                export_flattened_from_local_image(
+                    collector,
+                    vm_name,
+                    &overlay_owner,
+                    &vm_dir,
+                    &image,
+                    opts.include_workspace,
+                )?;
+            }
         } else {
+            if opts.preserve_layers {
+                return Err(Error::agent(
+                    "pack from VM",
+                    format!(
+                        "--preserve-layers cannot keep the layers of a registry image machine \
+                         ('{image}'): its layers live decompressed in the guest, and re-tarring \
+                         them would not reproduce the image's own layer digests. Create the \
+                         machine from a `docker save` archive (or drop --preserve-layers to \
+                         export one flattened layer)."
+                    ),
+                ));
+            }
             (image_env, image_user) = export_flattened_from_registry_image(
                 collector,
                 vm_name,
@@ -1201,7 +1240,7 @@ fn export_flattened_from_local_image(
     // The copy is confined to that case deliberately: it is a second full-size
     // copy of the image on a disk whose size was guessed from the source, and
     // taking it for an archive too is what runs a large export out of space.
-    let lower = if is_dir_source {
+    let lowers: Vec<String> = if is_dir_source {
         println!("Staging the machine's base layer for flatten...");
         let dst = "/storage/stage/0".to_string();
         let stage_cmd = format!(
@@ -1224,64 +1263,439 @@ fn export_flattened_from_local_image(
                 ),
             ));
         }
-        dst
+        vec![dst]
     } else {
-        locate_flattened_archive_rootfs(&mut client, vm_name)?
+        locate_flattened_archive_lowers(&mut client, vm_name)?
     };
 
-    flatten_and_export(
-        collector,
-        &mut client,
-        overlay_owner,
-        &[lower],
-        include_workspace,
-    )
+    flatten_and_export(collector, &mut client, overlay_owner, &lowers, include_workspace)
+}
+/// Export a local-archive machine with its layers kept apart.
+///
+/// The base layers are copied straight out of the archive the machine booted
+/// from — the same bytes, so the same diff ids the image was published with —
+/// and the machine's own writes become one new top layer, exported by the guest
+/// with its overlayfs markers translated into OCI `.wh.` entries. Nothing is
+/// merged, so a consumer that already holds the base layers fetches only the
+/// top one, and a rebake that changes only the contract produces the same base
+/// layers again.
+///
+/// A rootfs-directory machine (`local-dir:`) has no layers to preserve: its
+/// base is the host directory itself, and it is exported as one layer.
+fn export_preserved_from_local_image(
+    collector: &mut AssetCollector,
+    vm_name: &str,
+    overlay_owner: &str,
+    vm_dir: &Path,
+    image: &str,
+    include_workspace: bool,
+) -> crate::Result<()> {
+    let host_dir = crate::data::image_source::packed_layers_dir_for_ref(image);
+    let is_dir_source = image.starts_with("local-dir:");
+
+    // No network: every input is already on the host, so the helper never
+    // resolves a name. A rootfs dir is shared in as `/packed_layers`.
+    let export_vm = ExportVm::start(vm_name, vm_dir, host_dir.clone(), false, None)?;
+    let mut client = export_vm.connect()?;
+    export_vm.mount_source_storage(&mut client)?;
+
+    if is_dir_source {
+        // The rootfs dir is an image of its own: one layer, tarred in the guest
+        // so ownership and markers come from the directory as the machine sees
+        // it.
+        export_guest_directory_layer(collector, &mut client, "/packed_layers", "rootfs layer")?;
+    } else {
+        let archive = crate::data::image_source::archive_file_for_ref(image)
+            .filter(|path| path.is_file())
+            .ok_or_else(|| {
+                Error::agent(
+                    "pack from VM",
+                    format!(
+                        "machine '{vm_name}' was created from the local image archive {image}, \
+                         but the archive is no longer in the host's image cache. Re-create the \
+                         machine from the archive, or drop --preserve-layers to export one \
+                         flattened layer from the machine's own copy."
+                    ),
+                )
+            })?;
+        stage_archive_layers_verbatim(&archive, collector)?;
+    }
+
+    export_overlay_upper_layer(collector, &mut client, overlay_owner)?;
+    if include_workspace {
+        export_workspace_seed(collector, &mut client)?;
+    }
+    Ok(())
 }
 
-/// The flattened rootfs of a local *archive* image on the source machine's
-/// storage disk, as a helper-local path.
+/// Export an artifact-sourced machine (one created from `--from
+/// <pack>.smolmachine`) with its layers kept apart.
 ///
-/// The directory is keyed by a content hash the exporter does not have, so it is
-/// discovered rather than computed; a machine boots exactly one local archive,
-/// so a single match is expected.
-fn locate_flattened_archive_rootfs(
-    client: &mut AgentClient,
+/// The machine's imported layers are already layer tars — either staged as
+/// `layers/<id>.tar` for the guest to unpack, or unpacked by the host into
+/// `layers/<id>/`. Only the staged tars can be handed on unchanged; a host that
+/// unpacked them (root Linux with the per-VM uid drop active) has no tar left to
+/// copy, and re-tarring the extracted tree would not reproduce the pack's own
+/// layer digests.
+fn export_preserved_from_artifact_sourced(
+    collector: &mut AssetCollector,
     vm_name: &str,
-) -> crate::Result<String> {
-    let (exit_code, stdout, _) = client.vm_exec(
-        vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            "ls -d /mnt/source-storage/image-archives/*/0000_rootfs 2>/dev/null".to_string(),
-        ],
+    overlay_owner: &str,
+    vm_dir: &Path,
+    _staging_dir: &Path,
+    source_smolmachine: Option<&str>,
+    include_workspace: bool,
+) -> crate::Result<()> {
+    let cache_dir = machine_layers_cache_dir(vm_name);
+    let pack_content_dir = read_shared_pack_pointer(&cache_dir).unwrap_or(cache_dir.clone());
+    let layer_ids = ordered_cached_layer_ids(&pack_content_dir).ok_or_else(|| {
+        Error::agent(
+            "pack from VM",
+            format!(
+                "VM '{vm_name}' was created from a .smolmachine artifact, but its imported layer \
+                 cache is missing ({}). Restore the source artifact ({}), start the machine once \
+                 so it re-extracts, or drop --preserve-layers.",
+                pack_content_dir.display(),
+                source_smolmachine.unwrap_or("unknown path"),
+            ),
+        )
+    })?;
+
+    let mut tars = Vec::new();
+    for id in &layer_ids {
+        if !id.ends_with(".tar") {
+            return Err(Error::agent(
+                "pack from VM",
+                format!(
+                    "--preserve-layers cannot keep layer '{}' of machine '{vm_name}': the host \
+                     unpacked this artifact's layers into directories, so the layer tar is gone \
+                     and re-tarring the tree would produce a different digest. Export flattened \
+                     instead (drop --preserve-layers).",
+                    id.trim_start_matches("layers/")
+                ),
+            ));
+        }
+        tars.push(pack_content_dir.join(id));
+    }
+
+    println!("Copying {} imported layer(s) unchanged...", tars.len());
+    for tar in &tars {
+        stage_layer_file_verbatim(tar, collector)?;
+    }
+
+    let export_vm = ExportVm::start(vm_name, vm_dir, Some(pack_content_dir), false, None)?;
+    let mut client = export_vm.connect()?;
+    export_vm.mount_source_storage(&mut client)?;
+    export_overlay_upper_layer(collector, &mut client, overlay_owner)?;
+    if include_workspace {
+        export_workspace_seed(collector, &mut client)?;
+    }
+    Ok(())
+}
+
+/// Copy each layer of an image archive into the pack, unchanged.
+///
+/// The archive is the only place the image's own layer bytes still exist: the
+/// machine booted from a materialized copy, so copying here — rather than
+/// re-creating tars from the extracted layers — is what keeps a layer's diff id
+/// equal to the one the image was published with. Each layer's digest is
+/// computed from the bytes copied and checked against the archive config's
+/// `rootfs.diff_ids` when it declares them.
+///
+/// Returns the layer digests, bottom -> top.
+fn stage_archive_layers_verbatim(
+    archive: &Path,
+    collector: &mut AssetCollector,
+) -> crate::Result<Vec<String>> {
+    let layers = smolvm_oci_layer::read_archive_layers(archive)
+        .map_err(|e| Error::agent("read image archive", e.to_string()))?;
+    println!(
+        "Copying {} image layer(s) unchanged out of the archive...",
+        layers.len()
+    );
+    let scratch = collector
+        .layer_staging_path(&format!("sha256:{}", "0".repeat(64)))
+        .with_file_name("archive-layer.tmp");
+    // Indexed by OCI position: the sink is called in the archive's own member
+    // order, which need not be the image's layer order.
+    let mut digests: Vec<String> = vec![String::new(); layers.len()];
+    {
+        // Staging paths come from the collector's own naming rule, so the copy
+        // only borrows it; registration happens once every layer is on disk.
+        let staging: &AssetCollector = collector;
+        smolvm_oci_layer::for_each_archive_layer(archive, &layers, |index, layer, reader| {
+            let (digest, bytes) =
+                stage_layer_stream(reader, &scratch, staging, layer.declared_diff_id.as_deref())?;
+            println!(
+                "  Layer {}/{}: {} ({bytes} bytes)",
+                index + 1,
+                layers.len(),
+                short_digest(&digest)
+            );
+            digests[index] = digest;
+            Ok(())
+        })
+        .map_err(|e| Error::agent("copy image archive layers", e.to_string()))?;
+    }
+    // A layer that appears at two positions cannot be kept apart by diff id: its
+    // one directory would have to sit at both positions, and dropping either copy
+    // changes which whiteouts apply to the copy above it. Refuse rather than ship
+    // a stack that differs from the image's.
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    if let Some(repeated) = digests.iter().find(|digest| !seen.insert(digest.as_str())) {
+        return Err(Error::agent(
+            "read image archive",
+            format!(
+                "the archive repeats layer {} at more than one position; a layer-preserving \
+                 export cannot keep that stack apart. Re-create the machine from a flattened \
+                 import (drop --preserve-layers).",
+                short_digest(repeated)
+            ),
+        ));
+    }
+    for digest in &digests {
+        collector
+            .register_layer(digest)
+            .map_err(|e| Error::agent("register archive layer", e.to_string()))?;
+    }
+    Ok(digests)
+}
+
+/// Stream one layer's uncompressed bytes into the pack's staging area and return
+/// its digest and size.
+///
+/// The digest is computed from the bytes written, so it is the layer's true diff
+/// id whatever the source was called. When the image config declares the layer's
+/// diff id, a mismatch fails before the layer is published under any name.
+fn stage_layer_stream(
+    reader: &mut dyn std::io::Read,
+    scratch: &Path,
+    collector: &AssetCollector,
+    declared_diff_id: Option<&str>,
+) -> std::io::Result<(String, u64)> {
+    use std::io::Write;
+    if let Some(parent) = scratch.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::File::create(scratch)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 4 * 1024 * 1024];
+    let mut bytes = 0u64;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        file.write_all(&buffer[..read])?;
+        bytes = bytes.saturating_add(read as u64);
+    }
+    file.sync_all()?;
+    drop(file);
+
+    let computed = hex::encode(hasher.finalize());
+    if let Some(declared) = declared_diff_id.and_then(|id| id.strip_prefix("sha256:")) {
+        if declared != computed {
+            let _ = std::fs::remove_file(scratch);
+            return Err(std::io::Error::other(format!(
+                "a layer hashes to sha256:{computed} but the image config declares \
+                 sha256:{declared}"
+            )));
+        }
+    }
+    let digest = format!("sha256:{computed}");
+    std::fs::rename(scratch, collector.layer_staging_path(&digest))?;
+    Ok((digest, bytes))
+}
+
+/// Copy one layer tar file from a machine's pack cache into the pack unchanged,
+/// registering it under the digest of its bytes.
+fn stage_layer_file_verbatim(tar: &Path, collector: &mut AssetCollector) -> crate::Result<()> {
+    let scratch = collector
+        .layer_staging_path(&format!("sha256:{}", "0".repeat(64)))
+        .with_file_name("imported-layer.tmp");
+    let mut file = std::fs::File::open(tar)
+        .map_err(|e| Error::agent("open imported layer", format!("{}: {e}", tar.display())))?;
+    let (digest, bytes) = stage_layer_stream(&mut file, &scratch, collector, None)
+        .map_err(|e| Error::agent("copy imported layer", format!("{}: {e}", tar.display())))?;
+    collector
+        .register_layer(&digest)
+        .map_err(|e| Error::agent("register imported layer", e.to_string()))?;
+    println!("  Layer: {} ({bytes} bytes)", short_digest(&digest));
+    Ok(())
+}
+
+/// Export the machine's own rootfs writes as one new layer on top of the base
+/// layers.
+///
+/// The upper is the container overlay's own writable directory, so it holds the
+/// machine's deletions and replacements as overlayfs markers relative to the
+/// base layers it is exported above — which is exactly what makes it a valid
+/// top layer. A machine that never wrote to its overlay contributes no layer at
+/// all, matching the flattened export's behavior.
+fn export_overlay_upper_layer(
+    collector: &mut AssetCollector,
+    client: &mut AgentClient,
+    overlay_owner: &str,
+) -> crate::Result<()> {
+    let upper = format!("/mnt/source-storage/overlays/persistent-{overlay_owner}/upper");
+    if !guest_directory_has_entries(client, &upper)? {
+        println!("The machine never wrote to its overlay; no top layer to export.");
+        return Ok(());
+    }
+    println!("Exporting the machine's own writes as one layer...");
+    export_guest_directory_layer(collector, client, &upper, "machine layer")?;
+    Ok(())
+}
+
+/// Export one guest directory as a layer, streaming it to its content-addressed
+/// staging path.
+fn export_guest_directory_layer(
+    collector: &mut AssetCollector,
+    client: &mut AgentClient,
+    directory: &str,
+    what: &str,
+) -> crate::Result<()> {
+    let scratch = collector
+        .layer_staging_path(&format!("sha256:{}", "0".repeat(64)))
+        .with_file_name("guest-layer.tmp");
+    if let Some(parent) = scratch.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::agent("stage guest layer", e.to_string()))?;
+    }
+    let total = client
+        .export_directory_layer_to_path(
+            directory,
+            &scratch,
+            crate::agent::pack_export_max_total(),
+            |_| {},
+        )
+        .map_err(|e| Error::agent("export guest layer", format!("{what}: {e}")))?;
+    if total == 0 {
+        let _ = std::fs::remove_file(&scratch);
+        return Err(Error::agent(
+            "export guest layer",
+            format!("{what} ({directory}) is empty"),
+        ));
+    }
+
+    let mut hasher = Sha256::new();
+    {
+        use std::io::Read;
+        let mut file = std::fs::File::open(&scratch)
+            .map_err(|e| Error::agent("read exported layer", e.to_string()))?;
+        let mut buffer = vec![0u8; 4 * 1024 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .map_err(|e| Error::agent("hash exported layer", e.to_string()))?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+    }
+    let digest = format!("sha256:{}", hex::encode(hasher.finalize()));
+    let destination = collector.layer_staging_path(&digest);
+    std::fs::rename(&scratch, &destination)
+        .map_err(|e| Error::agent("stage exported layer", e.to_string()))?;
+    collector
+        .register_layer(&digest)
+        .map_err(|e| Error::agent("register exported layer", e.to_string()))?;
+    println!("  {what}: {} ({total} bytes)", short_digest(&digest));
+    Ok(())
+}
+
+/// Whether a guest directory exists and has at least one entry.
+fn guest_directory_has_entries(client: &mut AgentClient, directory: &str) -> crate::Result<bool> {
+    let probe =
+        format!("test -d '{directory}' && [ -n \"$(ls -A '{directory}' 2>/dev/null)\" ]");
+    let (exit_code, _, _) = client.vm_exec(
+        vec!["sh".to_string(), "-c".to_string(), probe],
         vec![],
         None,
         None,
         None,
     )?;
-    let found: Vec<String> = String::from_utf8_lossy(&stdout)
+    Ok(exit_code == 0)
+}
+
+/// A short, readable form of a `sha256:<hex>` digest.
+fn short_digest(digest: &str) -> String {
+    digest.chars().take(19).collect()
+}
+
+/// The base lowers of a local *archive* image machine on its storage disk, as
+/// helper-local paths, bottom -> top.
+///
+/// A machine that flattened the archive has one rootfs dir (`0000_rootfs`); one
+/// that imported it with its layers kept apart has one directory per layer, in
+/// the order its `layer-order` index records. The archive directory is keyed by
+/// a content hash the exporter does not have, so it is discovered rather than
+/// computed, and a machine boots exactly one local archive.
+fn locate_flattened_archive_lowers(
+    client: &mut AgentClient,
+    vm_name: &str,
+) -> crate::Result<Vec<String>> {
+    let script = r#"
+n=0; found=""
+for d in /mnt/source-storage/image-archives/*/; do
+    [ -d "$d" ] || continue
+    n=$((n + 1)); found="$d"
+done
+[ "$n" -eq 1 ] || exit 3
+if [ -d "${found}0000_rootfs" ]; then printf '%s\n' "${found}0000_rootfs"; exit 0; fi
+[ -f "${found}layer-order" ] || exit 4
+while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    [ -d "${found}${id}" ] || exit 5
+    printf '%s\n' "${found}${id}"
+done < "${found}layer-order"
+"#;
+    let (exit_code, stdout, stderr) = client.vm_exec(
+        vec!["sh".to_string(), "-c".to_string(), script.to_string()],
+        vec![],
+        None,
+        None,
+        None,
+    )?;
+    let lowers: Vec<String> = String::from_utf8_lossy(&stdout)
         .lines()
         .map(str::trim)
-        .filter(|l| !l.is_empty())
+        .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect();
-    match found.as_slice() {
-        [one] if exit_code == 0 => Ok(one.clone()),
-        [] => Err(Error::agent(
+    let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
+    match exit_code {
+        0 if !lowers.is_empty() => Ok(lowers),
+        0 => Err(Error::agent(
             "pack from VM",
             format!(
-                "machine '{vm_name}' was created from a local image archive, but no flattened \
-                 rootfs was found on its storage disk. The archive is flattened on first boot — \
-                 start the machine once, then re-run the export."
+                "machine '{vm_name}' was created from a local image archive, but no imported \
+                 base layers were found on its storage disk. The archive is imported on first \
+                 boot — start the machine once, then re-run the export."
             ),
         )),
-        many => Err(Error::agent(
+        3 => Err(Error::agent(
             "pack from VM",
             format!(
-                "machine '{vm_name}' has {} flattened image archives on its storage disk, so \
-                 the base layer is ambiguous. Recreate the machine from a single image and \
-                 export that.",
-                many.len()
+                "machine '{vm_name}' does not have exactly one local image archive on its \
+                 storage disk, so its base layers are ambiguous. Recreate the machine from a \
+                 single image and export that."
+            ),
+        )),
+        4 | 5 => Err(Error::agent(
+            "pack from VM",
+            format!(
+                "the imported base layers of machine '{vm_name}' are incomplete. Start the \
+                 machine once so it re-imports its archive, then re-run the export."
+            ),
+        )),
+        code => Err(Error::agent(
+            "pack from VM",
+            format!(
+                "listing the imported base layers of machine '{vm_name}' failed (exit {code}): \
+                 {stderr}"
             ),
         )),
     }

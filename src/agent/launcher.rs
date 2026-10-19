@@ -267,6 +267,10 @@ pub struct LaunchFeatures {
     /// the VM data dir (`DOCKER_HOST=unix://…`). The guest agent proxies each
     /// host connection to its in-guest `/var/run/docker.sock`.
     pub expose_docker: bool,
+    /// Keep a local image archive's layers apart (one directory per diff id)
+    /// instead of flattening them, so the guest's lowerdirs are the image's own
+    /// layers. Passed to the guest as `SMOLVM_PRESERVE_IMAGE_LAYERS`.
+    pub preserve_image_layers: bool,
     /// Hostnames for DNS filtering. When set, the host starts a DNS filter
     /// listener and the guest agent proxies DNS queries through it.
     pub dns_filter_hosts: Option<Vec<String>>,
@@ -625,6 +629,9 @@ pub struct LaunchConfig<'a> {
     pub packed_layers_dir: Option<&'a Path>,
     /// DAX window for `packed_layers_dir` (see [`super::virtiofs`]).
     pub packed_layers_dax_window: u64,
+    /// Ask the guest to import a local image archive one directory per layer
+    /// (see [`LaunchFeatures::preserve_image_layers`]).
+    pub preserve_image_layers: bool,
     /// Additional disk images (path, read_only, format). Appear as /dev/vdc, /dev/vdd, ...
     pub extra_disks: &'a [(std::path::PathBuf, bool, DiskFormat)],
     /// The machine's own qcow2 layer over its cache disk's shared base, when
@@ -702,6 +709,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         published_sockets,
         packed_layers_dir,
         packed_layers_dax_window,
+        preserve_image_layers,
         extra_disks,
         cache_disk_layer,
         dns_filter_enabled,
@@ -2415,6 +2423,16 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // Tell the agent about pre-extracted packed layers
         if packed_layers_dir.is_some_and(|d| d.exists()) {
             env_strings.push(cstr("SMOLVM_PACKED_LAYERS=smolvm_layers:/packed_layers"));
+        }
+
+        // A local image archive imported one directory per layer (see
+        // `LaunchFeatures::preserve_image_layers`).
+        if *preserve_image_layers {
+            env_strings.push(cstr(&format!(
+                "{}={}",
+                guest_env::PRESERVE_IMAGE_LAYERS,
+                guest_env::VALUE_ON
+            )));
         }
 
         let mut envp: Vec<*const libc::c_char> = env_strings.iter().map(|s| s.as_ptr()).collect();

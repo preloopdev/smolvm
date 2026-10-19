@@ -1167,7 +1167,9 @@ where
         std::fs::create_dir_all(&dir)?;
         info!(layer = %stem, "unpacking staged layer");
         progress("unpacking image layers", 0);
-        extract_layer_tar_with_progress(tar, &dir, || progress("unpacking image layers", 0))?;
+        extract_layer_tar_whiteouts_with_progress(tar, &dir, || {
+            progress("unpacking image layers", 0)
+        })?;
     }
 
     // Carry the stacking order across; without it the guest would fall back to
@@ -1233,6 +1235,58 @@ fn extract_layer_tar_with_progress(tar: &Path, dir: &Path, progress: impl FnMut(
         )));
     }
     Ok(())
+}
+
+/// Unpack one *image layer* tar into `dir`, translating OCI whiteout markers
+/// into overlayfs's on-disk representation.
+///
+/// A layer is not a plain tar: `.wh.<name>` means "delete `<name>` from every
+/// lower layer" and `.wh..wh..opq` means "this directory replaces the lower
+/// one". `tar -x` extracts both as ordinary files, so a machine built from a
+/// multi-layer pack whose top layer deleted anything would boot with `.wh.`
+/// files at those paths and the deleted paths still present from the layer
+/// below — and a file named `foo` deleted by the top layer would reappear.
+/// This is the path that unpacks a pack's layers when the host staged the tars
+/// for the guest (every macOS/Windows host, and a Linux host that opted out of
+/// the per-VM uid drop), so the conversion the registry pull already applies
+/// has to happen here too.
+///
+/// The extraction runs on a worker thread so the caller can keep emitting
+/// progress for a layer that takes minutes, exactly like the `tar` subprocess
+/// it replaces.
+fn extract_layer_tar_whiteouts_with_progress(
+    tar: &Path,
+    dir: &Path,
+    mut progress: impl FnMut(),
+) -> Result<()> {
+    std::thread::scope(|scope| -> Result<()> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("layer-unpack".into())
+            .spawn_scoped(scope, move || {
+                let result = std::fs::File::open(tar)
+                    .map_err(|e| StorageError::read_error(tar.display().to_string(), e))
+                    .and_then(|file| {
+                        smolvm_oci_layer::extract_oci_layer(file, dir).map_err(|e| {
+                            StorageError::new(format!(
+                                "failed to unpack layer {}: {e}",
+                                tar.display()
+                            ))
+                        })
+                    });
+                let _ = tx.send(result);
+            })
+            .map_err(|e| StorageError::new(format!("failed to start layer unpack: {e}")))?;
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                Ok(result) => return result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => progress(),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(StorageError::new("layer unpack worker stopped"));
+                }
+            }
+        }
+    })
 }
 
 /// Drain child output while the caller keeps its streaming RPC responsive.
@@ -1406,7 +1460,6 @@ const ARCHIVE_ROOTFS_DIR: &str = "0000_rootfs";
 const ARCHIVE_CONFIG_FILE: &str = "config.json";
 /// Marker written once a flatten completes, so restarts reuse it.
 const ARCHIVE_EXTRACTED_MARKER: &str = ".extracted";
-
 /// Env var to override where archive staging spills its scratch. Point it at a
 /// mounted volume with more room than the storage disk, or elsewhere entirely.
 const ARCHIVE_SCRATCH_DIR_ENV: &str = "SMOLVM_ARCHIVE_SCRATCH_DIR";
@@ -1440,16 +1493,30 @@ fn archive_scratch_dir() -> PathBuf {
 }
 
 /// If `packed_dir` is a staged local image archive (it contains `archive.tar`),
-/// flatten it once into a rootfs on the storage disk and return that directory
-/// (holding `0000_rootfs/` + `config.json`). Returns `None` for an ordinary
-/// packed-layers dir (a `.smolmachine`'s pre-extracted layers).
+/// materialize it once on the storage disk and return that directory. Returns
+/// `None` for an ordinary packed-layers dir (a `.smolmachine`'s pre-extracted
+/// layers).
+///
+/// Two materializations exist, chosen by the host's per-machine
+/// [`smolvm_protocol::guest_env::PRESERVE_IMAGE_LAYERS`] setting:
+///
+/// - **flattened** (default): one rootfs dir (`0000_rootfs/`) plus
+///   `config.json`, produced by `crane export | tar -x`. This is what every
+///   machine built from an archive has always booted, and it is what a single
+///   lowerdir wants.
+/// - **layer-preserving**: one directory per archive layer, named by its diff
+///   id (sha256 of the *uncompressed* layer tar), plus a `layer-order` index and
+///   `config.json`. The machine's lowerdirs are then the image's own layers —
+///   addressable, comparable with the registry image they came from, and
+///   exportable unchanged — instead of one flattened tree.
 ///
 /// The output is keyed by the virtiofs mount-point name (constant per VM, since
 /// `/storage` is per-machine), and the completion marker stores the archive's
-/// size+mtime signature. A start reuses the flatten only when that signature
-/// still matches, so a machine re-created from a different image on a reused
-/// disk re-flattens instead of booting the old rootfs. The marker is written
-/// last, so the image-info and overlay paths share one flatten within a start.
+/// size+mtime signature *and* the mode. A start reuses the materialization only
+/// when both still match, so a machine re-created from a different image (or
+/// re-created with a different mode) rebuilds instead of booting the old
+/// content. The marker is written last, so the image-info and overlay paths
+/// share one import within a start.
 fn ensure_archive_flattened_with_progress<F>(
     packed_dir: &Path,
     mut progress: F,
@@ -1467,18 +1534,26 @@ where
         .unwrap_or("archive");
     let out_base = Path::new(STORAGE_ROOT).join("image-archives").join(key);
     let marker = out_base.join(ARCHIVE_EXTRACTED_MARKER);
-    let signature = archive_signature(&archive)?;
+    let preserve_layers = archive_preserves_layers();
+    let signature = archive_import_signature(&archive, preserve_layers)?;
     if std::fs::read_to_string(&marker).ok().as_deref() == Some(signature.as_str()) {
         return Ok(Some(out_base));
     }
 
-    // First flatten, or the archive changed under a reused disk: rebuild.
+    // First import, or the archive changed under a reused disk: rebuild.
     let _ = std::fs::remove_dir_all(&out_base);
-    let rootfs = out_base.join(ARCHIVE_ROOTFS_DIR);
-    std::fs::create_dir_all(&rootfs)?;
-    info!(archive = %archive.display(), rootfs = %rootfs.display(), "flattening local image archive");
-    progress("flattening local image archive", 0);
-    let oci_config = flatten_archive_with_progress(&archive, &rootfs, &mut progress)?;
+    std::fs::create_dir_all(&out_base)?;
+    let oci_config = if preserve_layers {
+        info!(archive = %archive.display(), out = %out_base.display(), "extracting local image archive layers");
+        extract_archive_layers_with_progress(&archive, &out_base, &mut progress)?;
+        None
+    } else {
+        let rootfs = out_base.join(ARCHIVE_ROOTFS_DIR);
+        std::fs::create_dir_all(&rootfs)?;
+        info!(archive = %archive.display(), rootfs = %rootfs.display(), "flattening local image archive");
+        progress("flattening local image archive", 0);
+        flatten_archive_with_progress(&archive, &rootfs, &mut progress)?
+    };
     // Recover the image config before writing the marker, so a later reuse can
     // rely on config.json being present. A docker/podman `save` always carries
     // one.
@@ -1490,6 +1565,131 @@ where
     }
     std::fs::write(&marker, signature)?;
     Ok(Some(out_base))
+}
+
+/// Whether the host asked this boot to keep a local archive's layers apart. The
+/// host sets it per machine, so two machines sharing one cached archive can
+/// still import it differently.
+fn archive_preserves_layers() -> bool {
+    std::env::var(smolvm_protocol::guest_env::PRESERVE_IMAGE_LAYERS)
+        .is_ok_and(|value| value == smolvm_protocol::guest_env::VALUE_ON)
+}
+
+/// The completion signature of an archive import: the archive's size and mtime
+/// plus the import mode, so a changed archive — or the same archive imported
+/// the other way — invalidates a reused storage disk.
+fn archive_import_signature(archive: &Path, preserve_layers: bool) -> Result<String> {
+    let mode = if preserve_layers { "layers" } else { "flattened" };
+    Ok(format!("{mode}:{}", archive_signature(archive)?))
+}
+
+/// Import a local archive with its layers kept apart.
+///
+/// Each layer is extracted into its own directory named by the layer's diff id
+/// (sha256 of the uncompressed tar, hashed while it streams past), so the same
+/// layer is never extracted or stored twice, and a pack built from this machine
+/// can hand the base layers on byte-for-byte. The diff id in the archive's own
+/// config is checked against the computed one, so a corrupted layer cannot be
+/// mistaken for a valid one.
+///
+/// Extraction goes through the same whiteout-translating extractor the registry
+/// pull uses: a layer's `.wh.` markers become the overlayfs whiteouts the
+/// stacked lowers need, and an opaque marker becomes the directory's
+/// `trusted.overlay.opaque` xattr. `tar -x` alone would leave `.wh.` files
+/// visible and resurrect deleted paths.
+fn extract_archive_layers_with_progress<F>(
+    archive: &Path,
+    out_base: &Path,
+    progress: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&str, u64),
+{
+    let layers = smolvm_oci_layer::read_archive_layers(archive)
+        .map_err(|e| StorageError::new(format!("read image archive layers: {e}")))?;
+    progress("extracting image layers", 0);
+    let mut order: Vec<String> = vec![String::new(); layers.len()];
+    let mut extracted = 0u64;
+    smolvm_oci_layer::for_each_archive_layer(archive, &layers, |index, layer, reader| {
+        let mut hashing = HashingReader::new(reader);
+        // `.partial` until the diff id is known, so a crash can never leave a
+        // directory under a name that claims to be a complete layer.
+        let partial = out_base.join(format!(".{index}.partial"));
+        let _ = std::fs::remove_dir_all(&partial);
+        std::fs::create_dir_all(&partial)?;
+        let extract_result = smolvm_oci_layer::extract_oci_layer_tar_with_size(&mut hashing, &partial);
+        // The tar reader stops at its end-of-archive marker, but the diff id is
+        // over the whole uncompressed stream, padding included.
+        let drained = std::io::copy(&mut hashing, &mut std::io::sink());
+        if let Err(e) = extract_result.map(|_| ()).and(drained.map(|_| ())) {
+            let _ = std::fs::remove_dir_all(&partial);
+            return Err(std::io::Error::other(format!(
+                "extract layer {}: {e}",
+                layer.member
+            )));
+        }
+        let diff_id = format!("{:x}", hashing.finish());
+        if let Some(declared) = layer
+            .declared_diff_id
+            .as_deref()
+            .and_then(|id| id.strip_prefix("sha256:"))
+        {
+            if declared != diff_id {
+                let _ = std::fs::remove_dir_all(&partial);
+                return Err(std::io::Error::other(format!(
+                    "layer {} hashes to {diff_id} but the image config declares {declared}",
+                    layer.member
+                )));
+            }
+        }
+        let directory = out_base.join(&diff_id);
+        if directory.is_dir() {
+            // An earlier import left this layer; extraction is deterministic,
+            // so the existing tree is the same tree.
+            let _ = std::fs::remove_dir_all(&partial);
+        } else {
+            std::fs::rename(&partial, &directory)?;
+        }
+        order[index] = diff_id;
+        extracted += 1;
+        progress("extracting image layers", extracted);
+        Ok(())
+    })
+    .map_err(|e| StorageError::new(format!("extract image archive layers: {e}")))?;
+
+    // Bottom -> top, the order the guest stacks lowerdirs from.
+    let mut order_file = order.join("\n");
+    order_file.push('\n');
+    std::fs::write(out_base.join(LAYER_ORDER_FILE), order_file)?;
+    Ok(())
+}
+
+/// A reader that hashes the bytes passing through it (a layer's uncompressed
+/// tar, so the digest is its diff id).
+struct HashingReader<R> {
+    inner: R,
+    hasher: Sha256,
+}
+
+impl<R> HashingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+        }
+    }
+
+    fn finish(self) -> sha2::digest::Output<Sha256> {
+        self.hasher.finalize()
+    }
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.hasher.update(&buf[..read]);
+        Ok(read)
+    }
 }
 
 /// A cheap content signature for a staged archive (size + mtime), used to
@@ -3550,7 +3750,7 @@ fn query_packed_image(
             .unwrap_or("archive");
         let out = storage_root.join("image-archives").join(key);
         if std::fs::read_to_string(out.join(ARCHIVE_EXTRACTED_MARKER)).ok()
-            != Some(archive_signature(&archive)?)
+            != Some(archive_import_signature(&archive, archive_preserves_layers())?)
         {
             return Ok(None);
         }
