@@ -1793,7 +1793,9 @@ pub fn unpack_assets_skipping<R: Read>(
     let decoder =
         zstd::stream::Decoder::new(reader).map_err(|e| PackError::Compression(e.to_string()))?;
     let mut archive = tar::Archive::new(decoder);
-    let entries = archive.entries().map_err(|e| PackError::Tar(e.to_string()))?;
+    let entries = archive
+        .entries()
+        .map_err(|e| PackError::Tar(e.to_string()))?;
     for entry in entries {
         let mut entry = entry.map_err(|e| PackError::Tar(e.to_string()))?;
         let path = entry

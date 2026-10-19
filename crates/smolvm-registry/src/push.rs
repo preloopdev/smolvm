@@ -72,7 +72,11 @@ pub struct SplitPushResult {
 impl SplitPushResult {
     /// Bytes this push actually sent, layer blobs included.
     pub fn bytes_uploaded(&self) -> u64 {
-        let base = if self.base_uploaded { self.base_size } else { 0 };
+        let base = if self.base_uploaded {
+            self.base_size
+        } else {
+            0
+        };
         base + self
             .layers
             .iter()

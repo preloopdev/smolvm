@@ -14,7 +14,7 @@ mod token_store;
 pub use cache::{BlobCache, CachedArtifact, PulledRef};
 pub use client::{validate_digest, RegistryClient};
 pub use pull::{pull, pull_with_progress, PullResult};
-pub use push::{push, PushResult};
+pub use push::{push, push_split, PushResult, SplitPushResult};
 
 use serde::{Deserialize, Serialize};
 

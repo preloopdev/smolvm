@@ -297,7 +297,7 @@ pub async fn resolve_pack_ref(
         &crate::cli::pack::layer_store(None),
     )
     .await
-        .map_err(|e| Error::agent("pull smolmachine artifact", e.to_string()))?;
+    .map_err(|e| Error::agent("pull smolmachine artifact", e.to_string()))?;
     Ok(Some(result.path))
 }
 

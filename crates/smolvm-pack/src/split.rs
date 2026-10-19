@@ -28,13 +28,93 @@
 
 use crate::assets::{unpack_assets_skipping, AssetCollector};
 use crate::format::{LayerEntry, PackFooter, PackManifest};
-use crate::layer_store::{compress_layer_blob, diff_id_hex, sha256_file, CompressedLayer};
 use crate::packer::{read_footer_from_sidecar, read_manifest_from_sidecar, Packer};
 use crate::{PackError, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompressedLayer {
+    diff_id: String,
+    uncompressed_size: u64,
+    blob_digest: String,
+    blob_size: u64,
+}
+
+fn diff_id_hex(diff_id: &str) -> Option<&str> {
+    let hex = diff_id.strip_prefix("sha256:").unwrap_or(diff_id);
+    (hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(hex)
+}
+
+fn sha256_reader<R: Read>(mut reader: R) -> std::io::Result<(String, u64)> {
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total += n as u64;
+    }
+    Ok((format!("sha256:{:x}", hasher.finalize()), total))
+}
+
+fn sha256_file(path: &Path) -> std::io::Result<(String, u64)> {
+    sha256_reader(fs::File::open(path)?)
+}
+
+struct HashingWriter<W: Write> {
+    inner: W,
+    hasher: Sha256,
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.hasher.update(&buf[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn compress_layer_blob<R: Read>(reader: R, dest: &Path) -> std::io::Result<CompressedLayer> {
+    let mut sink = HashingWriter {
+        inner: fs::File::create(dest)?,
+        hasher: Sha256::new(),
+    };
+    let mut diff_hasher = Sha256::new();
+    let mut uncompressed_size = 0u64;
+    let mut buf = vec![0u8; 1024 * 1024];
+    {
+        let mut encoder = zstd::stream::write::Encoder::new(&mut sink, crate::assets::ZSTD_LEVEL)?;
+        let mut reader = reader;
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            diff_hasher.update(&buf[..n]);
+            uncompressed_size += n as u64;
+            encoder.write_all(&buf[..n])?;
+        }
+        encoder.finish()?;
+    }
+    sink.inner.sync_all()?;
+    let blob_size = fs::metadata(dest)?.len();
+    Ok(CompressedLayer {
+        diff_id: format!("sha256:{:x}", diff_hasher.finalize()),
+        uncompressed_size,
+        blob_size,
+        blob_digest: format!("sha256:{:x}", sink.hasher.finalize()),
+    })
+}
 
 /// Member prefix of a layer inside a pack's assets archive.
 pub const LAYER_MEMBER_PREFIX: &str = "layers/";
@@ -416,7 +496,6 @@ fn reconcile_with_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::Digest as _;
 
     /// The member paths of a pack's assets archive, in tar order.
     fn assets_members(pack: &Path) -> Vec<String> {
@@ -511,8 +590,7 @@ mod tests {
             let blob = layer.blob_path(&cache.blobs_dir());
             let bytes = std::fs::read(&blob).unwrap();
             assert_eq!(bytes.len() as u64, layer.blob_size);
-            let (blob_digest, blob_size) =
-                crate::layer_store::sha256_reader(std::io::Cursor::new(&bytes)).unwrap();
+            let (blob_digest, blob_size) = sha256_reader(std::io::Cursor::new(&bytes)).unwrap();
             assert_eq!(blob_digest, layer.blob_digest);
             assert_eq!(blob_size, layer.blob_size);
             let decoded: Vec<u8> = zstd::stream::read::Decoder::new(&bytes[..])
@@ -530,14 +608,12 @@ mod tests {
         // The base is a valid pack that names every layer and carries none.
         let base_manifest = read_manifest_from_sidecar(&split.base_path).unwrap();
         assert_eq!(base_manifest.assets.layers.len(), 3);
-        for (entry, layer) in base_manifest
-            .assets
-            .layers
-            .iter()
-            .zip(split.layers.iter())
-        {
+        for (entry, layer) in base_manifest.assets.layers.iter().zip(split.layers.iter()) {
             assert_eq!(entry.digest, layer.diff_id);
-            assert_eq!(entry.path, format!("layers/{}.tar", diff_id_hex(&layer.diff_id).unwrap()));
+            assert_eq!(
+                entry.path,
+                format!("layers/{}.tar", diff_id_hex(&layer.diff_id).unwrap())
+            );
             assert_eq!(entry.size, layer.uncompressed_size);
         }
         let members = assets_members(&split.base_path);

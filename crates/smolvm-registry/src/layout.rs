@@ -162,6 +162,15 @@ fn classify_split(manifest: &OciManifest) -> Result<ArtifactLayout> {
     Ok(ArtifactLayout::Split { base, layers })
 }
 
+/// Normalize a split layer's uncompressed identity. OCI producers commonly
+/// carry `sha256:<hex>`, while older pack manifests stored the same 64 hex
+/// without the algorithm prefix; both are safe path identities.
+fn normalize_diff_id(diff_id: &str) -> Option<String> {
+    let hex = diff_id.strip_prefix("sha256:").unwrap_or(diff_id);
+    (hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| format!("sha256:{}", hex.to_ascii_lowercase()))
+}
+
 /// One split layer descriptor, with its digest identity checked.
 fn split_layer(descriptor: &OciDescriptor) -> Result<SplitLayerDescriptor> {
     crate::client::validate_digest(&descriptor.digest)?;
@@ -176,7 +185,7 @@ fn split_layer(descriptor: &OciDescriptor) -> Result<SplitLayerDescriptor> {
                 descriptor.digest
             ))
         })?;
-    let normalized = smolvm_pack::layer_store::normalize_diff_id(diff_id).map_err(|_| {
+    let normalized = normalize_diff_id(diff_id).ok_or_else(|| {
         RegistryError::InvalidManifest(format!(
             "split layer {} declares `{diff_id}` as its uncompressed digest, which is not a \
              sha256 digest",
@@ -374,6 +383,9 @@ mod tests {
             ],
         ))
         .unwrap_err();
-        assert!(error.to_string().contains("application/vnd.example.layer"), "{error}");
+        assert!(
+            error.to_string().contains("application/vnd.example.layer"),
+            "{error}"
+        );
     }
 }

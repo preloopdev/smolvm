@@ -75,32 +75,26 @@ impl PullResult {
 ///
 /// The store is keyed by the layer's own content, so installing the same layer
 /// twice — from two goldens, two registries, or two hosts sharing one cache —
-/// costs one extraction in total.
+/// costs one extraction in total. The path is the shared-root parent; the
+/// runtime's `smolvm_pack::extract` module owns the platform-specific
+/// `layers/` directory and installation protocol.
 #[derive(Debug, Clone)]
 pub struct LayerStore {
-    /// Directory holding one subdirectory per layer, named by its uncompressed
-    /// digest. Use [`LayerStore::shared`] unless you are testing the store
-    /// itself.
-    pub dir: PathBuf,
-    /// Record each archive entry's ownership in `user.containers.override_stat`
-    /// instead of applying it, for a host that cannot apply it itself (macOS
-    /// and Windows always can't; on Linux the runtime's probe decides).
-    pub owner_xattr: bool,
+    /// Shared pack-cache root containing the digest-keyed `layers/` directory.
+    pub shared_root: PathBuf,
 }
 
 impl LayerStore {
-    /// The store under a shared pack cache root, laid out the way the runtime
-    /// lays it out (`layers/` on Linux, a case-sensitive volume on macOS).
-    pub fn shared(shared_root: impl AsRef<Path>, owner_xattr: bool) -> Self {
+    /// The store under a shared pack cache root.
+    pub fn shared(shared_root: impl AsRef<Path>) -> Self {
         Self {
-            dir: smolvm_pack::layer_store::shared_layers_dir(shared_root.as_ref()),
-            owner_xattr,
+            shared_root: shared_root.as_ref().to_path_buf(),
         }
     }
 
     /// Whether the store already holds `diff_id`'s extracted tree.
     pub fn layer_present(&self, diff_id: &str) -> bool {
-        smolvm_pack::layer_store::layer_present(&self.dir, diff_id)
+        smolvm_pack::extract::layer_present(&self.shared_root, diff_id)
     }
 }
 
@@ -399,7 +393,12 @@ async fn install_split_layers(
     // not the pack it claims to be, and installing either side would stack an
     // image nobody published.
     let pack_manifest = smolvm_pack::read_manifest_from_sidecar(pack_path)?;
-    let named = smolvm_pack::layer_store::manifest_layer_ids(&pack_manifest);
+    let named: Vec<String> = pack_manifest
+        .assets
+        .layers
+        .iter()
+        .map(|layer| layer.digest.clone())
+        .collect();
     let described: Vec<String> = split_layers
         .iter()
         .map(|layer| layer.diff_id.clone())
@@ -450,8 +449,9 @@ async fn install_split_layers(
                             size = layer.size,
                             "downloading layer blob..."
                         );
-                        let mut layer_progress =
-                            |layer_done: u64, _layer_total: u64| on_progress(done + layer_done, grand_total.max(done + layer_done));
+                        let mut layer_progress = |layer_done: u64, _layer_total: u64| {
+                            on_progress(done + layer_done, grand_total.max(done + layer_done))
+                        };
                         download_blob(
                             client,
                             repo,
@@ -469,24 +469,27 @@ async fn install_split_layers(
             }
         };
 
-        // Installing is decompression plus a full untar of the layer: blocking
-        // work that would otherwise park a runtime worker for minutes.
-        let store = layers.clone();
+        // Track A owns decompression, safe untar, digest verification, atomic
+        // `.partial` publication, and the process-scoped hold that protects a
+        // newly installed layer until an extraction records its reference.
+        let shared_root = layers.shared_root.clone();
         let diff_id = layer.diff_id.clone();
         let blob = blob_path.clone();
         tokio::task::spawn_blocking(move || {
-            smolvm_pack::layer_store::install_layer_from_blob(
-                &store.dir,
-                &diff_id,
-                &blob,
-                store.owner_xattr,
-            )
-            .map_err(|error| {
+            let reader = std::fs::File::open(&blob).map_err(|error| {
                 RegistryError::InvalidManifest(format!(
-                    "installing layer {diff_id} from {} failed: {error}",
+                    "opening layer blob {} failed: {error}",
                     blob.display()
                 ))
-            })
+            })?;
+            smolvm_pack::extract::install_layer_from_stream(&shared_root, &diff_id, reader).map_err(
+                |error| {
+                    RegistryError::InvalidManifest(format!(
+                        "installing layer {diff_id} from {} failed: {error}",
+                        blob.display()
+                    ))
+                },
+            )
         })
         .await
         .map_err(|error| {
@@ -1144,12 +1147,9 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// A layer store in a fresh directory, with a lifetime the caller keeps.
+    /// A layer store in a fresh shared-root directory, with a lifetime the caller keeps.
     fn store_in(dir: &Path) -> LayerStore {
-        LayerStore {
-            dir: dir.join("layers"),
-            owner_xattr: false,
-        }
+        LayerStore::shared(dir)
     }
 
     /// With empty `blob_peers`, `pull` takes the registry path exactly as before:
@@ -1192,9 +1192,17 @@ mod tests {
         let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
         let client = RegistryClient::new(server.uri());
 
-        let result = pull(&client, "myrepo", "latest", None, &cache, &[], &store_in(tmp.path()))
-            .await
-            .expect("registry pull must succeed");
+        let result = pull(
+            &client,
+            "myrepo",
+            "latest",
+            None,
+            &cache,
+            &[],
+            &store_in(tmp.path()),
+        )
+        .await
+        .expect("registry pull must succeed");
 
         assert_eq!(result.digest, digest);
         assert_eq!(result.size, data.len() as u64);
@@ -1249,19 +1257,43 @@ mod tests {
         let client = RegistryClient::new(server.uri());
 
         for _ in 0..3 {
-            let result = pull(&client, "myrepo", &pinned, None, &cache, &[], &store_in(tmp.path()))
-                .await
-                .unwrap();
+            let result = pull(
+                &client,
+                "myrepo",
+                &pinned,
+                None,
+                &cache,
+                &[],
+                &store_in(tmp.path()),
+            )
+            .await
+            .unwrap();
             assert_eq!(result.digest, layer);
         }
         for _ in 0..2 {
-            pull(&client, "myrepo", "v1", None, &cache, &[], &store_in(tmp.path()))
-                .await
-                .unwrap();
-        }
-        let other = pull(&client, "other", &pinned, None, &cache, &[], &store_in(tmp.path()))
+            pull(
+                &client,
+                "myrepo",
+                "v1",
+                None,
+                &cache,
+                &[],
+                &store_in(tmp.path()),
+            )
             .await
             .unwrap();
+        }
+        let other = pull(
+            &client,
+            "other",
+            &pinned,
+            None,
+            &cache,
+            &[],
+            &store_in(tmp.path()),
+        )
+        .await
+        .unwrap();
         assert!(other.cached, "the layer blob itself is shared by digest");
         // MockServer drop asserts each manifest endpoint's expected hit count.
     }
@@ -1439,9 +1471,17 @@ mod tests {
         let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
         let client = RegistryClient::new(server.uri());
 
-        let result = pull(&client, "myrepo", "latest", None, &cache, &[], &store_in(tmp.path()))
-            .await
-            .expect("a truncated transfer must be resumed and completed");
+        let result = pull(
+            &client,
+            "myrepo",
+            "latest",
+            None,
+            &cache,
+            &[],
+            &store_in(tmp.path()),
+        )
+        .await
+        .expect("a truncated transfer must be resumed and completed");
 
         assert_eq!(
             result.size,
@@ -1512,9 +1552,17 @@ mod tests {
         let partial = cache.blob_path_for(&digest).with_extension("partial");
         std::fs::write(&partial, &data).unwrap();
 
-        let result = pull(&client_for(&server), "myrepo", "latest", None, &cache, &[], &store_in(tmp.path()))
-            .await
-            .expect("a complete partial must be adopted, not resumed past its end");
+        let result = pull(
+            &client_for(&server),
+            "myrepo",
+            "latest",
+            None,
+            &cache,
+            &[],
+            &store_in(tmp.path()),
+        )
+        .await
+        .expect("a complete partial must be adopted, not resumed past its end");
         assert_eq!(result.size, data.len() as u64);
         assert_eq!(
             tokio::fs::read(cache.get(&digest).unwrap()).await.unwrap(),
@@ -1534,9 +1582,17 @@ mod tests {
         let partial = cache.blob_path_for(&digest).with_extension("partial");
         std::fs::write(&partial, vec![0u8; data.len()]).unwrap();
 
-        let result = pull(&client_for(&server), "myrepo", "latest", None, &cache, &[], &store_in(tmp.path()))
-            .await
-            .expect("a wrong full-size partial must be replaced");
+        let result = pull(
+            &client_for(&server),
+            "myrepo",
+            "latest",
+            None,
+            &cache,
+            &[],
+            &store_in(tmp.path()),
+        )
+        .await
+        .expect("a wrong full-size partial must be replaced");
         assert_eq!(tokio::fs::read(&result.path).await.unwrap(), data);
     }
 
@@ -1551,9 +1607,17 @@ mod tests {
         let partial = cache.blob_path_for(&digest).with_extension("partial");
         std::fs::write(&partial, &data[..100]).unwrap();
 
-        let result = pull(&client_for(&server), "myrepo", "latest", None, &cache, &[], &store_in(tmp.path()))
-            .await
-            .expect("a 416 on resume must restart from zero");
+        let result = pull(
+            &client_for(&server),
+            "myrepo",
+            "latest",
+            None,
+            &cache,
+            &[],
+            &store_in(tmp.path()),
+        )
+        .await
+        .expect("a 416 on resume must restart from zero");
         assert_eq!(tokio::fs::read(&result.path).await.unwrap(), data);
     }
 
@@ -1587,9 +1651,17 @@ mod tests {
         let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
         let client = RegistryClient::new(server.uri());
 
-        let err = pull(&client, "myrepo", "latest", None, &cache, &[], &store_in(tmp.path()))
-            .await
-            .expect_err("a missing blob must fail");
+        let err = pull(
+            &client,
+            "myrepo",
+            "latest",
+            None,
+            &cache,
+            &[],
+            &store_in(tmp.path()),
+        )
+        .await
+        .expect_err("a missing blob must fail");
         assert!(
             matches!(err, RegistryError::BlobNotFound(_)),
             "expected BlobNotFound, got {err:?}"
@@ -1818,7 +1890,10 @@ mod tests {
             &mut |_, _| {},
         )
         .await;
-        assert!(first.is_err(), "the cut-off attempt must not report success");
+        assert!(
+            first.is_err(),
+            "the cut-off attempt must not report success"
+        );
         let recorded = std::fs::metadata(ranged_parts_path(&ranged_path))
             .unwrap()
             .len()
@@ -2067,20 +2142,15 @@ mod tests {
             .await;
     }
 
-    /// Fetch a layer blob's bytes into the store, as a host that already pulled
+    /// Fetch a layer blob into the store, as a host that already pulled
     /// this layer would have them.
     fn install_layer(store: &LayerStore, layer: &SplitFixtureLayer) {
-        let blob = store.dir.join(format!("{}.tar.zst", &layer.diff_id[7..]));
-        std::fs::create_dir_all(&store.dir).unwrap();
-        std::fs::write(&blob, &layer.blob_bytes).unwrap();
-        smolvm_pack::layer_store::install_layer_from_blob(
-            &store.dir,
+        smolvm_pack::extract::install_layer_from_stream(
+            &store.shared_root,
             &layer.diff_id,
-            &blob,
-            false,
+            std::io::Cursor::new(&layer.blob_bytes),
         )
         .unwrap();
-        std::fs::remove_file(&blob).unwrap();
     }
 
     /// A consumer that already holds one of a split artifact's layers fetches
@@ -2138,7 +2208,13 @@ mod tests {
         assert!(store.layer_present(&present.diff_id));
         assert!(store.layer_present(&missing.diff_id));
         assert_eq!(
-            std::fs::read(store.dir.join(&missing.diff_id[7..]).join("opt/b.txt")).unwrap(),
+            std::fs::read(
+                smolvm_pack::extract::shared_layers_dir(&store.shared_root)
+                    .unwrap()
+                    .join(&missing.diff_id[7..])
+                    .join("opt/b.txt"),
+            )
+            .unwrap(),
             b"layer b"
         );
     }
@@ -2165,8 +2241,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(format!("/v2/myrepo/blobs/{}", corrupt.blob_digest)))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_bytes(vec![0x58_u8; corrupt.blob_bytes.len()]),
+                ResponseTemplate::new(200).set_body_bytes(vec![0x58_u8; corrupt.blob_bytes.len()]),
             )
             .mount(&server)
             .await;
@@ -2226,7 +2301,9 @@ mod tests {
 
         // What an interrupted attempt leaves behind: the first bytes of the blob.
         let have = (resumed.blob_bytes.len() / 2) as u64;
-        let partial = cache.blob_path_for(&resumed.blob_digest).with_extension("partial");
+        let partial = cache
+            .blob_path_for(&resumed.blob_digest)
+            .with_extension("partial");
         std::fs::create_dir_all(partial.parent().unwrap()).unwrap();
         std::fs::write(&partial, &resumed.blob_bytes[..have as usize]).unwrap();
 
@@ -2279,8 +2356,7 @@ mod tests {
     #[tokio::test]
     async fn pull_refuses_an_unknown_artifact_type() {
         let server = MockServer::start().await;
-        let digest =
-            "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+        let digest = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
         let manifest = serde_json::json!({
             "schemaVersion": 2,
             "mediaType": MANIFEST_MEDIA_TYPE,

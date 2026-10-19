@@ -63,6 +63,8 @@ pub enum PackCmd {
 
     /// Clean up cached pack extractions to free disk space
     Prune(PackPruneCmd),
+    /// Install one verified split-artifact layer into the shared digest-keyed store
+    InstallLayer(PackInstallLayerCmd),
 }
 
 impl PackCmd {
@@ -75,6 +77,7 @@ impl PackCmd {
             PackCmd::List(cmd) => cmd.run(),
             PackCmd::Inspect(cmd) => cmd.run(),
             PackCmd::Prune(cmd) => cmd.run(),
+            PackCmd::InstallLayer(cmd) => cmd.run(),
         }
     }
 }
@@ -1739,20 +1742,21 @@ impl PackPruneCmd {
         #[cfg(target_os = "linux")]
         {
             let root = crate::agent::shared_pack_cache_root();
-            let report = match smolvm_pack::extract::collect_layer_store_with(
-                &root,
-                false,
-                self.dry_run,
-            ) {
-                Ok(report) => report,
-                Err(error) => {
-                    return Err(smolvm::Error::agent(
-                        "prune shared layers",
-                        error.to_string(),
-                    ))
-                }
+            let report =
+                match smolvm_pack::extract::collect_layer_store_with(&root, false, self.dry_run) {
+                    Ok(report) => report,
+                    Err(error) => {
+                        return Err(smolvm::Error::agent(
+                            "prune shared layers",
+                            error.to_string(),
+                        ))
+                    }
+                };
+            let verb = if self.dry_run {
+                "Would remove"
+            } else {
+                "Removed"
             };
-            let verb = if self.dry_run { "Would remove" } else { "Removed" };
             println!(
                 "{verb} {} shared layer(s), reclaimed {}",
                 report.layers_removed,
@@ -1857,6 +1861,40 @@ impl PackPruneCmd {
         }
 
         Ok((freed, removed))
+    }
+}
+/// Install one zstd-compressed split-artifact layer into the shared digest-keyed
+/// store. The stream is verified against its uncompressed `diff_id` by
+/// `smolvm_pack::extract::install_layer_from_stream` before publication.
+#[derive(Args, Debug)]
+pub struct PackInstallLayerCmd {
+    /// `sha256:<64 hex>` identity of the uncompressed layer tar.
+    #[arg(long, value_name = "DIGEST")]
+    pub diff_id: String,
+
+    /// Path to the zstd-compressed layer blob.
+    #[arg(long, value_name = "PATH")]
+    pub blob: PathBuf,
+
+    /// Shared pack-cache root containing the digest-keyed `layers/` directory.
+    #[arg(long = "store-root", value_name = "DIR")]
+    pub store_root: Option<PathBuf>,
+}
+
+impl PackInstallLayerCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let root = self
+            .store_root
+            .unwrap_or_else(smolvm::agent::shared_pack_cache_root);
+        let reader = std::fs::File::open(&self.blob).map_err(|error| {
+            Error::agent(
+                "open split layer blob",
+                format!("{}: {error}", self.blob.display()),
+            )
+        })?;
+        smolvm_pack::extract::install_layer_from_stream(&root, &self.diff_id, reader)
+            .map_err(|error| Error::agent("install split layer", error.to_string()))?;
+        Ok(())
     }
 }
 
@@ -1973,33 +2011,21 @@ impl PackPushCmd {
 /// cache so a republish of the same pack re-reads neither its layers nor its
 /// base.
 fn split_cache(explicit: &Option<PathBuf>) -> smolvm_pack::split::SplitCache {
-    let root = explicit.clone().unwrap_or_else(|| {
-        smolvm_pack::split::SplitCache::default_root(&smolvm::agent::shared_pack_cache_root())
-    });
+    let root = explicit
+        .clone()
+        .unwrap_or_else(|| smolvm::agent::shared_pack_cache_root().join("pack-split"));
     smolvm_pack::split::SplitCache::new(root)
 }
 
-/// The layer store a split pull installs into.
+/// The shared root a split pull installs layers into.
 ///
 /// `--layers-store` overrides it (tests, or a store on another volume); the
-/// default is the shared store beside the pack cache, so a layer pulled for one
-/// golden is present for every golden that shares it.
-///
-/// Ownership is recorded in `user.containers.override_stat` exactly when this
-/// host's virtiofs server would serve it — the same probe the runtime registers
-/// — because that is the only way an unprivileged host can hand the guest an
-/// image's owners. `SMOLVM_LAYER_OWNER_XATTR=on|off` forces the choice for a
-/// host whose kernel or filesystem disagrees with the probe.
+/// default is the shared root beside the pack cache. The runtime's
+/// `smolvm_pack::extract` module owns the platform-specific `layers/` directory
+/// and its atomic install/hold protocol.
 pub fn layer_store(explicit: Option<PathBuf>) -> smolvm_registry::pull::LayerStore {
-    let dir = explicit.unwrap_or_else(|| {
-        smolvm_pack::layer_store::shared_layers_dir(&smolvm::agent::shared_pack_cache_root())
-    });
-    let owner_xattr = match std::env::var("SMOLVM_LAYER_OWNER_XATTR").ok().as_deref() {
-        Some("on") => true,
-        Some("off") => false,
-        _ => smolvm::agent::host_layers_supported(),
-    };
-    smolvm_registry::pull::LayerStore { dir, owner_xattr }
+    let root = explicit.unwrap_or_else(smolvm::agent::shared_pack_cache_root);
+    smolvm_registry::pull::LayerStore::shared(root)
 }
 
 /// Pull a .smolmachine artifact from a registry.
@@ -2117,7 +2143,7 @@ impl PackPullCmd {
                 result.layers_fetched,
                 crate::cli::format_bytes(result.layer_bytes),
                 result.layers_skipped,
-                layers.dir.display(),
+                layers.shared_root.display(),
             );
         }
         if into_cache {
