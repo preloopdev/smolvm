@@ -75,6 +75,25 @@ checkpoint of a machine needed it to have been started `--branchable`, and the e
 not names neither the flag nor the precondition. From v1.20.0 a checkpoint file does not need it;
 a stored checkpoint, `--store`, still does.
 
+### Preserving local image layers
+
+For a local `docker save` archive, keep the archive's own layers instead of
+flattening them during import:
+
+```bash
+smolvm machine create --name builder --image ./runner-image.tar \
+  --preserve-image-layers
+smolvm pack create --from-vm builder --preserve-layers -o ./builder
+smolvm pack layers ./builder.smolmachine --json
+```
+
+The resulting payload carries the original layers, identified by the SHA-256
+digest of each uncompressed layer tar, followed by one layer for writes made
+in the machine's overlay. `pack layers` prints the ordered digests and sizes.
+Layer-preserving export requires the source machine to have been created from
+the local archive; registry-image and already-packed machines must use the
+default flattened export.
+
 Both pack paths boot a helper VM first. `pack create --image` pulls in one fixed at 8192 MiB, which `--mem` does not
 change (`--mem` is the artifact's). `pack create --from-vm` boots an export helper: 8192 MiB through v1.16.1, and from
 v1.16.2 4096 MiB, less on a Linux host with less available, set by `SMOLVM_EXPORT_HELPER_MEMORY_MIB`. `SKILL.md` step 1
