@@ -1616,6 +1616,11 @@ impl PackCreateCmd {
 ///   smolvm pack prune --keep 2     # keep 2 most recent
 ///   smolvm pack prune --all        # remove everything
 ///   smolvm pack prune --dry-run    # show what would be removed
+///   smolvm pack prune --layers-only  # reclaim only layers no entry names
+///
+/// `--layers-only` touches nothing but the shared digest-keyed layer store on
+/// Linux: no pack entry and no machine pointer is removed, and a layer any
+/// entry still names (or a live pull holds) is kept.
 #[derive(Args, Debug)]
 pub struct PackPruneCmd {
     /// Number of unused cached entries to keep (default: 5)
@@ -1629,10 +1634,17 @@ pub struct PackPruneCmd {
     /// Show what would be removed without actually removing
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Only reclaim shared layers that no pack entry names; remove no entry
+    #[arg(long)]
+    pub layers_only: bool,
 }
 
 impl PackPruneCmd {
     pub fn run(self) -> smolvm::Result<()> {
+        if self.layers_only {
+            return self.run_layers_only();
+        }
         let keep = if self.all { 0 } else { self.keep };
 
         let mut total_freed: u64 = 0;
@@ -1717,6 +1729,46 @@ impl PackPruneCmd {
             println!("No cached entries to remove.");
         }
 
+        Ok(())
+    }
+
+    /// The store-only pass: reclaim shared layers no entry names, and nothing
+    /// else. Exits 0 with a count when the store is busy (an install holds it),
+    /// so a caller that retries later does not have to treat that as a failure.
+    fn run_layers_only(&self) -> smolvm::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let root = crate::agent::shared_pack_cache_root();
+            let report = match smolvm_pack::extract::collect_layer_store_with(
+                &root,
+                false,
+                self.dry_run,
+            ) {
+                Ok(report) => report,
+                Err(error) => {
+                    return Err(smolvm::Error::agent(
+                        "prune shared layers",
+                        error.to_string(),
+                    ))
+                }
+            };
+            let verb = if self.dry_run { "Would remove" } else { "Removed" };
+            println!(
+                "{verb} {} shared layer(s), reclaimed {}",
+                report.layers_removed,
+                crate::cli::format_bytes(report.bytes_reclaimed)
+            );
+            if report.partials_discarded > 0 {
+                println!(
+                    "  {} interrupted install(s) discarded",
+                    report.partials_discarded
+                );
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            println!("No shared layer store on this platform.");
+        }
         Ok(())
     }
 
