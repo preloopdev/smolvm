@@ -349,7 +349,7 @@ const WHITEOUT_MODE: u32 = 0o020000;
 /// mounts with `userxattr`, and a cache filesystem that stores user xattrs.
 /// `SMOLVM_HOST_LAYERS=on` waives the pack-version check (for packs built before
 /// the threshold); `off` disables the path; neither bypasses the server check.
-fn host_layers_via_override_stat(pack_version: Option<&str>, cache_dir: &Path) -> bool {
+pub fn host_unpacks_layers(pack_version: Option<&str>, cache_dir: &Path) -> bool {
     let server_honors_override = || {
         cfg!(any(target_os = "macos", target_os = "windows"))
             || HOST_LAYERS_PROBE.get().is_some_and(|probe| probe())
@@ -779,7 +779,7 @@ fn safe_unpack<R: Read>(
 /// Extracted into a struct so tests can inject small values (exercising the
 /// sparse-write path and the cap-rejection paths) without mutating process-wide
 /// env vars, which would race with other concurrently-running tests.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct SafeUnpackLimits {
     /// Max number of tar entries before erroring (inode-flood guard).
     max_entries: u64,
@@ -788,6 +788,12 @@ struct SafeUnpackLimits {
     max_total_bytes: u64,
     /// Regular files with a header size >= this use the sparse-write path.
     sparse_threshold: u64,
+    /// Where a pack's `layers/<digest>.tar` members are unpacked as they
+    /// stream past (`layers/<digest>/` under this directory) instead of being
+    /// written out for a later unpack step. `None` — the default, and what
+    /// every caller but [`extract_sidecar_inner`] passes — keeps the staged-tar
+    /// path byte for byte. See [`stream_layer_member`].
+    stream_layers: Option<PathBuf>,
 }
 
 impl SafeUnpackLimits {
@@ -796,8 +802,929 @@ impl SafeUnpackLimits {
             max_entries: max_extract_entries(),
             max_total_bytes: max_extract_total_bytes(),
             sparse_threshold: SPARSE_WRITE_THRESHOLD,
+            stream_layers: None,
         }
     }
+
+    /// [`Self`] with the layer tars unpacked into `store` as the assets
+    /// stream past. `store` must be resolved by the caller *before* the
+    /// archive is opened — on macOS it is the mounted case-sensitive volume
+    /// ([`extraction_layers_dir`]), which a streamed tree must land in rather
+    /// than on the case-insensitive volume the cache directory usually sits on.
+    fn streaming_layers(mut self, store: PathBuf) -> Self {
+        self.stream_layers = Some(store);
+        self
+    }
+
+    /// [`Self`] with streaming off, for the nested unpack of a layer member.
+    fn without_streaming(&self) -> Self {
+        let mut nested = self.clone();
+        nested.stream_layers = None;
+        nested
+    }
+}
+
+/// Whether an extraction's layer store holds host-unpacked layer trees.
+///
+/// With streaming enabled the layer tars are never written, so
+/// [`has_layer_tars`] cannot see the result and the layer decision would flip
+/// to "stage for the guest" on a fresh extraction that already unpacked them.
+/// `streamed` is the store this extraction streamed into, when it did — passed
+/// in rather than resolved here, because resolving the store on macOS mounts
+/// the case-sensitive volume, which must not happen for an extraction that
+/// stages its tars for the guest.
+fn has_host_unpacked_layers(cache_dir: &Path, streamed: Option<&Path>) -> bool {
+    let has_trees = |dir: &Path| {
+        fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok()).any(|e| {
+                    let name = e.file_name();
+                    let staging = name.to_str().is_some_and(is_partial_dir_name);
+                    e.path().is_dir() && !staging
+                })
+            })
+            .unwrap_or(false)
+    };
+    streamed.is_some_and(has_trees) || has_trees(&cache_dir.join("layers"))
+}
+
+/// Whether this host unpacks a pack's layer members as they stream past.
+///
+/// On by default on Linux only. Two other platforms have a reason to stay off
+/// until they are checked, and both can be forced on with
+/// `SMOLVM_STREAM_LAYERS=on`:
+///
+/// - macOS keeps the trees in a case-sensitive volume at
+///   `cache_dir/layers-cs` ([`extraction_layers_dir`]), a different filesystem
+///   from the entry's `layers/`. `pack export --from-vm` stages a machine's
+///   layers out of `layers/` (`ordered_cached_layer_ids`) and cannot see a
+///   streamed entry's trees there, so streaming would break re-export of the
+///   golden flow. Stock macOS keeps the staged tars, so it does not.
+/// - Windows streams through alternate-data-stream xattrs, which this tree has
+///   not been run against.
+///
+/// `SMOLVM_STREAM_LAYERS=off` disables it anywhere, which is what a caller
+/// wanting the staged-tar layout sets.
+fn stream_layers_enabled() -> bool {
+    match std::env::var("SMOLVM_STREAM_LAYERS").ok().as_deref() {
+        Some("off") => false,
+        Some("on") => true,
+        _ => cfg!(target_os = "linux"),
+    }
+}
+
+/// The digest a pack asset path names, when it is a `layers/<hex>.tar` member.
+///
+/// `digest_to_filename` is what wrote the name, so only pure hex (at least the
+/// same 12 characters) can be one: anything else is not a layer and keeps the
+/// ordinary file path in [`safe_unpack_skipping`].
+fn layer_member_id(path: &Path) -> Option<String> {
+    let mut components = path.components().filter_map(|component| match component {
+        std::path::Component::CurDir => None,
+        other => Some(other),
+    });
+    let dir = components.next()?;
+    let file = components.next()?;
+    if components.next().is_some() {
+        return None;
+    }
+    if dir.as_os_str() != "layers" {
+        return None;
+    }
+    let file = Path::new(file.as_os_str());
+    if file.extension().and_then(|e| e.to_str()) != Some("tar") {
+        return None;
+    }
+    let stem = file.file_stem().and_then(|s| s.to_str())?;
+    (stem.len() >= 12 && stem.bytes().all(|b| b.is_ascii_hexdigit())).then(|| stem.to_owned())
+}
+
+/// Hash every byte read through `inner`, so a streamed layer tar's digest is
+/// verified over the exact bytes the pack carried.
+struct HashingReader<R: Read> {
+    inner: R,
+    hasher: Context,
+    bytes: u64,
+}
+
+impl<R: Read> HashingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: Context::new(&SHA256),
+            bytes: 0,
+        }
+    }
+
+    /// The digest of everything read so far, lowercase hex, and the byte count.
+    fn finish(self) -> (String, u64) {
+        let mut digest = String::with_capacity(64);
+        for byte in self.hasher.finish().as_ref() {
+            write!(&mut digest, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        (digest, self.bytes)
+    }
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.hasher.update(&buf[..read]);
+        self.bytes += read as u64;
+        Ok(read)
+    }
+}
+
+/// Unpack one `layers/<hex>.tar` member straight into `<store>/<id>/`.
+///
+/// The member's own bytes are hashed as they are consumed, and the digest its
+/// name claims is checked before the tree is installed, so a streamed layer is
+/// verified exactly like the staged tar was: the `.partial` directory is what
+/// the unpack writes, and `<id>/` exists only once the archive ended and the
+/// digest matched. Nothing is written to a temporary tar, so a 53 GB layer
+/// costs one pass instead of a write plus a read of the same bytes.
+///
+/// `store` is the extraction's host layer store, resolved before the archive
+/// was opened (see [`SafeUnpackLimits::streaming_layers`]). `dest` is the
+/// extraction's own directory, whose `layers/` holds the staged tars that a
+/// streamed layer makes obsolete.
+///
+/// `entry` must be the member's data reader: the tar crate bounds it to the
+/// member's declared size, and any bytes the nested archive does not consume
+/// (padding after a truncated nested archive) are drained here so the outer
+/// stream stays aligned.
+fn stream_layer_member<R: Read>(
+    entry: &mut R,
+    dest: &Path,
+    store: &Path,
+    id: &str,
+    limits: &SafeUnpackLimits,
+    debug: bool,
+) -> std::io::Result<()> {
+    let final_dir = store.join(id);
+    let staging = partial_dir_for(&final_dir)?;
+
+    if final_dir.is_dir() {
+        // A resumed extraction already installed this layer. Drain and verify
+        // the member so the outer stream still lines up and the pack is still
+        // checked, without rebuilding a tree the guest may be reading.
+        let mut hashing = HashingReader::new(entry);
+        let drained = std::io::copy(&mut hashing, &mut std::io::sink());
+        let (digest, _bytes) = hashing.finish();
+        drained?;
+        return check_layer_digest(id, &digest);
+    }
+
+    if debug {
+        eprintln!("debug: streaming layer {id} into {}", staging.display());
+    }
+    // A `.partial` from an interrupted attempt is never resumed into; the
+    // whole layer is unpacked again (the layers that already finished are the
+    // ones this path skips, above).
+    if staging.exists() {
+        fs::remove_dir_all(&staging)?;
+    }
+    fs::create_dir_all(&staging)?;
+
+    let nested_limits = limits.without_streaming();
+    let mut hashing = HashingReader::new(entry);
+    let unpacked = {
+        // Erase the reader's type: `safe_unpack_with_policy` is generic, and a
+        // nested call over `HashingReader<Entry<R>>` would ask the compiler to
+        // monomorphize this function infinitely.
+        let reader: Box<dyn Read + '_> = Box::new(&mut hashing);
+        let mut archive = tar::Archive::new(reader);
+        // The archived owner and mode are the layer's own, and this host is
+        // the one unpacking it (streaming is only enabled then), so the
+        // override xattr describes them exactly as the staged unpack did.
+        safe_unpack_with_policy(&mut archive, &staging, &nested_limits, false, true)
+            .map(|_report| ())
+    };
+    // Whatever the nested archive did not read belongs to this member too, and
+    // has to be consumed and hashed before the outer archive can continue.
+    let drained = std::io::copy(&mut hashing, &mut std::io::sink());
+    let (digest, bytes) = hashing.finish();
+
+    let failure = match (unpacked, drained) {
+        (Err(error), _) => Some(error),
+        (Ok(()), Err(error)) => Some(error),
+        (Ok(()), Ok(_)) => check_layer_digest(id, &digest).err(),
+    };
+    if let Some(error) = failure {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(std::io::Error::new(
+            error.kind(),
+            format!("streaming layer {id} failed, nothing was kept ({bytes} bytes read): {error}"),
+        ));
+    }
+    fs::rename(&staging, &final_dir)?;
+    // The staged tar this layer would otherwise have been written as is now
+    // dead weight: the tree holds the same bytes, and every reader of an
+    // extraction's `layers/` accepts the directory form. Only a leftover from
+    // an earlier, non-streaming extraction of this same entry can be here.
+    let stale_tar = dest.join("layers").join(format!("{id}.tar"));
+    if stale_tar.is_file() {
+        let _ = fs::remove_file(&stale_tar);
+    }
+    if debug {
+        eprintln!("debug: layer {id} streamed into place ({bytes} bytes)");
+    }
+    Ok(())
+}
+
+/// Fail when a streamed member's digest is not the one its name claims.
+///
+/// No override: a layer that does not hash to its name is a corrupt image, and
+/// keeping it would hand the guest a tree that silently disagrees with every
+/// manifest that names the layer.
+fn check_layer_digest(id: &str, digest: &str) -> std::io::Result<()> {
+    if digest.eq_ignore_ascii_case(id) {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("layer digest mismatch: stream is {digest}, name claims {id}"),
+    ))
+}
+
+// =============================================================================
+// Digest-keyed shared layer store
+//
+// One directory per layer, named by the sha256 of the layer's *uncompressed*
+// tar — the OCI diff_id, which is the identity a pack manifest names its layers
+// by. A pack entry stops owning layer bytes: it references the store, so a
+// second pack that carries the same layers costs one directory entry per file
+// instead of another extraction, and a golden re-published with one changed
+// layer costs exactly that layer.
+//
+// Nothing here stages a tar. A layer arrives as a stream — out of a pack's
+// assets, or straight off a registry — is unpacked into `<diff_id>.partial/`
+// while its bytes are hashed, and takes its final name only once the archive
+// ended and the digest matched. "A directory under its final name is complete"
+// is the entire concurrency protocol: a reader never sees a half-written tree,
+// a second install of the same layer is a no-op, and a crash leaves at most one
+// layer to redo.
+// =============================================================================
+
+/// Whether the digest-keyed layer store backs pack extractions on this host.
+///
+/// Linux, where the shared extraction path already runs: an entry references a
+/// store layer by hard-linking its files, which needs both on one filesystem
+/// (the store and the entries share `shared_root`) and the same on-disk owner
+/// (both are root-owned and presented through per-VM idmapped mounts, so linking
+/// cannot leak one machine's ownership into another's).
+///
+/// macOS keeps its layers in a case-sensitive volume no link can cross, and
+/// Windows has no shared extraction path at all; both keep the per-entry layout
+/// and never reach the store through the pack path.
+/// `SMOLVM_DISABLE_LAYER_STORE` turns it off on Linux too.
+fn shared_layer_store_enabled() -> bool {
+    cfg!(target_os = "linux") && std::env::var_os("SMOLVM_DISABLE_LAYER_STORE").is_none()
+}
+
+/// Directory holding the digest-keyed layer store under a shared root
+/// (`<shared_root>/layers/<diff_id>/`). macOS mounts a case-sensitive volume
+/// beside it instead, so the name is only used to recognize (and never evict)
+/// a store directory on the platforms that keep their trees in one.
+const LAYER_STORE_DIR: &str = "layers";
+
+/// Lock file the store is installed under and collected under: an extraction
+/// holds it shared for as long as it is installing layers or linking them into
+/// an entry, and [`collect_layer_store`] takes it exclusively, so a collection
+/// can never take a layer out from under an extraction that is still writing
+/// the entry that needs it.
+const LAYER_STORE_LOCK: &str = ".gc.lock";
+
+/// Room the case-sensitive store volume is created with on macOS. Unlike an
+/// extraction's own volume there are no staged tars to size it from — the
+/// caller streams the layers — so it is created generous and grown when a
+/// layer arrives that does not fit ([`grow_layer_store_volume`]).
+#[cfg(target_os = "macos")]
+const LAYER_STORE_VOLUME_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+/// Where a shared root keeps its digest-keyed layer store.
+///
+/// Linux and Windows: `<shared_root>/layers`, on the same filesystem as the
+/// entries, which is what lets an entry reference a layer with hard links
+/// instead of a copy. macOS: the mount point of a case-sensitive APFS volume
+/// (`<shared_root>/layers-cs`), mounted on demand — the layers are Linux images
+/// whose paths may differ only in case, and the default volume would silently
+/// merge those paths.
+///
+/// Creating the shared root is part of opening the store, so callers do not
+/// have to know whether the platform needs a directory or a volume.
+pub fn shared_layers_dir(shared_root: &Path) -> std::io::Result<PathBuf> {
+    fs::create_dir_all(shared_root)?;
+    #[cfg(target_os = "macos")]
+    {
+        extraction_layers_dir(shared_root, LAYER_STORE_VOLUME_BYTES, false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(shared_root.join(LAYER_STORE_DIR))
+    }
+}
+
+/// The store's directory name for one layer: the diff_id, normalized.
+///
+/// Accepts the `sha256:` form as well as bare hex, and only hex — the id becomes
+/// a path component, so anything else (`../`, separators, absolute paths) is
+/// refused instead of being joined onto the store root.
+fn layer_store_id(diff_id: &str) -> std::io::Result<String> {
+    let hex = diff_id.strip_prefix("sha256:").unwrap_or(diff_id);
+    let long_enough = (12..=64).contains(&hex.len());
+    if long_enough && hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Ok(hex.to_ascii_lowercase());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("not a layer digest: {diff_id:?}"),
+    ))
+}
+
+/// Whether the store already holds this layer, complete.
+///
+/// `false` for an id that is not a digest at all, and for a host whose store
+/// cannot be opened: a caller then fetches what it asked about, which is always
+/// safe.
+pub fn layer_present(shared_root: &Path, diff_id: &str) -> bool {
+    let Ok(id) = layer_store_id(diff_id) else {
+        return false;
+    };
+    existing_layers_dir(shared_root).is_some_and(|layers| layers.join(id).is_dir())
+}
+
+/// The store's directory if it already exists, without creating it or mounting
+/// anything: a read-only question must not change the host.
+fn existing_layers_dir(shared_root: &Path) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let mount = shared_root.join(CS_MOUNT_DIR);
+        (mount.exists() && is_mount_point(&mount)).then_some(mount)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let dir = shared_root.join(LAYER_STORE_DIR);
+        dir.is_dir().then_some(dir)
+    }
+}
+
+/// Where a pull's hold on a layer lives: one file per holder and layer, named
+/// `<pid>.<diff_id>`, beside the store rather than inside it.
+const LAYER_HOLDS_DIR: &str = ".layer-holds";
+
+/// Mark `id` as in use by this process until an extraction names it.
+///
+/// A pull installs its layers before the entry that references them exists,
+/// and a collection that runs in between would otherwise take a layer nothing
+/// names yet. The hold is the reference that covers that gap: it lives while
+/// the holding process does, so a crashed pull's holds are reclaimed rather
+/// than kept forever.
+fn hold_layer(shared_root: &Path, id: &str) -> std::io::Result<()> {
+    let dir = shared_root.join(LAYER_HOLDS_DIR);
+    fs::create_dir_all(&dir)?;
+    fs::write(dir.join(format!("{}.{id}", std::process::id())), b"")
+}
+
+/// Drop this process's holds on `ids` — called once an entry that names them
+/// has been recorded, so the entry's record is what keeps them from then on.
+fn release_layer_holds(shared_root: &Path, ids: &[String]) {
+    let dir = shared_root.join(LAYER_HOLDS_DIR);
+    let pid = std::process::id();
+    for id in ids {
+        let _ = fs::remove_file(dir.join(format!("{pid}.{id}")));
+    }
+}
+
+/// Whether a process that wrote a hold is still running.
+#[cfg(unix)]
+fn pid_alive(pid: i32) -> bool {
+    // SAFETY: signal 0 performs the existence and permission check only.
+    let signalled = unsafe { libc::kill(pid, 0) } == 0;
+    signalled || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn pid_alive(_pid: i32) -> bool {
+    // Without a cheap liveness probe a hold is kept: over-keeping is safe, and
+    // only the Linux shared store reaches this code with holds in play.
+    true
+}
+
+/// Hold the store's lock: shared to install into it, exclusive to collect it.
+///
+/// Beside the store rather than inside it, so the lock never shows up among the
+/// layers and survives whichever directory the platform keeps its trees in.
+fn lock_layer_store(shared_root: &Path, exclusive: bool) -> std::io::Result<File> {
+    lock_layer_store_inner(shared_root, exclusive, false)?
+        .ok_or_else(|| std::io::Error::other("the layer store lock was not acquired"))
+}
+
+/// [`lock_layer_store`] without waiting: `None` when somebody else holds it.
+///
+/// An extraction collects the store on its way out, and that must never stall
+/// behind another extraction's install — the collection simply does not happen
+/// then, and the next one takes it.
+fn try_lock_layer_store(shared_root: &Path) -> std::io::Result<Option<File>> {
+    lock_layer_store_inner(shared_root, true, true)
+}
+
+fn lock_layer_store_inner(
+    shared_root: &Path,
+    exclusive: bool,
+    nonblocking: bool,
+) -> std::io::Result<Option<File>> {
+    fs::create_dir_all(shared_root)?;
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(shared_root.join(format!(".layer-store{LAYER_STORE_LOCK}")))?;
+    #[cfg(unix)]
+    {
+        let mut op = if exclusive {
+            libc::LOCK_EX
+        } else {
+            libc::LOCK_SH
+        };
+        if nonblocking {
+            op |= libc::LOCK_NB;
+        }
+        if unsafe { libc::flock(lock.as_raw_fd(), op) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if nonblocking && error.kind() == std::io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+    }
+    #[cfg(windows)]
+    {
+        // LockFileEx has no shared mode a same-process reader can hold
+        // alongside, so installs and collections serialize here. Correct, just
+        // not as concurrent: the pack path that uses the store is Linux-only,
+        // and the opportunistic collection simply does not run.
+        if nonblocking {
+            return Ok(None);
+        }
+        let _ = exclusive;
+        lock_file_exclusive(&lock)?;
+    }
+    Ok(Some(lock))
+}
+
+/// Stream one zstd layer blob into the store, verifying and atomic.
+///
+/// `reader` yields the blob exactly as a registry serves it: the
+/// zstd-compressed layer tar. The uncompressed bytes are what `diff_id`
+/// identifies, so they are hashed as they are unpacked and the tree only takes
+/// the layer's name once the archive ended and the digest matched; a mismatch
+/// leaves nothing behind. Returns without writing anything when the layer is
+/// already in the store, so a resumed pull re-does only the layer that was
+/// interrupted.
+///
+/// The store's lock is held shared across the install, which is what keeps a
+/// concurrent collection from deleting the tree being written.
+pub fn install_layer_from_stream<R: Read>(
+    shared_root: &Path,
+    diff_id: &str,
+    reader: R,
+) -> std::io::Result<()> {
+    let id = layer_store_id(diff_id)?;
+    let layers_dir = shared_layers_dir(shared_root)?;
+    let final_dir = layers_dir.join(&id);
+    if final_dir.is_dir() {
+        hold_layer(shared_root, &id)?;
+        return Ok(());
+    }
+    fs::create_dir_all(&layers_dir)?;
+    let _installing = lock_layer_store(shared_root, false)?;
+    // Re-check under the lock: another installer may have finished it while we
+    // waited, and the layer is content-addressed, so one copy serves everyone.
+    if final_dir.is_dir() {
+        hold_layer(shared_root, &id)?;
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    grow_layer_store_volume(shared_root)?;
+
+    let staging = partial_dir_for(&final_dir)?;
+    if staging.exists() {
+        fs::remove_dir_all(&staging)?;
+    }
+    fs::create_dir_all(&staging)?;
+
+    let unpacked = {
+        // The digest is over the *uncompressed* tar: decode first, then hash
+        // every byte the decoder hands out, whether the tar consumes it or the
+        // drain below does.
+        let decoder = match zstd::stream::Decoder::new(reader) {
+            Ok(decoder) => decoder,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("layer {id} is not a zstd stream: {error}"),
+                ));
+            }
+        };
+        let mut hashing = HashingReader::new(decoder);
+        let result = {
+            let boxed: Box<dyn Read + '_> = Box::new(&mut hashing);
+            let mut archive = tar::Archive::new(boxed);
+            safe_unpack_with_policy(
+                &mut archive,
+                &staging,
+                &SafeUnpackLimits::from_env(),
+                false,
+                true,
+            )
+            .map(|_report| ())
+        };
+        // Whatever the archive left unread — padding, or the rest of a stream
+        // that ended early — belongs to the layer's bytes and is hashed too.
+        let drained = std::io::copy(&mut hashing, &mut std::io::sink());
+        (result, drained, hashing.finish())
+    };
+    let (unpacked, drained, (digest, bytes)) = unpacked;
+    let failure = match (unpacked, drained) {
+        (Err(error), _) => Some(error),
+        (Ok(()), Err(error)) => Some(error),
+        (Ok(()), Ok(_)) if digest != id => Some(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("layer digest mismatch: stream hashes to {digest}, descriptor names {id}"),
+        )),
+        (Ok(()), Ok(_)) => None,
+    };
+    if let Some(error) = failure {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(std::io::Error::new(
+            error.kind(),
+            format!("installing layer {id} failed, nothing was kept ({bytes} bytes): {error}"),
+        ));
+    }
+    fs::rename(&staging, &final_dir)?;
+    hold_layer(shared_root, &id)
+}
+
+/// What a collection removed, for callers that report it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LayerStoreCollection {
+    /// Layers removed from the store.
+    pub layers_removed: u64,
+    /// Interrupted installs (`.partial` directories) discarded.
+    pub partials_discarded: u64,
+    /// Bytes that removing them actually frees on disk: the data of every file
+    /// whose inode no entry still links. A layer an entry holds frees nothing
+    /// until that entry goes too, and is reported as zero here.
+    pub bytes_reclaimed: u64,
+}
+
+/// Remove the layers no extraction or machine still references.
+///
+/// A layer is kept when any entry under `shared_root` names it in its
+/// `layers/layer-order` or `layers/streamed-layers` record (the two places a
+/// pack entry writes what its `layers/<id>/` holds), or when a live process
+/// holds it (a pull that has not yet been referenced). It is also kept when the
+/// store cannot be read at all, because a collection that cannot see its
+/// references must not guess. Machines are covered by their entry: a machine
+/// boots from a shared entry it holds a pointer to, and `smolvm pack prune`
+/// treats that pointer as a lease, so the entry outlives the machine.
+///
+/// Safe against installs by construction rather than by timing: installs and
+/// extractions hold the store's lock shared while they write, and this takes it
+/// exclusively, so nothing is collected while a tree is being written.
+pub fn collect_layer_store(
+    shared_root: &Path,
+    debug: bool,
+) -> std::io::Result<LayerStoreCollection> {
+    collect_layer_store_with(shared_root, debug, false)
+}
+
+/// [`collect_layer_store`] that only reports what it would remove when `dry_run`.
+pub fn collect_layer_store_with(
+    shared_root: &Path,
+    debug: bool,
+    dry_run: bool,
+) -> std::io::Result<LayerStoreCollection> {
+    let _collecting = lock_layer_store(shared_root, true)?;
+    collect_layer_store_locked(shared_root, debug, dry_run)
+}
+
+/// The collection itself, with the store's exclusive lock already held.
+fn collect_layer_store_locked(
+    shared_root: &Path,
+    debug: bool,
+    dry_run: bool,
+) -> std::io::Result<LayerStoreCollection> {
+    let mut report = LayerStoreCollection::default();
+    let Some(layers_dir) = existing_layers_dir(shared_root) else {
+        return Ok(report);
+    };
+
+    // References: every entry's own record of what it holds.
+    let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Ok(entries) = fs::read_dir(shared_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() || path == layers_dir {
+                continue;
+            }
+            for name in [LAYER_ORDER_FILE, STREAMED_LAYERS_FILE] {
+                referenced.extend(read_layer_ids(&path.join("layers").join(name)));
+            }
+        }
+    }
+
+    // Holds: a pull's layers that no entry names yet, kept while the process
+    // that placed the hold runs. A hold whose process is gone is dropped.
+    if let Ok(holds) = fs::read_dir(shared_root.join(LAYER_HOLDS_DIR)) {
+        for hold in holds.flatten() {
+            let name = hold.file_name();
+            let Some((pid, id)) = name.to_str().and_then(|n| n.split_once('.')) else {
+                continue;
+            };
+            match pid.parse::<i32>() {
+                Ok(pid) if pid_alive(pid) => {
+                    referenced.insert(id.to_owned());
+                }
+                _ => {
+                    if !dry_run {
+                        let _ = fs::remove_file(hold.path());
+                    }
+                }
+            }
+        }
+    }
+
+    let Ok(layers) = fs::read_dir(&layers_dir) else {
+        return Ok(report);
+    };
+    for layer in layers.flatten() {
+        let path = layer.path();
+        let name = layer.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !path.is_dir() {
+            continue;
+        }
+        if name.ends_with(PARTIAL_DIR_SUFFIX) {
+            // An interrupted install keeps no partial state worth resuming: the
+            // layer is content-addressed, so the next attempt starts from empty.
+            // The final directory is the only thing that proves a layer
+            // complete, so a leftover under any other name has to go.
+            if dry_run || fs::remove_dir_all(&path).is_ok() {
+                report.partials_discarded += 1;
+            }
+            continue;
+        }
+        if referenced.contains(name) {
+            continue;
+        }
+        if debug {
+            eprintln!("debug: collecting unreferenced layer {name}");
+        }
+        let reclaimable = reclaimable_bytes(&path);
+        if dry_run || fs::remove_dir_all(&path).is_ok() {
+            report.layers_removed += 1;
+            report.bytes_reclaimed = report.bytes_reclaimed.saturating_add(reclaimable);
+        }
+    }
+    Ok(report)
+}
+
+/// Bytes a tree's removal actually frees: the data of each regular file whose
+/// inode nothing else links. A file an entry also links keeps its blocks.
+#[cfg(unix)]
+fn reclaimable_bytes(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let Ok(meta) = fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if meta.is_dir() {
+            total = total.saturating_add(reclaimable_bytes(&entry.path()));
+        } else if meta.is_file() && meta.nlink() == 1 {
+            total = total.saturating_add(meta.blocks().saturating_mul(512));
+        }
+    }
+    total
+}
+
+#[cfg(not(unix))]
+fn reclaimable_bytes(path: &Path) -> u64 {
+    dir_disk_usage(path)
+}
+
+/// Publish `to` as a fan-out of `from`: built under a staging name and renamed
+/// into place, so a tree carries its final name only once every file is linked.
+/// Whatever stood at `to` before is replaced.
+fn publish_tree(from: &Path, to: &Path, debug: bool) -> std::io::Result<()> {
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let staging = partial_dir_for(to)?;
+    if staging.exists() {
+        fs::remove_dir_all(&staging)?;
+    }
+    if to.is_dir() {
+        fs::remove_dir_all(to)?;
+    }
+    if let Err(error) = link_layer_tree(from, &staging, debug) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(std::io::Error::new(
+            error.kind(),
+            format!(
+                "linking {} into {} failed: {error}",
+                from.display(),
+                to.display()
+            ),
+        ));
+    }
+    fs::rename(&staging, to)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn link_layer_tree(from: &Path, to: &Path, debug: bool) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = fs::symlink_metadata(from)?;
+    let file_type = meta.file_type();
+    if file_type.is_dir() {
+        fs::create_dir_all(to)?;
+        let mode = meta.permissions().mode() & 0o7777;
+        // Children have to be creatable in a directory the layer may have
+        // archived read-only, so it is widened first and restored after.
+        fs::set_permissions(to, fs::Permissions::from_mode(mode | 0o700))?;
+        copy_user_xattrs(from, to);
+        let mut children: Vec<fs::DirEntry> = fs::read_dir(from)?.flatten().collect();
+        children.sort_by_key(|entry| entry.file_name());
+        for child in children {
+            link_layer_tree(&child.path(), &to.join(child.file_name()), debug)?;
+        }
+        fs::set_permissions(to, fs::Permissions::from_mode(mode))?;
+        return Ok(());
+    }
+    if file_type.is_file() {
+        // A layer with two hard links of its own (rare, but a tar can archive
+        // one file twice) is linked once and then linked again from the copy,
+        // which is what `link` does for every other file.
+        if to.exists() {
+            return Ok(());
+        }
+        fs::hard_link(from, to)?;
+        return Ok(());
+    }
+    if file_type.is_symlink() {
+        let target = fs::read_link(from)?;
+        if to.symlink_metadata().is_ok() {
+            return Ok(());
+        }
+        std::os::unix::fs::symlink(&target, to)?;
+        // Linux refuses user xattrs on symlinks (EPERM), so this is best
+        // effort and no worse than the extraction's own recording.
+        copy_user_xattrs(from, to);
+        return Ok(());
+    }
+    // Device nodes, fifos and sockets: the host cannot create them
+    // unprivileged, and the extraction leaves the same entries out, so the
+    // store holds none. Silence here matches that: the tree is what the guest
+    // can represent.
+    let _ = debug;
+    Ok(())
+}
+
+/// The same fan-out on a platform whose store cannot share inodes with an
+/// entry: macOS keeps its layers in a volume no link can cross, and Windows has
+/// no shared extraction to link into. Only the store itself is ever built
+/// there (a registry pull), and it is built by unpacking, so nothing asks for a
+/// linked tree.
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+fn link_layer_tree(from: &Path, to: &Path, debug: bool) -> std::io::Result<()> {
+    let _ = (from, to, debug);
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "the layer store does not link trees into entries on this platform",
+    ))
+}
+
+/// Copy every `user.*` extended attribute from one entry to another.
+///
+/// The attributes are the ownership contract with the guest (the
+/// `user.containers.override_stat` the extraction wrote) and overlayfs's opaque
+/// markers, so a recreated directory without them would hand the guest the
+/// host's own ownership. Best effort per attribute, like the extraction itself:
+/// a filesystem that cannot store one simply has none to copy.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn copy_user_xattrs(from: &Path, to: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c_from) = std::ffi::CString::new(from.as_os_str().as_bytes()) else {
+        return;
+    };
+    let size = unsafe { libc::llistxattr(c_from.as_ptr(), std::ptr::null_mut(), 0) };
+    if size <= 0 {
+        return;
+    }
+    let mut names = vec![0u8; size as usize];
+    let read = unsafe { libc::llistxattr(c_from.as_ptr(), names.as_mut_ptr().cast(), names.len()) };
+    if read <= 0 {
+        return;
+    }
+    names.truncate(read as usize);
+    for name in names.split(|byte| *byte == 0) {
+        if name.is_empty() || !name.starts_with(b"user.") {
+            continue;
+        }
+        let Ok(c_name) = std::ffi::CString::new(name) else {
+            continue;
+        };
+        let size =
+            unsafe { libc::lgetxattr(c_from.as_ptr(), c_name.as_ptr(), std::ptr::null_mut(), 0) };
+        if size < 0 {
+            continue;
+        }
+        let mut value = vec![0u8; size as usize];
+        let read = unsafe {
+            libc::lgetxattr(
+                c_from.as_ptr(),
+                c_name.as_ptr(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+            )
+        };
+        if read < 0 {
+            continue;
+        }
+        value.truncate(read as usize);
+        let _ = set_user_xattr_os(to, name, &value);
+    }
+}
+
+/// Windows stores these attributes as alternate data streams rather than in a
+/// `user.*` namespace, and macOS keeps its attributes on the volume it links
+/// nothing into; both only ever build the store by unpacking.
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+fn copy_user_xattrs(_from: &Path, _to: &Path) {}
+
+/// [`set_user_xattr`] with the name and value as bytes, so a whole attribute
+/// set can be replayed rather than one known constant.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn set_user_xattr_os(path: &Path, name: &[u8], value: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path"))?;
+    let c_name = std::ffi::CString::new(name)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "xattr name"))?;
+    let rc = unsafe {
+        libc::lsetxattr(
+            c_path.as_ptr(),
+            c_name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Grow the case-sensitive store volume when it is running out of room.
+///
+/// The store cannot be sized from what it will hold — a pull streams the layers
+/// — so it is created generous and grown here, on the way into an install, by a
+/// volume-sized step at a time. `hdiutil resize` works on a mounted sparse
+/// image, so the store stays usable while it grows.
+#[cfg(target_os = "macos")]
+fn grow_layer_store_volume(shared_root: &Path) -> std::io::Result<()> {
+    let mount_point = shared_root.join(CS_MOUNT_DIR);
+    let Ok(available) = available_bytes(&mount_point) else {
+        return Ok(());
+    };
+    const HEADROOM: u64 = 2 * 1024 * 1024 * 1024;
+    if available >= HEADROOM {
+        return Ok(());
+    }
+    let image_path = shared_root.join(CS_IMAGE_NAME);
+    let output = std::process::Command::new("hdiutil")
+        .arg("resize")
+        .arg("-size")
+        .arg(format!(
+            "+{}g",
+            LAYER_STORE_VOLUME_BYTES / (1024 * 1024 * 1024)
+        ))
+        .arg(&image_path)
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "hdiutil resize failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(())
 }
 
 /// What an unpack actually did, so a caller can judge completeness instead of
@@ -1262,6 +2189,24 @@ fn safe_unpack_skipping<R: Read>(
                     entry_path.display()
                 ),
             ));
+        }
+
+        // A pack's layer members are unpacked as they stream past when this
+        // host is the one that unpacks them: the tar is never written, and the
+        // tree lands in `<store>/<id>.partial` -> `<store>/<id>/` with its
+        // digest verified over the bytes consumed. See [`stream_layer_member`].
+        // `store` was resolved before this archive was opened, so on macOS it
+        // is the *mounted* case-sensitive volume: a streamed tree can never be
+        // written through the case-insensitive path that would silently drop
+        // paths differing only in case.
+        if let Some(store) = limits.stream_layers.as_deref() {
+            if !required_here && entry_type == tar::EntryType::Regular {
+                if let Some(id) = layer_member_id(&entry_path) {
+                    stream_layer_member(&mut entry, dest, store, &id, limits, false)?;
+                    report.entries += 1;
+                    continue;
+                }
+            }
         }
 
         // Ensure parent directories are writable before extracting any entry.
@@ -1729,7 +2674,7 @@ pub fn cached_layers_usable(cache_dir: &Path) -> bool {
     let layers_dir = cache_dir.join("layers");
     let has_form =
         |id: &str| layers_dir.join(id).is_dir() || layers_dir.join(format!("{id}.tar")).is_file();
-    if let Ok(contents) = fs::read_to_string(layers_dir.join("layer-order")) {
+    if let Ok(contents) = fs::read_to_string(layers_dir.join(LAYER_ORDER_FILE)) {
         let ids: Vec<&str> = contents
             .lines()
             .map(str::trim)
@@ -1737,7 +2682,7 @@ pub fn cached_layers_usable(cache_dir: &Path) -> bool {
             .collect();
         return !ids.is_empty() && ids.iter().all(|id| has_form(id));
     }
-    fs::read_dir(&layers_dir)
+    let listed = fs::read_dir(&layers_dir)
         .map(|rd| {
             rd.flatten().any(|e| {
                 let path = e.path();
@@ -1745,7 +2690,65 @@ pub fn cached_layers_usable(cache_dir: &Path) -> bool {
                 (path.is_dir() && !staging) || path.extension().is_some_and(|x| x == "tar")
             })
         })
-        .unwrap_or(false)
+        .unwrap_or(false);
+    // An extraction that streamed its layers has no tar for the checks above
+    // to find; its own record stands in for them.
+    listed || streamed_layers_present(cache_dir)
+}
+
+/// Whether the layers a streaming extraction installed are still in place.
+///
+/// Its record (written by [`post_process_extraction`] once the whole layer set
+/// was in the store) must exist and name at least one layer; what "in place"
+/// then means depends on where the host unpacked them.
+///
+/// Linux and Windows: the trees are in `layers/` itself, so every recorded id
+/// must still be a directory there — a cleaner that deleted the trees has to
+/// be seen, exactly as the tar-based check sees it.
+///
+/// macOS: the trees are inside the extraction's case-sensitive volume, which
+/// cannot be read while it is unmounted, so the record together with the
+/// volume's backing file is the whole check — a cleaner that takes the store
+/// takes the sparse image with it.
+fn streamed_layers_present(cache_dir: &Path) -> bool {
+    let layers_dir = cache_dir.join("layers");
+    let ids = read_layer_ids(&layers_dir.join(STREAMED_LAYERS_FILE));
+    !ids.is_empty() && streamed_layer_store_intact(cache_dir, &layers_dir, &ids)
+}
+
+/// The layer ids a record file names, one per line, blanks ignored.
+///
+/// The ids become path components, so only ids this code may join onto a
+/// directory are kept: a name that is not a digest is skipped rather than
+/// turned into a path.
+fn read_layer_ids(path: &Path) -> std::collections::HashSet<String> {
+    fs::read_to_string(path)
+        .map(|contents| {
+            contents
+                .lines()
+                .map(str::trim)
+                .filter_map(|id| layer_store_id(id).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn streamed_layer_store_intact(
+    _cache_dir: &Path,
+    layers_dir: &Path,
+    ids: &std::collections::HashSet<String>,
+) -> bool {
+    ids.iter().all(|id| layers_dir.join(id).is_dir())
+}
+
+#[cfg(target_os = "macos")]
+fn streamed_layer_store_intact(
+    cache_dir: &Path,
+    _layers_dir: &Path,
+    _ids: &std::collections::HashSet<String>,
+) -> bool {
+    cache_dir.join(CS_IMAGE_NAME).is_file()
 }
 
 /// Whether the pack at `sidecar_path` carries image layers that its extracted
@@ -1939,6 +2942,13 @@ pub fn evict_cache_to_size_protecting(
         if !meta.is_dir() {
             continue; // skip *.lock files and other non-extraction entries
         }
+        // The digest-keyed layer store belongs to the node, not to any one
+        // extraction: it has no lease to protect it and no marker to look for,
+        // and deleting it would take every pack's layers with it. Its own
+        // collection ([`collect_layer_store`]) decides what may go.
+        if entry.file_name() == LAYER_STORE_DIR {
+            continue;
+        }
         let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
         entries.push((path, modified, dir_disk_usage(&entry.path())));
     }
@@ -2042,6 +3052,7 @@ pub fn extract_sidecar_for_agent(
             agent_version,
             digest_out: None,
             defer_memory_sync: None,
+            layer_store: None,
         },
     )
 }
@@ -2052,6 +3063,13 @@ struct ExtractContext<'a> {
     /// Set when a new extraction leaves its checkpoint RAM for a later
     /// write-back instead of syncing it; the marker is written first.
     defer_memory_sync: Option<&'a mut bool>,
+    /// The shared root of the node's digest-keyed layer store, when this
+    /// extraction should reference it instead of owning its layers: the pack's
+    /// layer members stream into the store, and the entry gets each one under
+    /// its own name by linking it in ([`link_layer_tree`]). `None` — the
+    /// per-machine path, and every platform without one — keeps each extraction
+    /// self-contained, exactly as before.
+    layer_store: Option<&'a Path>,
 }
 
 /// Core of [`extract_sidecar`]. `cap_cache` runs the LRU size-cap on
@@ -2078,6 +3096,7 @@ fn extract_sidecar_capped(
         agent_version,
         digest_out,
         defer_memory_sync,
+        layer_store,
     } = context;
     if !sidecar_path.exists() {
         return Err(std::io::Error::new(
@@ -2177,6 +3196,7 @@ fn extract_sidecar_capped(
         debug,
         agent_version,
         digest_out,
+        layer_store,
     );
 
     // If extraction failed mid-stream, partially extracted files remain on
@@ -2277,7 +3297,7 @@ pub fn retain_prepared_checkpoint_with_identity(
         return Ok(());
     }
     // Do not expose the completion marker until all payloads are durable.
-    post_process_extraction(prepared, &[], true, false, false)?;
+    post_process_extraction(prepared, &[], true, false, false, None, None)?;
     fs::set_permissions(
         prepared.join("checkpoint/memory.bin"),
         fs::Permissions::from_mode(0o600),
@@ -2386,6 +3406,8 @@ pub fn extract_sidecar_shared_with_options(
 ) -> std::io::Result<PathBuf> {
     let shared_dir = shared_pack_dir(shared_root, footer.checksum);
     let was_extracted = is_extracted(&shared_dir);
+    // Whether this extraction references the node's digest-keyed layer store.
+    let store_used = shared_layer_store_enabled();
     let checkpoint = cfg!(target_os = "linux")
         && std::env::var_os("SMOLVM_DISABLE_CHECKPOINT_WRITEBACK").is_none()
         && crate::packer::read_manifest_from_sidecar(sidecar_path)
@@ -2409,6 +3431,11 @@ pub fn extract_sidecar_shared_with_options(
             agent_version: None,
             digest_out: capture_digest.then_some(&mut observed_digest),
             defer_memory_sync: defer.then_some(&mut deferred),
+            // The shared extraction path is the one place a pack entry may
+            // reference the node's layer store: it is Linux-only, root-owned,
+            // and presented to each VM through an idmapped mount, which is
+            // exactly where sharing a layer's bytes between entries is sound.
+            layer_store: store_used.then_some(shared_root),
         },
     )?;
     // With deferral requested, whoever extracted the entry owns its
@@ -2439,6 +3466,42 @@ pub fn extract_sidecar_shared_with_options(
             observed_digest.as_mut(),
         )?;
     }
+    // A layer no extracted entry names any more is dead weight, and an entry
+    // that references one is exactly what protects it, so this is the moment
+    // the answer is known — and, since the extractor is already here, the
+    // moment to act on it. Never waits: an extraction that is still streaming
+    // layers in holds the store, and the next shared extraction collects
+    // instead.
+    if store_used {
+        match try_lock_layer_store(shared_root) {
+            // The lock is held for the collection itself and released with it.
+            Ok(Some(_collecting)) => match collect_layer_store_locked(shared_root, debug, false) {
+                Ok(report) if report.layers_removed > 0 || report.partials_discarded > 0 => {
+                    if debug {
+                        eprintln!(
+                            "debug: layer store collection removed {} layer(s) and {} \
+                             interrupted install(s)",
+                            report.layers_removed, report.partials_discarded
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    if debug {
+                        eprintln!("debug: layer store collection failed: {error}");
+                    }
+                }
+            },
+            // Another extraction is mid-install; that one collects instead.
+            Ok(None) => {}
+            Err(error) => {
+                if debug {
+                    eprintln!("debug: layer store collection skipped: {error}");
+                }
+            }
+        }
+    }
+
     // Lock down the store so a dropped per-VM uid can't read the shared copy
     // directly (it must go through its idmapped mount). Best-effort: traversal
     // by root (the VMM before it drops privileges) is unaffected by 0700.
@@ -3424,7 +4487,7 @@ fn upgrade_staged_layers(
     }
     let manifest = crate::packer::read_manifest_from_sidecar(sidecar_path).ok();
     let agent = agent_version.or_else(|| manifest.as_ref().map(|m| m.smolvm_version.as_str()));
-    if !host_layers_via_override_stat(agent, cache_dir) {
+    if !host_unpacks_layers(agent, cache_dir) {
         return Ok(false);
     }
     // The stacking order the guest needs: the manifest's, else the one the
@@ -3456,7 +4519,7 @@ fn upgrade_staged_layers(
             cache_dir.display()
         );
     }
-    post_process_extraction(cache_dir, &layer_order, false, debug, true)?;
+    post_process_extraction(cache_dir, &layer_order, false, debug, true, None, None)?;
     Ok(true)
 }
 
@@ -3880,6 +4943,120 @@ mod resume_extract_tests {
     }
 }
 
+/// The host layer store a streaming extraction installs into, when streaming
+/// applies to this extraction at all.
+///
+/// The store is resolved *before* the archive is opened: on macOS this mounts
+/// the case-sensitive APFS volume a streamed tree has to land in
+/// ([`extraction_layers_dir`]), and it is the last moment at which that can
+/// happen — once the first byte of the assets blob has been read, a mount that
+/// fails would leave a half-written tree on the case-insensitive volume.
+///
+/// Sizing and the free-space check move here with it. A staged extraction sizes
+/// the volume from the tars it just wrote and preflights them before unpacking;
+/// streamed, neither exists, so the manifest's layer sizes — the same
+/// uncompressed bytes the tars would hold — stand in for them.
+fn stream_layers_store(
+    cache_dir: &Path,
+    manifest: Option<&crate::format::PackManifest>,
+    agent_version: Option<&str>,
+    debug: bool,
+    layer_store_dir: Option<&Path>,
+) -> std::io::Result<Option<PathBuf>> {
+    if !stream_layers_enabled() {
+        return Ok(None);
+    }
+    let Some(manifest) = manifest else {
+        return Ok(None);
+    };
+    if manifest.assets.layers.is_empty() {
+        return Ok(None);
+    }
+    if !host_unpacks_layers(
+        agent_version.or(Some(manifest.smolvm_version.as_str())),
+        cache_dir,
+    ) {
+        return Ok(None);
+    }
+    // Every layer, so the volume is created large enough for the whole image;
+    // only the ones not already in the store cost room and speed.
+    let total: u64 = manifest.assets.layers.iter().map(|layer| layer.size).sum();
+    let store = match layer_store_dir {
+        // The node's digest-keyed store: the same layers a second pack carries
+        // are already here, which is the whole point of streaming into it.
+        Some(store) => store.to_path_buf(),
+        None => extraction_layers_dir(cache_dir, total, debug)?,
+    };
+    fs::create_dir_all(&store)?;
+    // Layers whose asset path is not a `layers/<hex>.tar` member are staged as
+    // tars exactly as before, and preflighted after they are written.
+    let missing: u64 = manifest
+        .assets
+        .layers
+        .iter()
+        .filter(|layer| {
+            layer_member_id(Path::new(&layer.path)).is_some_and(|id| !store.join(id).is_dir())
+        })
+        .map(|layer| layer.size)
+        .sum();
+    if missing > 0 {
+        preflight_free_space(&store, missing, "the packed image layers")?;
+    }
+    if debug {
+        eprintln!(
+            "debug: streaming the pack's layer members into {}{}",
+            store.display(),
+            if missing > 0 {
+                format!(" ({missing} bytes to install)")
+            } else {
+                String::new()
+            }
+        );
+    }
+    Ok(Some(store))
+}
+
+/// Whether an error is a streamed layer whose bytes do not hash to its name.
+fn is_layer_digest_mismatch(error: &std::io::Error) -> bool {
+    error.to_string().contains(LAYER_DIGEST_MISMATCH)
+}
+
+/// The message every streamed-layer digest failure carries, so the caller can
+/// tell it from a truncated or corrupt archive (which stays an error).
+const LAYER_DIGEST_MISMATCH: &str = "layer digest mismatch";
+
+/// Unpack a pack's assets from `sidecar_file`, streaming its layer members into
+/// `streamed_layers_dir` when given. Opens nothing itself, so the caller can
+/// rewind by opening a fresh reader.
+fn unpack_pack_assets(
+    sidecar_file: &mut ExtractDigestReader,
+    cache_dir: &Path,
+    footer: &PackFooter,
+    manifest: Option<&crate::format::PackManifest>,
+    streamed_layers_dir: Option<&Path>,
+) -> std::io::Result<()> {
+    let limited_reader = (&mut *sidecar_file).take(footer.assets_size);
+    let decoder = zstd::stream::Decoder::new(limited_reader)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let mut archive = tar::Archive::new(decoder);
+    // The layer decision has to be made before the unpack when streaming is
+    // possible: the tars are never written then, so a decision read off the
+    // extracted tree afterwards (`has_layer_tars`) would say "stage for the
+    // guest" about a tree this host already unpacked.
+    let limits = match streamed_layers_dir {
+        Some(store) => SafeUnpackLimits::from_env().streaming_layers(store.to_path_buf()),
+        None => SafeUnpackLimits::from_env(),
+    };
+    safe_unpack_with_policy(
+        &mut archive,
+        cache_dir,
+        &limits,
+        manifest.is_some_and(|manifest| manifest.checkpoint.is_some()),
+        false,
+    )
+    .map(|_report| ())
+}
+
 fn extract_sidecar_inner(
     sidecar_path: &Path,
     cache_dir: &Path,
@@ -3887,6 +5064,7 @@ fn extract_sidecar_inner(
     debug: bool,
     agent_version: Option<&str>,
     digest_out: Option<&mut Option<ArtifactDigestProof>>,
+    layer_store: Option<&Path>,
 ) -> std::io::Result<()> {
     fs::create_dir_all(cache_dir)?;
 
@@ -3898,22 +5076,74 @@ fn extract_sidecar_inner(
         );
     }
 
-    let mut sidecar_file = ExtractDigestReader::open(sidecar_path, digest_out.is_some())?;
     let manifest = crate::packer::read_manifest_from_sidecar(sidecar_path).ok();
-    {
-        let limited_reader = (&mut sidecar_file).take(footer.assets_size);
-        let decoder = zstd::stream::Decoder::new(limited_reader)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let mut archive = tar::Archive::new(decoder);
-        safe_unpack_with_policy(
-            &mut archive,
-            cache_dir,
-            &SafeUnpackLimits::from_env(),
-            manifest
-                .as_ref()
-                .is_some_and(|manifest| manifest.checkpoint.is_some()),
-            false,
-        )?;
+    // The node's digest-keyed layer store, when the caller threads one through:
+    // its directory is resolved once here (mounting the case-sensitive volume on
+    // macOS), used as the streaming target below, and then as the source of the
+    // trees the entry links in during post-processing. The store's lock is held
+    // *shared* for the whole extraction — layers are installed into it, and the
+    // entry that references them is only written at the end — so a collection
+    // can never run between the two halves.
+    let mut layer_store_dir = match layer_store {
+        Some(shared_root) => Some(shared_layers_dir(shared_root)?),
+        None => None,
+    };
+    let _store_install_guard = match layer_store {
+        Some(shared_root) => Some(lock_layer_store(shared_root, false)?),
+        None => None,
+    };
+    // Whether this host should unpack the pack's layer members while they
+    // stream past — the same conditions that make host extraction the right
+    // call, plus layers to unpack at all — and where they are unpacked. See
+    // [`stream_layers_store`]. The store is resolved (and the case-sensitive
+    // volume mounted, on macOS) *before* the archive is opened, so no streamed
+    // byte can ever be written through the wrong path.
+    let mut streamed_layers_dir = stream_layers_store(
+        cache_dir,
+        manifest.as_ref(),
+        agent_version,
+        debug,
+        layer_store_dir.as_deref(),
+    )?;
+    let mut sidecar_file = ExtractDigestReader::open(sidecar_path, digest_out.is_some())?;
+    let unpacked = unpack_pack_assets(
+        &mut sidecar_file,
+        cache_dir,
+        footer,
+        manifest.as_ref(),
+        streamed_layers_dir.as_deref(),
+    );
+    if let Err(error) = &unpacked {
+        if streamed_layers_dir.is_some() && is_layer_digest_mismatch(error) {
+            // A layer whose bytes are not the digest its name claims: the name
+            // is not a content address for this pack (a single-layer export
+            // re-creates its tar, so its bytes need not hash to the image's
+            // layer digest). Nothing from the streamed attempt may be kept, and
+            // the store must never take an unverified layer, so the whole pack
+            // is extracted the way it always was: staged, unpacked on the host,
+            // with no store. The bytes are the same either way.
+            eprintln!(
+                "warning: a layer in {} does not hash to its name ({error}); extracting \
+                 the pack without the layer store, as before this path existed",
+                sidecar_path.display()
+            );
+            // The directory stays (guests may hold its other files, as with
+            // every in-place re-extraction); the retry rewrites what the
+            // streamed attempt wrote, and that attempt removed its own partial
+            // layer trees when it failed.
+            streamed_layers_dir = None;
+            layer_store_dir = None;
+            sidecar_file = ExtractDigestReader::open(sidecar_path, digest_out.is_some())?;
+            unpack_pack_assets(
+                &mut sidecar_file,
+                cache_dir,
+                footer,
+                manifest.as_ref(),
+                None,
+            )?;
+        } else {
+            unpacked?;
+        }
     }
 
     if debug {
@@ -3940,8 +5170,9 @@ fn extract_sidecar_inner(
     // presented; that is the packed agent unless the caller boots its own.
     let pack_version =
         agent_version.or_else(|| manifest.as_ref().map(|m| m.smolvm_version.as_str()));
-    let host_layers =
-        has_layer_tars(cache_dir) && host_layers_via_override_stat(pack_version, cache_dir);
+    let host_layers = (has_layer_tars(cache_dir)
+        || has_host_unpacked_layers(cache_dir, streamed_layers_dir.as_deref()))
+        && host_unpacks_layers(pack_version, cache_dir);
     let guest_unpacks_layers =
         !host_layers && pack_version.is_some_and(packed_agent_unpacks_staged_layers);
     if !host_layers
@@ -3976,6 +5207,8 @@ fn extract_sidecar_inner(
         guest_unpacks_layers,
         debug,
         host_layers,
+        streamed_layers_dir.as_deref(),
+        layer_store_dir.as_deref(),
     )?;
     if let Some(slot) = digest_out {
         *slot = sidecar_file.finish()?;
@@ -4026,7 +5259,7 @@ pub fn extract_from_binary(
         // order from here, so let the agent fall back to a name sort. The stub
         // and the agent it carries were built by the same release, so staging
         // can never outrun the agent the way a sidecar from another version can.
-        post_process_extraction(cache_dir, &[], true, debug, false)?;
+        post_process_extraction(cache_dir, &[], true, debug, false, None, None)?;
         Ok(())
     }
 }
@@ -4068,7 +5301,7 @@ pub unsafe fn extract_from_section(
 
     // Mach-O section self-exec stub: same as embedded mode — name-sort fallback,
     // and likewise self-consistent on staging.
-    post_process_extraction(cache_dir, &[], true, debug, false)?;
+    post_process_extraction(cache_dir, &[], true, debug, false, None)?;
     Ok(())
 }
 
@@ -4282,6 +5515,20 @@ fn preflight_free_space(dest: &Path, needed: u64, what: &str) -> std::io::Result
 /// can be mis-stacked. Must match the agent's `LAYER_ORDER_FILE`.
 const LAYER_ORDER_FILE: &str = "layer-order";
 
+/// Name of the file a *streaming* extraction writes into its own `layers/`
+/// directory, listing the layer ids it unpacked as the assets streamed past,
+/// bottom→top.
+///
+/// A staged extraction leaves a tar per layer, and those tars are what
+/// [`cached_layers_usable`] reads to tell a cache whose layers were deleted
+/// from one that still has them. Streamed, no tar is ever written, so on
+/// Linux and Windows the trees themselves answer and on macOS — where the trees
+/// are inside a case-sensitive volume that cannot be read while it is unmounted
+/// — this record plus the volume's backing file is the whole answer. Without it
+/// a streamed entry would look like it lost its layers on every cache hit and
+/// be re-extracted from scratch.
+pub const STREAMED_LAYERS_FILE: &str = "streamed-layers";
+
 /// Layer id used as the on-disk layer dir name, derived from the manifest asset
 /// path stem so old short paths and new full-digest paths both preserve order.
 fn layer_id_from_asset_path(path: &str) -> Option<String> {
@@ -4298,12 +5545,26 @@ fn layer_id_from_asset_path(path: &str) -> Option<String> {
 /// permissions, and (when `layer_order` is non-empty) write the layer-order
 /// index so the guest stacks the layers in true OCI order rather than by their
 /// content-addressed names. `layer_order` is the short layer ids bottom→top.
+///
+/// `streamed_layers` is the host layer store the caller unpacked the layer
+/// members into while the assets streamed past, when it did so: those trees
+/// exist already and there is no tar for the loop below to find. It is also
+/// what marks the extraction as streamed, for the record
+/// [`cached_layers_usable`] reads.
+///
+/// `layer_store` is the node's digest-keyed store, when this extraction
+/// references one: the entry then holds each layer under its own name as a
+/// fan-out of hard links into the store ([`link_layer_tree`]), and any tree this
+/// extraction produced itself — from a staged tar, or from an earlier layout —
+/// is linked *into* the store so the next pack can reuse it.
 fn post_process_extraction(
     cache_dir: &Path,
     layer_order: &[String],
     guest_unpacks_layers: bool,
     debug: bool,
     owner_xattr: bool,
+    streamed_layers: Option<&Path>,
+    layer_store: Option<&Path>,
 ) -> std::io::Result<()> {
     // Extract agent-rootfs.tar to agent-rootfs directory
     let rootfs_tar = cache_dir.join("agent-rootfs.tar");
@@ -4346,7 +5607,7 @@ fn post_process_extraction(
                 fs::write(layers_dir.join(LAYER_ORDER_FILE), lines.join("\n"))?;
             }
         }
-    } else if layers_dir.exists() {
+    } else if layers_dir.exists() || streamed_layers.is_some() || layer_store.is_some() {
         if debug {
             eprintln!("debug: extracting OCI layers...");
         }
@@ -4354,39 +5615,53 @@ fn post_process_extraction(
         // paths that differ only in case. On Linux (ext4/xfs), the layers
         // dir is already case-sensitive. If the volume can't be created on
         // macOS, fail rather than silently corrupting case-colliding paths.
-        let extract_dir = extraction_layers_dir(cache_dir, debug)?;
+        let extract_dir = extraction_layers_dir(cache_dir, 0, debug)?;
+        if layer_store.is_some() || streamed_layers.is_some() {
+            fs::create_dir_all(&layers_dir)?;
+        }
+        // With a digest-keyed store the trees this host unpacks are built there,
+        // and the entry takes each one as a fan-out of hard links into it.
+        let tree_root = layer_store
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| extract_dir.clone());
 
-        // Only the tars whose layer is not already in place still cost disk.
-        // A tar's size is a faithful upper bound on the tree it unpacks to.
+        // Only the staged tars whose tree is not already in place still cost
+        // disk. A tar's size is a faithful upper bound on the tree it unpacks to.
         let mut pending: Vec<(PathBuf, PathBuf)> = Vec::new();
         let mut needed = 0u64;
-        for entry in fs::read_dir(&layers_dir)? {
-            let path = entry?.path();
-            if !path.extension().is_some_and(|ext| ext == "tar") {
-                continue;
-            }
-            let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-            let layer_dir = extract_dir.join(&*stem);
-            if !layer_dir.is_dir() {
-                needed = needed.saturating_add(fs::metadata(&path)?.len());
-                pending.push((path, layer_dir));
+        if layers_dir.exists() {
+            for entry in fs::read_dir(&layers_dir)? {
+                let path = entry?.path();
+                if !path.extension().is_some_and(|ext| ext == "tar") {
+                    continue;
+                }
+                let stem = path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                let tree = tree_root.join(&stem);
+                if !tree.is_dir() {
+                    needed = needed.saturating_add(fs::metadata(&path)?.len());
+                    pending.push((path, tree));
+                }
             }
         }
         if !pending.is_empty() {
-            preflight_free_space(&extract_dir, needed, "the packed image layers")?;
+            preflight_free_space(&tree_root, needed, "the packed image layers")?;
         }
-        for (tar, layer_dir) in &pending {
+        for (tar, tree) in &pending {
             if debug {
                 eprintln!(
                     "debug: extracting layer {}...",
-                    layer_dir.file_name().unwrap_or_default().to_string_lossy()
+                    tree.file_name().unwrap_or_default().to_string_lossy()
                 );
             }
-            if let Some(report) = materialize_tar_dir(tar, layer_dir, debug, owner_xattr)? {
+            if let Some(report) = materialize_tar_dir(tar, tree, debug, owner_xattr)? {
                 if debug && report.skipped > 0 {
                     eprintln!(
                         "debug: layer {}: {} entries the host could not represent were skipped",
-                        layer_dir.file_name().unwrap_or_default().to_string_lossy(),
+                        tree.file_name().unwrap_or_default().to_string_lossy(),
                         report.skipped
                     );
                 }
@@ -4399,18 +5674,54 @@ fn post_process_extraction(
             fs::write(cache_dir.join(HOST_LAYER_SYMLINKS_MARKER), "")?;
             fs::write(cache_dir.join(HOST_LAYERS_MARKER), "")?;
         }
-        // Record the manifest's layer order so the guest stacks overlayfs
-        // lowerdirs correctly (layer dirs are named by digest and don't sort
-        // into stack order). Only ids backed by an extracted dir are written.
-        if !layer_order.is_empty() {
-            let lines: Vec<&str> = layer_order
-                .iter()
-                .filter(|id| extract_dir.join(id).is_dir())
-                .map(String::as_str)
-                .collect();
-            if !lines.is_empty() {
-                fs::write(extract_dir.join(LAYER_ORDER_FILE), lines.join("\n"))?;
+
+        // The entry's own view of its layers, in stack order. Every layer the
+        // order names is either already a complete tree here, or one the store
+        // holds (a fan-out of its links), or one this entry built itself (then
+        // the store takes a fan-out of it, so the next pack reuses the bytes).
+        // Only an entry whose record names a layer and still holds its tree
+        // skips the fan-out, which is what makes a resumed extraction cheap.
+        let mut recorded = read_layer_ids(&layers_dir.join(STREAMED_LAYERS_FILE));
+        let mut installed: Vec<String> = Vec::new();
+        for id in layer_order {
+            let Ok(key) = layer_store_id(id) else {
+                // Not an id this code may turn into a path; the order index
+                // still carries it for the agent, exactly as before.
+                continue;
+            };
+            let tree = extract_dir.join(&key);
+            if let Some(store) = layer_store {
+                let shared = store.join(&key);
+                if shared.is_dir() {
+                    if !(recorded.contains(&key) && tree.is_dir()) {
+                        publish_tree(&shared, &tree, debug)?;
+                    }
+                } else if tree.is_dir() {
+                    publish_tree(&tree, &shared, debug)?;
+                }
             }
+            if tree.is_dir() {
+                installed.push(key.clone());
+                recorded.insert(key);
+            }
+        }
+        if !installed.is_empty() {
+            // The stacking order the guest reads.
+            fs::write(extract_dir.join(LAYER_ORDER_FILE), installed.join("\n"))?;
+            // A tar-less extraction leaves no other trace of what it holds, so
+            // it records that beside the extraction (see
+            // [`streamed_layers_present`]); a store-backed entry needs the same
+            // record for collection, which only frees layers no entry names.
+            if layer_store.is_some() || streamed_layers.is_some() {
+                let mut ids: Vec<&str> = recorded.iter().map(String::as_str).collect();
+                ids.sort_unstable();
+                fs::write(layers_dir.join(STREAMED_LAYERS_FILE), ids.join("\n"))?;
+            }
+        }
+        // The entry's record now protects these layers, so any hold a pull
+        // placed on them for this extraction has done its job.
+        if let Some(shared_root) = layer_store.and_then(Path::parent) {
+            release_layer_holds(shared_root, &installed);
         }
     }
 
@@ -4564,7 +5875,7 @@ pub fn acquire_daemon_lease(
             fs::create_dir_all(&leases_dir)?;
             let lock = lock_leases(cache_dir)?;
             gc_stale_leases(&leases_dir);
-            ensure_cs_volume_mounted(cache_dir, debug)?;
+            ensure_cs_volume_mounted(cache_dir, 0, debug)?;
             fs::write(leases_dir.join("daemon"), format!("{}", daemon_pid))?;
             drop(lock);
             return Ok(cache_dir.join(CS_MOUNT_DIR));
@@ -4747,19 +6058,42 @@ pub fn force_detach_layers_volume(cache_dir: &Path) {
     }
 }
 
+/// Where an extraction keeps the layer trees the host unpacked for it:
+/// `cache_dir/layers` on Linux and Windows, and the mount point of the
+/// case-sensitive APFS volume on macOS (`cache_dir/layers-cs`, mounted on
+/// demand — an already-mounted volume is returned as it is).
+///
+/// Public because a caller that has to find those trees — a test, a second
+/// front end, a repair — must not re-derive the platform rule. Resolving it on
+/// macOS mounts the volume, which is why callers that only *stage* layers for
+/// the guest pass 0 bytes and never call this (see
+/// [`has_host_unpacked_layers`]).
+pub fn host_layer_store(cache_dir: &Path, debug: bool) -> std::io::Result<PathBuf> {
+    extraction_layers_dir(cache_dir, 0, debug)
+}
+
 /// Mount the case-sensitive volume (if needed) and return the extraction
 /// directory. Called during initial extraction (already under flock — no
 /// lease needed). For runtime use, call `acquire_layers_lease()` instead.
-fn extraction_layers_dir(cache_dir: &Path, debug: bool) -> std::io::Result<PathBuf> {
+///
+/// `layer_bytes` is a lower bound on the layer trees this extraction will write
+/// when the staged tars that [`ensure_cs_volume_mounted`] sizes the volume from
+/// do not exist yet (a streaming extraction never writes them, and a caller
+/// arriving before them passes 0).
+fn extraction_layers_dir(
+    cache_dir: &Path,
+    layer_bytes: u64,
+    debug: bool,
+) -> std::io::Result<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        ensure_cs_volume_mounted(cache_dir, debug)?;
+        ensure_cs_volume_mounted(cache_dir, layer_bytes, debug)?;
         Ok(cache_dir.join(CS_MOUNT_DIR))
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = debug;
+        let _ = (layer_bytes, debug);
         Ok(cache_dir.join("layers"))
     }
 }
@@ -4821,8 +6155,10 @@ fn acquire_lease(cache_dir: &Path, debug: bool) -> std::io::Result<PathBuf> {
     // Reclaim volumes stranded by runs that were killed before releasing.
     reap_orphan_volumes(cache_dir);
 
-    // Ensure the sparse image exists and is mounted.
-    ensure_cs_volume_mounted(cache_dir, debug)?;
+    // Ensure the sparse image exists and is mounted. An image still missing
+    // here is sized from the staged layer tars beside it, which this path only
+    // reaches when they exist.
+    ensure_cs_volume_mounted(cache_dir, 0, debug)?;
 
     // Write a lease file for this process.
     let lease_path = leases_dir.join(format!("{}", std::process::id()));
@@ -5050,8 +6386,17 @@ fn lock_leases(cache_dir: &Path) -> std::io::Result<File> {
 }
 
 /// Create the sparse image if needed and mount it.
+///
+/// `layer_bytes` is the size of the layer trees an extraction is about to write
+/// when there are no staged tars to measure yet: a streaming extraction writes
+/// none at all, and a tar-based estimate of zero would create a 1 GiB volume
+/// for a 53 GB image and fail part-way through the first layer.
 #[cfg(target_os = "macos")]
-fn ensure_cs_volume_mounted(cache_dir: &Path, debug: bool) -> std::io::Result<()> {
+fn ensure_cs_volume_mounted(
+    cache_dir: &Path,
+    layer_bytes: u64,
+    debug: bool,
+) -> std::io::Result<()> {
     let image_path = cache_dir.join(CS_IMAGE_NAME);
     let mount_point = cache_dir.join(CS_MOUNT_DIR);
 
@@ -5063,7 +6408,7 @@ fn ensure_cs_volume_mounted(cache_dir: &Path, debug: bool) -> std::io::Result<()
     // Create the sparse image if it doesn't exist.
     if !image_path.exists() {
         let layers_dir = cache_dir.join("layers");
-        let total_tar_bytes = sum_tar_sizes(&layers_dir);
+        let total_tar_bytes = sum_tar_sizes(&layers_dir).max(layer_bytes);
         // 2.5x headroom + 512 MiB for fs metadata, minimum 1 GiB.
         // Sparse format: only written bytes use real disk.
         let size_bytes = std::cmp::max(
@@ -5075,7 +6420,7 @@ fn ensure_cs_volume_mounted(cache_dir: &Path, debug: bool) -> std::io::Result<()
 
         if debug {
             eprintln!(
-                "debug: creating case-sensitive APFS sparse image ({}g from {} bytes of tars)...",
+                "debug: creating case-sensitive APFS sparse image ({}g from {} bytes of layers)...",
                 size_gib, total_tar_bytes
             );
         }
@@ -5770,6 +7115,182 @@ mod tests {
         assert!(msg.contains("not enough free disk"), "got: {msg}");
         assert!(msg.contains("the packed image layers"), "got: {msg}");
         assert!(msg.contains("is free on"), "got: {msg}");
+    }
+
+    /// Only a `layers/<hex>.tar` member is a layer a streamed extraction may
+    /// install: the name has to be one `digest_to_filename` wrote, and every
+    /// other asset keeps the ordinary file path.
+    #[test]
+    fn only_layer_member_names_are_streamed() {
+        use std::path::Path as TestPath;
+        let hex = "a".repeat(64);
+        for (path, expected) in [
+            (format!("layers/{hex}.tar"), Some(hex.as_str())),
+            // Short ids are legal (`digest_to_filename` only requires 12).
+            ("layers/abcdef012345.tar".to_string(), Some("abcdef012345")),
+            // Upper case hex is still a digest.
+            ("layers/ABCDEF012345.tar".to_string(), Some("ABCDEF012345")),
+            (
+                "layers/./abcdef012345.tar".to_string(),
+                Some("abcdef012345"),
+            ),
+            // Not a layer: another directory, another extension, too short,
+            // not hex, nested, or escaping.
+            ("storage/abcdef012345.tar".to_string(), None),
+            ("layers/abcdef012345.raw".to_string(), None),
+            ("layers/abcdef01234.tar".to_string(), None),
+            (format!("layers/{}z.tar", "a".repeat(63)), None),
+            (format!("layers/{hex}.tar/nested.tar"), None),
+            ("../layers/abcdef012345.tar".to_string(), None),
+            ("/layers/abcdef012345.tar".to_string(), None),
+            ("layers/".to_string(), None),
+        ] {
+            assert_eq!(
+                super::layer_member_id(TestPath::new(&path)).as_deref(),
+                expected,
+                "for {path}"
+            );
+        }
+    }
+
+    /// A store id becomes a path component, so only a real digest may through:
+    /// anything else — a traversal, a separator, an absolute path — is refused
+    /// rather than joined onto the store root.
+    #[test]
+    fn a_layer_store_id_is_only_a_digest() {
+        for good in [
+            "a".repeat(64),
+            "abcdef012345".to_string(),
+            "sha256:abcdef012345".to_string(),
+            format!("sha256:{}", "B".repeat(64)),
+        ] {
+            assert!(super::layer_store_id(&good).is_ok(), "{good}");
+        }
+        assert_eq!(
+            super::layer_store_id("sha256:ABCDEF012345").unwrap(),
+            "abcdef012345"
+        );
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../etc/passwd",
+            "/etc/passwd",
+            "layers/abcdef012345",
+            "abcdef01234",
+            "zzzzzzzzzzzz",
+        ] {
+            assert!(
+                super::layer_store_id(bad).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    /// A linked tree shares the files' inodes — that is the whole point — and
+    /// recreates what a directory entry cannot share: the directories
+    /// themselves (with their mode and the ownership xattrs the guest reads),
+    /// and symlinks.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn linking_a_layer_tree_shares_files_and_recreates_the_rest() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        if !user_xattrs_supported(root.path()) {
+            eprintln!("SKIP: this filesystem does not store user xattrs");
+            return;
+        }
+        let from = root.path().join("store/abcdef012345");
+        fs::create_dir_all(from.join("usr/lib")).unwrap();
+        fs::write(from.join("usr/lib/lib.so"), b"payload").unwrap();
+        std::os::unix::fs::symlink("lib.so", from.join("usr/lib/alias.so")).unwrap();
+        // A read-only directory and a recorded owner: both have to survive the
+        // re-creation, and the read-only one must not stop the walk.
+        super::set_user_xattr(
+            &from.join("usr/lib"),
+            super::OVERRIDE_STAT_XATTR,
+            b"1000:1000:0755",
+        )
+        .unwrap();
+        fs::set_permissions(from.join("usr/lib"), fs::Permissions::from_mode(0o555)).unwrap();
+
+        let to = root.path().join("entry/layers/abcdef012345");
+        super::link_layer_tree(&from, &to, false).unwrap();
+
+        let stored = fs::metadata(from.join("usr/lib/lib.so")).unwrap();
+        let linked = fs::metadata(to.join("usr/lib/lib.so")).unwrap();
+        assert_eq!(linked.ino(), stored.ino(), "the file must be shared");
+        assert_eq!(linked.nlink(), 2, "one inode, two directory entries");
+        assert_eq!(fs::read(to.join("usr/lib/lib.so")).unwrap(), b"payload");
+        assert_eq!(
+            fs::read_link(to.join("usr/lib/alias.so")).unwrap(),
+            Path::new("lib.so")
+        );
+        assert_eq!(
+            fs::metadata(to.join("usr/lib"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o555,
+            "the directory's archived mode must be re-applied"
+        );
+        assert_eq!(
+            read_user_xattr(&to.join("usr/lib"), super::OVERRIDE_STAT_XATTR).as_deref(),
+            Some("1000:1000:0755"),
+            "the recorded owner must be copied onto the recreated directory"
+        );
+
+        // A second fan-out of the same layer adds nothing (the entry already
+        // holds every name) and must not fail on the links that exist.
+        super::link_layer_tree(&from, &to, false).unwrap();
+        assert_eq!(fs::metadata(to.join("usr/lib/lib.so")).unwrap().nlink(), 2);
+    }
+
+    /// A streaming extraction never writes the tars, so the case-sensitive
+    /// volume it installs into has to be sized from the manifest: sizing it
+    /// from the (absent) tars created a 1 GiB volume for a 53 GB image, which
+    /// failed part-way through the first layer.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_case_sensitive_volume_is_sized_for_the_streamed_layers() {
+        if std::process::Command::new("hdiutil")
+            .arg("-help")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP: hdiutil is unavailable");
+            return;
+        }
+        let layer_bytes = 60 * 1024 * 1024 * 1024u64;
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        super::ensure_cs_volume_mounted(&cache_dir, layer_bytes, false).unwrap();
+        let mount = cache_dir.join(super::CS_MOUNT_DIR);
+        assert!(
+            super::is_mount_point(&mount),
+            "the volume must be mounted at {}",
+            mount.display()
+        );
+        let capacity = super::available_bytes(&mount).unwrap();
+        assert!(
+            capacity >= layer_bytes,
+            "the volume ({capacity} bytes) must hold the streamed layers ({layer_bytes} bytes)"
+        );
+        super::force_detach_layers_volume(&cache_dir);
+
+        // Without a hint (a staged extraction, or one arriving before its
+        // tars) the same call still sizes from the tars it finds.
+        let bare_dir = dir.path().join("bare");
+        std::fs::create_dir_all(&bare_dir).unwrap();
+        super::ensure_cs_volume_mounted(&bare_dir, 0, false).unwrap();
+        let bare_capacity = super::available_bytes(&bare_dir.join(super::CS_MOUNT_DIR)).unwrap();
+        assert!(
+            bare_capacity < layer_bytes,
+            "without a hint the volume stays minimal, got {bare_capacity} bytes"
+        );
+        super::force_detach_layers_volume(&bare_dir);
     }
 
     /// Fault injection against a real full filesystem: the case that produced
@@ -6926,6 +8447,7 @@ mod tests {
             max_entries: 1_000,
             max_total_bytes: 1 << 30,
             sparse_threshold: 512, // 4096-byte payload takes the sparse path
+            stream_layers: None,
         };
         let result = safe_unpack_with_limits(&mut archive, &dest, &limits);
 
@@ -7022,6 +8544,7 @@ mod tests {
             max_entries: 3,
             max_total_bytes: 1 << 30,
             sparse_threshold: SPARSE_WRITE_THRESHOLD,
+            stream_layers: None,
         };
         let err = safe_unpack_with_limits(&mut archive, &dest, &limits).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
@@ -7045,6 +8568,7 @@ mod tests {
             max_entries: 1_000,
             max_total_bytes: 1024, // 4096-byte entry exceeds this
             sparse_threshold: SPARSE_WRITE_THRESHOLD,
+            stream_layers: None,
         };
         let err = safe_unpack_with_limits(&mut archive, &dest, &limits).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
@@ -7083,6 +8607,7 @@ mod tests {
             max_entries: 1_000,
             max_total_bytes: 1024 * 1024, // far below the 64 MiB declared size
             sparse_threshold: SPARSE_WRITE_THRESHOLD,
+            stream_layers: None,
         };
         safe_unpack_with_limits(&mut archive, &dest, &limits).unwrap();
         let out = dest.join("checkpoint/disks/storage/1");
@@ -9115,10 +10640,10 @@ mod orphan_reap_tests {
         let exited_pid = child.id();
         child.wait().unwrap();
         for path in [&machine, &standalone] {
-            ensure_cs_volume_mounted(path, false).unwrap();
+            ensure_cs_volume_mounted(path, 0, false).unwrap();
             fs::write(path.join(LEASES_DIR).join(exited_pid.to_string()), "").unwrap();
         }
-        ensure_cs_volume_mounted(&peer, false).unwrap();
+        ensure_cs_volume_mounted(&peer, 0, false).unwrap();
         let lease = acquire_layers_lease(&peer, false).unwrap();
         assert!(is_mount_point(&lease.path));
         assert!(is_mount_point(&machine.join(CS_MOUNT_DIR)));
@@ -9146,7 +10671,7 @@ mod orphan_reap_tests {
             }
         }
         let _cleanup = Cleanup(source.clone(), child.clone());
-        ensure_cs_volume_mounted(&source, false).unwrap();
+        ensure_cs_volume_mounted(&source, 0, false).unwrap();
         fs::write(source.join(CS_MOUNT_DIR).join("marker"), "source").unwrap();
         std::os::unix::fs::symlink(&source, &child).unwrap();
         // A broken, unrelated machine must neither release this live source
