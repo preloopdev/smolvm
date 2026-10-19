@@ -788,6 +788,11 @@ struct SafeUnpackLimits {
     max_total_bytes: u64,
     /// Regular files with a header size >= this use the sparse-write path.
     sparse_threshold: u64,
+    /// Unpack `layers/<digest>.tar` members straight into `layers/<digest>/`
+    /// while the assets blob streams, instead of writing each tar and
+    /// unpacking it afterwards. Only for extractions this host unpacks
+    /// itself; see [`stream_layer_member`].
+    stream_layers: bool,
 }
 
 impl SafeUnpackLimits {
@@ -796,8 +801,211 @@ impl SafeUnpackLimits {
             max_entries: max_extract_entries(),
             max_total_bytes: max_extract_total_bytes(),
             sparse_threshold: SPARSE_WRITE_THRESHOLD,
+            stream_layers: false,
         }
     }
+
+    /// [`Self`] with the layer tars unpacked as the assets stream past.
+    fn streaming_layers(mut self) -> Self {
+        self.stream_layers = true;
+        self
+    }
+
+    /// [`Self`] with streaming off, for the nested unpack of a layer member.
+    fn without_streaming(mut self) -> Self {
+        self.stream_layers = false;
+        self
+    }
+}
+
+/// Whether an extraction's `layers/` cache holds host-unpacked layer dirs.
+///
+/// With streaming enabled the layer tars are never written, so
+/// [`has_layer_tars`] cannot see the result and the layer decision would flip
+/// to "stage for the guest" on a fresh extraction that already unpacked them.
+fn has_host_unpacked_layers(cache_dir: &Path) -> bool {
+    let layers_dir = cache_dir.join("layers");
+    fs::read_dir(&layers_dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok()).any(|e| {
+                let name = e.file_name();
+                let staging = name.to_str().is_some_and(is_partial_dir_name);
+                e.path().is_dir() && !staging
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// The digest a pack asset path names, when it is a `layers/<hex>.tar` member.
+///
+/// `digest_to_filename` is what wrote the name, so only pure hex (at least the
+/// same 12 characters) can be one: anything else is not a layer and keeps the
+/// ordinary file path in [`safe_unpack_skipping`].
+fn layer_member_id(path: &Path) -> Option<String> {
+    let mut components = path.components().filter_map(|component| match component {
+        std::path::Component::CurDir => None,
+        other => Some(other),
+    });
+    let dir = components.next()?;
+    let file = components.next()?;
+    if components.next().is_some() {
+        return None;
+    }
+    if dir.as_os_str() != "layers" {
+        return None;
+    }
+    let file = Path::new(file.as_os_str());
+    if file.extension().and_then(|e| e.to_str()) != Some("tar") {
+        return None;
+    }
+    let stem = file.file_stem().and_then(|s| s.to_str())?;
+    (stem.len() >= 12 && stem.bytes().all(|b| b.is_ascii_hexdigit())).then(|| stem.to_owned())
+}
+
+/// Hash every byte read through `inner`, so a streamed layer tar's digest is
+/// verified over the exact bytes the pack carried.
+struct HashingReader<R: Read> {
+    inner: R,
+    hasher: Context,
+    bytes: u64,
+}
+
+impl<R: Read> HashingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: Context::new(&SHA256),
+            bytes: 0,
+        }
+    }
+
+    /// The digest of everything read so far, lowercase hex, and the byte count.
+    fn finish(self) -> (String, u64) {
+        let mut digest = String::with_capacity(64);
+        for byte in self.hasher.finish().as_ref() {
+            write!(&mut digest, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        (digest, self.bytes)
+    }
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.hasher.update(&buf[..read]);
+        self.bytes += read as u64;
+        Ok(read)
+    }
+}
+
+/// Whether a streamed layer that fails digest verification is still kept.
+/// Off by default: an unverified layer is a corrupt image, not a slow one.
+fn stream_layers_skip_verification() -> bool {
+    std::env::var_os("SMOLVM_STREAM_LAYERS_NO_VERIFY").is_some()
+}
+
+/// Unpack one `layers/<hex>.tar` member straight into `layers/<id>/`.
+///
+/// The member's own bytes are hashed as they are consumed, and the digest its
+/// name claims is checked before the tree is installed, so a streamed layer is
+/// verified exactly like the staged tar was: the `.partial` directory is what
+/// the unpack writes, and `layers/<id>/` exists only once the archive ended and
+/// the digest matched. Nothing is written to a temporary tar, so a 53 GB layer
+/// costs one pass instead of a write plus a read of the same bytes.
+///
+/// `entry` must be the member's data reader: the tar crate bounds it to the
+/// member's declared size, and any bytes the nested archive does not consume
+/// (padding after a truncated nested archive) are drained here so the outer
+/// stream stays aligned.
+fn stream_layer_member<R: Read>(
+    entry: &mut R,
+    dest: &Path,
+    id: &str,
+    limits: &SafeUnpackLimits,
+    debug: bool,
+) -> std::io::Result<()> {
+    let layers_dir = dest.join("layers");
+    fs::create_dir_all(&layers_dir)?;
+    let final_dir = layers_dir.join(id);
+    let staging = partial_dir_for(&final_dir)?;
+
+    if final_dir.is_dir() {
+        // A resumed extraction already installed this layer. Drain and verify
+        // the member so the outer stream still lines up and the pack is still
+        // checked, without rebuilding a tree the guest may be reading.
+        let mut hashing = HashingReader::new(entry);
+        let drained = std::io::copy(&mut hashing, &mut std::io::sink());
+        let (digest, _bytes) = hashing.finish();
+        drained?;
+        return check_layer_digest(id, &digest, debug);
+    }
+
+    if debug {
+        eprintln!("debug: streaming layer {id} into {}", staging.display());
+    }
+    if staging.exists() {
+        fs::remove_dir_all(&staging)?;
+    }
+    fs::create_dir_all(&staging)?;
+
+    let nested_limits = limits.without_streaming();
+    let mut hashing = HashingReader::new(entry);
+    let unpacked = {
+        // Erase the reader's type: `safe_unpack_with_policy` is generic, and a
+        // nested call over `HashingReader<Entry<R>>` would ask the compiler to
+        // monomorphize this function infinitely.
+        let reader: Box<dyn Read + '_> = Box::new(&mut hashing);
+        let mut archive = tar::Archive::new(reader);
+        // The archived owner and mode are the layer's own, and this host is
+        // the one unpacking it (streaming is only enabled then), so the
+        // override xattr describes them exactly as the staged unpack did.
+        safe_unpack_with_policy(&mut archive, &staging, &nested_limits, false, true)
+            .map(|_report| ())
+    };
+    // Whatever the nested archive did not read belongs to this member too, and
+    // has to be consumed and hashed before the outer archive can continue.
+    let drained = std::io::copy(&mut hashing, &mut std::io::sink());
+    let (digest, bytes) = hashing.finish();
+
+    let failure = match (unpacked, drained) {
+        (Err(error), _) => Some(error),
+        (Ok(()), Err(error)) => Some(error),
+        (Ok(()), Ok(_)) => check_layer_digest(id, &digest, debug).err(),
+    };
+    if let Some(error) = failure {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(std::io::Error::new(
+            error.kind(),
+            format!(
+                "streaming layer {id} failed, nothing was kept ({bytes} bytes read): {error}"
+            ),
+        ));
+    }
+    fs::rename(&staging, &final_dir)?;
+    if debug {
+        eprintln!(
+            "debug: layer {id} streamed into place ({} bytes)",
+            bytes
+        );
+    }
+    Ok(())
+}
+
+/// Fail when a streamed member's digest is not the one its name claims.
+fn check_layer_digest(id: &str, digest: &str, debug: bool) -> std::io::Result<()> {
+    if digest.eq_ignore_ascii_case(id) {
+        return Ok(());
+    }
+    if stream_layers_skip_verification() {
+        if debug {
+            eprintln!("debug: layer {id} digest {digest} not verified (SMOLVM_STREAM_LAYERS_NO_VERIFY)");
+        }
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("layer digest mismatch: stream is {digest}, name claims {id}"),
+    ))
 }
 
 /// What an unpack actually did, so a caller can judge completeness instead of
@@ -1262,6 +1470,18 @@ fn safe_unpack_skipping<R: Read>(
                     entry_path.display()
                 ),
             ));
+        }
+
+        // A pack's layer members are unpacked as they stream past when this
+        // host is the one that unpacks them: the tar is never written, and the
+        // tree lands in `layers/<id>.partial` -> `layers/<id>/` with its digest
+        // verified over the bytes consumed. See [`stream_layer_member`].
+        if limits.stream_layers && !required_here && entry_type == tar::EntryType::Regular {
+            if let Some(id) = layer_member_id(&entry_path) {
+                stream_layer_member(&mut entry, dest, &id, limits, false)?;
+                report.entries += 1;
+                continue;
+            }
         }
 
         // Ensure parent directories are writable before extracting any entry.
@@ -3900,15 +4120,38 @@ fn extract_sidecar_inner(
 
     let mut sidecar_file = ExtractDigestReader::open(sidecar_path, digest_out.is_some())?;
     let manifest = crate::packer::read_manifest_from_sidecar(sidecar_path).ok();
+    // Whether this host should unpack the pack's layer members while they
+    // stream past, instead of staging the tars and unpacking them afterwards:
+    // the same conditions that make host extraction the right call (a libkrun
+    // that serves the override xattr, an agent that mounts with `userxattr`, a
+    // cache filesystem that stores user xattrs) plus layers to unpack at all.
+    let stream_layers = host_layers_via_override_stat(
+        agent_version.or_else(|| manifest.as_ref().map(|m| m.smolvm_version.as_str())),
+        cache_dir,
+    ) && manifest
+        .as_ref()
+        .is_some_and(|manifest| !manifest.assets.layers.is_empty());
+    if debug && stream_layers {
+        eprintln!("debug: streaming the pack's layer members into place");
+    }
     {
         let limited_reader = (&mut sidecar_file).take(footer.assets_size);
         let decoder = zstd::stream::Decoder::new(limited_reader)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let mut archive = tar::Archive::new(decoder);
+        // The layer decision has to be made before the unpack when streaming
+        // is possible: the tars are never written then, so a decision read off
+        // the extracted tree afterwards (`has_layer_tars`) would say "stage for
+        // the guest" about a tree this host already unpacked.
+        let limits = if stream_layers {
+            SafeUnpackLimits::from_env().streaming_layers()
+        } else {
+            SafeUnpackLimits::from_env()
+        };
         safe_unpack_with_policy(
             &mut archive,
             cache_dir,
-            &SafeUnpackLimits::from_env(),
+            &limits,
             manifest
                 .as_ref()
                 .is_some_and(|manifest| manifest.checkpoint.is_some()),
@@ -3940,8 +4183,8 @@ fn extract_sidecar_inner(
     // presented; that is the packed agent unless the caller boots its own.
     let pack_version =
         agent_version.or_else(|| manifest.as_ref().map(|m| m.smolvm_version.as_str()));
-    let host_layers =
-        has_layer_tars(cache_dir) && host_layers_via_override_stat(pack_version, cache_dir);
+    let host_layers = (has_layer_tars(cache_dir) || has_host_unpacked_layers(cache_dir))
+        && host_layers_via_override_stat(pack_version, cache_dir);
     let guest_unpacks_layers =
         !host_layers && pack_version.is_some_and(packed_agent_unpacks_staged_layers);
     if !host_layers
@@ -6877,6 +7120,7 @@ mod tests {
             max_entries: 1_000,
             max_total_bytes: 1 << 30,
             sparse_threshold: 512, // 4096-byte payload takes the sparse path
+            stream_layers: false,
         };
         let result = safe_unpack_with_limits(&mut archive, &dest, &limits);
 
@@ -6973,6 +7217,7 @@ mod tests {
             max_entries: 3,
             max_total_bytes: 1 << 30,
             sparse_threshold: SPARSE_WRITE_THRESHOLD,
+            stream_layers: false,
         };
         let err = safe_unpack_with_limits(&mut archive, &dest, &limits).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
@@ -6996,6 +7241,7 @@ mod tests {
             max_entries: 1_000,
             max_total_bytes: 1024, // 4096-byte entry exceeds this
             sparse_threshold: SPARSE_WRITE_THRESHOLD,
+            stream_layers: false,
         };
         let err = safe_unpack_with_limits(&mut archive, &dest, &limits).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
@@ -7034,6 +7280,7 @@ mod tests {
             max_entries: 1_000,
             max_total_bytes: 1024 * 1024, // far below the 64 MiB declared size
             sparse_threshold: SPARSE_WRITE_THRESHOLD,
+            stream_layers: false,
         };
         safe_unpack_with_limits(&mut archive, &dest, &limits).unwrap();
         let out = dest.join("checkpoint/disks/storage/1");
