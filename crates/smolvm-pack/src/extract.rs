@@ -4121,6 +4121,55 @@ fn materialize_tar_dir(
     if final_dir.is_dir() {
         return Ok(None);
     }
+    let staged = materialize_archive(
+        || Ok(File::open(tar)?),
+        &format!("{}", tar.display()),
+        final_dir,
+        debug,
+        owner_xattr,
+    )?;
+    Ok(staged)
+}
+
+/// Unpack one *already decompressed* layer tar into `final_dir`, taking the tar
+/// bytes from a stream instead of a file on disk.
+///
+/// A layer that arrives as a compressed blob (a split pack's registry blob, or
+/// a store entry installed from one) never needs the whole tar written out to
+/// be unpacked, so this is the entry point for "install this layer now": the
+/// caller hands over the decompressing reader and gets the same `.partial` →
+/// rename discipline [`materialize_tar_dir`] gives a staged tar.
+///
+/// Returns the number of entries the platform could not represent, if any
+/// (`None` when the destination already held the layer).
+pub fn materialize_layer_from_reader<R: Read>(
+    reader: R,
+    final_dir: &Path,
+    owner_xattr: bool,
+) -> std::io::Result<Option<u64>> {
+    let staged = materialize_archive(
+        || Ok(reader),
+        &format!("stream for {}", final_dir.display()),
+        final_dir,
+        false,
+        owner_xattr,
+    )?;
+    Ok(staged.map(|report| report.skipped))
+}
+
+/// The shared body of [`materialize_tar_dir`] and
+/// [`materialize_layer_from_reader`]: stage into a `.partial` sibling, unpack
+/// the archive there, and rename into place only on success.
+fn materialize_archive<R: Read>(
+    open: impl FnOnce() -> std::io::Result<R>,
+    source: &str,
+    final_dir: &Path,
+    debug: bool,
+    owner_xattr: bool,
+) -> std::io::Result<Option<UnpackReport>> {
+    if final_dir.is_dir() {
+        return Ok(None);
+    }
     let staging = partial_dir_for(final_dir)?;
     if staging.exists() {
         if debug {
@@ -4133,8 +4182,8 @@ fn materialize_tar_dir(
     }
     fs::create_dir_all(&staging)?;
     let unpacked = (|| {
-        let tar_file = File::open(tar)?;
-        let mut archive = tar::Archive::new(tar_file);
+        let reader = open()?;
+        let mut archive = tar::Archive::new(reader);
         safe_unpack_with_policy(
             &mut archive,
             &staging,
@@ -4151,7 +4200,7 @@ fn materialize_tar_dir(
                 e.kind(),
                 format!(
                     "extracting {} into {} failed, nothing was kept: {}",
-                    tar.display(),
+                    source,
                     final_dir.display(),
                     e
                 ),

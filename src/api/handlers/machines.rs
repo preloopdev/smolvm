@@ -7416,8 +7416,16 @@ pub(crate) async fn pull_smolmachine(
         "pulling .smolmachine from registry"
     );
 
-    let result = smolvm_registry::pull(&client, &repo, tag_or_digest, None, &cache, blob_peers)
-        .await
+    let result = smolvm_registry::pull(
+        &client,
+        &repo,
+        tag_or_digest,
+        None,
+        &cache,
+        blob_peers,
+        &crate::cli::pack::layer_store(None),
+    )
+    .await
         .map_err(|e| match &e {
             // A missing image/manifest is the caller's mistake (typo'd ref, or a
             // bare name that resolved to an empty repo) — surface it as 404, not a

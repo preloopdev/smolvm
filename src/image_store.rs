@@ -552,6 +552,7 @@ mod tests {
             media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into(),
             digest: format!("sha256:{}", hex::encode(Sha256::digest(bytes))),
             size: bytes.len() as u64,
+            annotations: None,
         }
     }
 

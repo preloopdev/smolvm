@@ -5,6 +5,7 @@
 
 pub mod cache;
 pub mod client;
+pub mod layout;
 pub mod peer;
 pub mod pull;
 pub mod push;
@@ -22,6 +23,23 @@ pub const CONFIG_MEDIA_TYPE: &str = "application/vnd.smolmachines.machine.config
 
 /// OCI media type for the smolmachine sidecar layer blob.
 pub const LAYER_MEDIA_TYPE: &str = "application/vnd.smolmachines.smolmachine.v1";
+
+/// `artifactType` of a split smolmachine manifest: a base pack plus one blob
+/// per layer, so a consumer fetches only the layers it does not already hold.
+pub const SPLIT_ARTIFACT_TYPE: &str = "application/vnd.smolmachines.smolmachine.v2+split";
+
+/// Media type of a split artifact's base pack blob: a complete `.smolmachine`
+/// whose `assets.layers[]` names every layer and whose assets carry none of
+/// them.
+pub const SPLIT_BASE_MEDIA_TYPE: &str = "application/vnd.smolmachines.smolmachine.base.v1";
+
+/// Media type of one layer blob of a split artifact: the zstd-compressed layer
+/// tar, digest-keyed by its compressed bytes.
+pub const SPLIT_LAYER_MEDIA_TYPE: &str = "application/vnd.smolmachines.layer.v1.tar+zstd";
+
+/// Descriptor annotation carrying a layer blob's **uncompressed** digest (the
+/// OCI `diff_id`), which is the identity a consumer's layer store is keyed by.
+pub const LAYER_DIFF_ID_ANNOTATION: &str = "com.smolmachines.layer.diff_id";
 
 /// OCI manifest media type.
 pub const MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
@@ -52,6 +70,22 @@ pub struct OciDescriptor {
     pub media_type: String,
     pub digest: String,
     pub size: u64,
+    /// Descriptor-level annotations. A split artifact's layer descriptors carry
+    /// [`LAYER_DIFF_ID_ANNOTATION`], the identity the layer is stored under.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub annotations: Option<std::collections::BTreeMap<String, String>>,
+}
+
+impl OciDescriptor {
+    /// One descriptor with no annotations.
+    pub fn new(media_type: impl Into<String>, digest: impl Into<String>, size: u64) -> Self {
+        Self {
+            media_type: media_type.into(),
+            digest: digest.into(),
+            size,
+            annotations: None,
+        }
+    }
 }
 
 /// OCI image index media type — a multi-platform "fan-out" manifest that points
@@ -365,6 +399,7 @@ mod is_local_tests {
                 media_type: CONFIG_MEDIA_TYPE.to_string(),
                 digest: "sha256:abc".to_string(),
                 size: 1,
+                annotations: None,
             },
             layers: vec![],
             annotations: Some(std::collections::BTreeMap::from([(
