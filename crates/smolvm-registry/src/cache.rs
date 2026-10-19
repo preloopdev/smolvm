@@ -154,6 +154,22 @@ impl BlobCache {
         Ok(Self { root, max_size })
     }
 
+    /// Drop a blob and its recency marker from the cache.
+    ///
+    /// A split pull installs each layer into the digest-keyed layer store and
+    /// then has no use for the compressed copy: keeping it would be a second
+    /// full copy of every layer on disk, and a multi-GB layer would sweep the
+    /// rest of the cache out through LRU on the way in.
+    pub fn remove(&self, digest: &str) {
+        let path = self.blob_path(digest);
+        if let Err(error) = fs::remove_file(&path) {
+            if error.kind() != io::ErrorKind::NotFound {
+                tracing::warn!(%error, digest, "could not drop a cached blob");
+            }
+        }
+        let _ = fs::remove_file(lru_marker_path(&path));
+    }
+
     /// Look up a blob by digest. Returns the path if it exists.
     pub fn get(&self, digest: &str) -> Option<PathBuf> {
         let path = self.blob_path(digest);

@@ -1,16 +1,35 @@
 //! Pull a `.smolmachine` artifact from an OCI registry.
 //!
-//! The pull flow:
+//! Two artifact shapes arrive here, and both land the same way: a
+//! `.smolmachine` file the caller can boot.
+//!
+//! **Single blob** (the historical layout)
 //! 1. Fetch the OCI manifest by tag or digest
 //! 2. Parse the manifest to find the layer blob digest
 //! 3. Check the local cache for the blob
 //! 4. If not cached, try any brokered P2P peers, then stream from the registry,
 //!    computing the digest while writing
 //! 5. Verify the digest and adopt into cache
+//!
+//! **Split** ([`crate::SPLIT_ARTIFACT_TYPE`]): a base pack plus one blob per
+//! layer, each blob carrying the layer's uncompressed digest as an annotation.
+//! 1. Fetch and verify the base pack blob (steps 3-5 above), which names every
+//!    layer, in stacking order, in its own manifest
+//! 2. For each layer: skip it when the layer store already holds its tree —
+//!    that is what makes a second golden, or a second host, fetch only what
+//!    changed
+//! 3. Otherwise fetch that one blob, resuming a partial download where the last
+//!    attempt stopped, verify it against the descriptor digest, and install it
+//!    into the store (streaming the decompressed tar straight to disk, staging
+//!    in a `.partial` directory and renaming into place only when complete)
+//! 4. A blob that fails its digest, or a manifest this build cannot read,
+//!    fails the pull for that artifact — the layers already installed stay, and
+//!    the next attempt resumes rather than starting over
 
 use crate::cache::BlobCache;
 use crate::client::RegistryClient;
-use crate::{OciManifest, RegistryError, Result, LAYER_MEDIA_TYPE};
+use crate::layout::{self, ArtifactLayout, SplitLayerDescriptor};
+use crate::{OciManifest, RegistryError, Result};
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -28,6 +47,55 @@ pub struct PullResult {
     pub size: u64,
     /// Whether the blob was served from local cache.
     pub cached: bool,
+    /// Layers this pull installed into the layer store. Zero for a single-blob
+    /// artifact, which arrives as one layer.
+    pub layers_fetched: usize,
+    /// Layers the store already held, which this pull did not fetch.
+    pub layers_skipped: usize,
+    /// Bytes of layer blobs this pull transferred.
+    pub layer_bytes: u64,
+}
+
+impl PullResult {
+    /// A result for an artifact that has no layers of its own to install.
+    fn of_pack_blob(path: PathBuf, digest: String, size: u64, cached: bool) -> Self {
+        Self {
+            path,
+            digest,
+            size,
+            cached,
+            layers_fetched: 0,
+            layers_skipped: 0,
+            layer_bytes: 0,
+        }
+    }
+}
+
+/// Where a split pull installs the layers a base pack names.
+///
+/// The store is keyed by the layer's own content, so installing the same layer
+/// twice — from two goldens, two registries, or two hosts sharing one cache —
+/// costs one extraction in total. The path is the shared-root parent; the
+/// runtime's `smolvm_pack::extract` module owns the platform-specific
+/// `layers/` directory and installation protocol.
+#[derive(Debug, Clone)]
+pub struct LayerStore {
+    /// Shared pack-cache root containing the digest-keyed `layers/` directory.
+    pub shared_root: PathBuf,
+}
+
+impl LayerStore {
+    /// The store under a shared pack cache root.
+    pub fn shared(shared_root: impl AsRef<Path>) -> Self {
+        Self {
+            shared_root: shared_root.as_ref().to_path_buf(),
+        }
+    }
+
+    /// Whether the store already holds `diff_id`'s extracted tree.
+    pub fn layer_present(&self, diff_id: &str) -> bool {
+        smolvm_pack::extract::layer_present(&self.shared_root, diff_id)
+    }
 }
 
 /// Pull a `.smolmachine` artifact from the registry.
@@ -48,6 +116,7 @@ pub async fn pull(
     output: Option<&Path>,
     cache: &BlobCache,
     blob_peers: &[String],
+    layers: &LayerStore,
 ) -> Result<PullResult> {
     pull_with_progress(
         client,
@@ -56,6 +125,7 @@ pub async fn pull(
         output,
         cache,
         blob_peers,
+        layers,
         &mut |_, _| {},
     )
     .await
@@ -63,11 +133,13 @@ pub async fn pull(
 
 /// [`pull`], reporting download progress.
 ///
-/// `on_progress` is called with `(bytes_on_disk, total_bytes)` as the layer
-/// streams in, on every chunk — callers throttle their own rendering. It is not
-/// called for a cache hit or a peer fetch, neither of which downloads from the
-/// registry, and `bytes_on_disk` starts from the resume point when a retry
-/// picks up a partial file rather than restarting at zero.
+/// `on_progress` is called with `(bytes_on_disk, total_bytes)` as the artifact's
+/// blobs stream in, on every chunk — callers throttle their own rendering. It is
+/// not called for a cache hit or a peer fetch, neither of which downloads from
+/// the registry, and `bytes_on_disk` starts from the resume point when a retry
+/// picks up a partial file rather than restarting at zero. A split artifact
+/// reports all of its blobs against one total: the base pack plus every layer
+/// that has to be fetched, so the bar never jumps backwards between layers.
 pub async fn pull_with_progress(
     client: &RegistryClient,
     repo: &str,
@@ -75,6 +147,7 @@ pub async fn pull_with_progress(
     output: Option<&Path>,
     cache: &BlobCache,
     blob_peers: &[String],
+    layers: &LayerStore,
     on_progress: &mut (dyn FnMut(u64, u64) + Send),
 ) -> Result<PullResult> {
     let result = pull_unrecorded(
@@ -84,6 +157,7 @@ pub async fn pull_with_progress(
         output,
         cache,
         blob_peers,
+        layers,
         on_progress,
     )
     .await?;
@@ -117,6 +191,7 @@ async fn pull_unrecorded(
     output: Option<&Path>,
     cache: &BlobCache,
     blob_peers: &[String],
+    layers: &LayerStore,
     on_progress: &mut (dyn FnMut(u64, u64) + Send),
 ) -> Result<PullResult> {
     // 1. Fetch the manifest, resolving a multi-platform index to this machine's
@@ -142,84 +217,295 @@ async fn pull_unrecorded(
 
     let manifest: OciManifest = serde_json::from_slice(&manifest_bytes)?;
 
-    // 2. Find the smolmachine layer.
-    let layer = manifest
-        .layers
-        .iter()
-        .find(|l| l.media_type == LAYER_MEDIA_TYPE)
-        .ok_or_else(|| {
-            RegistryError::InvalidManifest(format!(
-                "no layer with media type {} in manifest",
-                LAYER_MEDIA_TYPE
-            ))
-        })?;
-
-    let digest = &layer.digest;
-    let size = layer.size;
+    // 2. Decide what this artifact is. A shape this build does not know is
+    //    refused here, before any blob is requested, rather than half-consumed.
+    let layout = layout::classify(&manifest)?;
+    let (base, split_layers) = match layout {
+        ArtifactLayout::Single { ref layer } => (layer.clone(), Vec::new()),
+        ArtifactLayout::Split {
+            ref base,
+            ref layers,
+        } => (base.clone(), layers.clone()),
+    };
+    let digest = base.digest.clone();
+    let size = base.size;
 
     // Validate the digest format BEFORE it is used to build any cache filesystem
     // path. `BlobCache::blob_path` only does `digest.replace(':', "_")`, leaving
     // `/` and `..` intact, so an attacker-controlled manifest digest could
     // otherwise create a `.partial` file or touch atime outside the cache dir.
-    crate::client::validate_digest(digest)?;
+    crate::client::validate_digest(&digest)?;
 
     sweep_abandoned_partials_now_and_then(cache);
+
+    // A split artifact splits its progress across the base pack and the layers
+    // that are missing from the store; both are known before the first byte
+    // moves, so the caller's bar has one total from the start.
+    let missing: Vec<SplitLayerDescriptor> = split_layers
+        .iter()
+        .filter(|layer| !layers.layer_present(&layer.diff_id))
+        .cloned()
+        .collect();
+    let grand_total = size + missing.iter().map(|layer| layer.size).sum::<u64>();
 
     // 3. Wait out any other pull of this blob, then check the cache: a pull that
     //    queued behind one fetching the same blob finds it cached here instead of
     //    streaming into the partial file the first one is about to rename away.
-    let _download_lock = lock_blob_download(cache, digest).await?;
-    if let Some(cached_path) = cache.get(digest) {
-        tracing::info!(digest = %digest, "blob found in cache");
-
-        if let Some(out) = output {
-            tokio::fs::copy(&cached_path, out).await?;
-        }
-
-        return Ok(PullResult {
-            path: output.map(PathBuf::from).unwrap_or(cached_path),
-            digest: digest.clone(),
-            size,
-            cached: true,
-        });
-    }
-
-    // 4. Brokered P2P: try sibling nodes before hitting the registry. Inert when
-    //    `blob_peers` is empty — the registry path below is then reached
-    //    byte-for-byte as before. Peers arrive only from the control plane, and
-    //    a node with no serve-TLS identity has no peer client, so this is also a
-    //    no-op there.
-    if !blob_peers.is_empty() {
-        if let Some(peer_client) = crate::peer::peer_client() {
-            if let Some(result) =
-                crate::peer::fetch_blob_from_peers(peer_client, blob_peers, digest, output, cache)
+    //    The lock covers the transfer only: a split pull spends most of its time
+    //    installing layers, and holding a blob's lock for that would make a
+    //    second pull of the same pack wait minutes for no reason.
+    let (pack_path, pack_cached) = {
+        let _download_lock = lock_blob_download(cache, &digest).await?;
+        if let Some(cached_path) = cache.get(&digest) {
+            tracing::info!(digest = %digest, "blob found in cache");
+            (cached_path, true)
+        } else {
+            // 4. Brokered P2P: try sibling nodes before hitting the registry.
+            //    Inert when `blob_peers` is empty — the registry path below is
+            //    then reached byte-for-byte as before. Peers arrive only from the
+            //    control plane, and a node with no serve-TLS identity has no peer
+            //    client, so this is also a no-op there.
+            let from_peer = if blob_peers.is_empty() {
+                None
+            } else {
+                match crate::peer::peer_client() {
+                    Some(peer_client) => crate::peer::fetch_blob_from_peers(
+                        peer_client,
+                        blob_peers,
+                        &digest,
+                        None,
+                        cache,
+                    )
                     .await
-            {
-                return Ok(result);
+                    .map(|result| result.path),
+                    None => None,
+                }
+            };
+            match from_peer {
+                Some(path) => (path, true),
+                // 5. Stream the blob from the registry, resuming and retrying a
+                //    broken transfer, then verify the digest and adopt into cache.
+                None => {
+                    tracing::info!(digest = %digest, size, "downloading blob...");
+                    let mut base_progress =
+                        |done: u64, _base_total: u64| on_progress(done, grand_total);
+                    let path = download_blob(
+                        client,
+                        repo,
+                        &digest,
+                        size,
+                        None,
+                        cache,
+                        RangedPlan::default(),
+                        &mut base_progress,
+                    )
+                    .await?
+                    .path;
+                    (path, false)
+                }
             }
-            tracing::info!(digest = %digest, "no peer served the blob; falling back to registry");
         }
+    };
+
+    // 6. The pulled pack is what the caller asked for; put it where they want it
+    //    before the layers cost minutes, so a partial layer install never hides
+    //    a pack that already arrived intact.
+    let result_path = match output {
+        Some(out) => {
+            tokio::fs::copy(&pack_path, out).await?;
+            PathBuf::from(out)
+        }
+        None => pack_path.clone(),
+    };
+
+    if split_layers.is_empty() {
+        tracing::info!(digest = %digest, size = size, "pull complete");
+        return Ok(PullResult::of_pack_blob(
+            result_path,
+            digest,
+            size,
+            pack_cached,
+        ));
     }
 
-    // 5. Stream blob from the registry to disk, resuming and retrying a broken
-    //    transfer, then verify the digest and adopt into cache.
-    tracing::info!(digest = %digest, size, "downloading blob...");
-
-    let result = download_blob(
+    let installed = install_split_layers(
         client,
         repo,
-        digest,
-        size,
-        output,
         cache,
-        RangedPlan::default(),
+        blob_peers,
+        layers,
+        &pack_path,
+        &split_layers,
+        size,
+        grand_total,
         on_progress,
     )
     .await?;
 
-    tracing::info!(digest = %digest, size = result.size, "pull complete");
+    tracing::info!(
+        digest = %digest,
+        layers = split_layers.len(),
+        fetched = installed.fetched,
+        skipped = installed.skipped,
+        "split pull complete"
+    );
 
-    Ok(result)
+    Ok(PullResult {
+        path: result_path,
+        digest,
+        size,
+        cached: pack_cached,
+        layers_fetched: installed.fetched,
+        layers_skipped: installed.skipped,
+        layer_bytes: installed.bytes,
+    })
+}
+
+/// What installing a split artefact's layers did.
+#[derive(Debug, Default, Clone, Copy)]
+struct InstalledLayers {
+    /// Layers downloaded and installed by this pull.
+    fetched: usize,
+    /// Layers that turned out to be present by the time this pull reached them
+    /// (another pull installed them while this one ran).
+    skipped: usize,
+    /// Bytes of layer blobs transferred.
+    bytes: u64,
+}
+
+/// Install every layer the base pack names, fetching only the ones the store
+/// does not already hold.
+#[allow(clippy::too_many_arguments)]
+async fn install_split_layers(
+    client: &RegistryClient,
+    repo: &str,
+    cache: &BlobCache,
+    blob_peers: &[String],
+    layers: &LayerStore,
+    pack_path: &Path,
+    split_layers: &[SplitLayerDescriptor],
+    base_size: u64,
+    grand_total: u64,
+    on_progress: &mut (dyn FnMut(u64, u64) + Send),
+) -> Result<InstalledLayers> {
+    // The base pack is the authority on what the artifact contains: it names
+    // every layer, in stacking order. A manifest whose layer list disagrees is
+    // not the pack it claims to be, and installing either side would stack an
+    // image nobody published.
+    let pack_manifest = smolvm_pack::read_manifest_from_sidecar(pack_path)?;
+    let named: Vec<String> = pack_manifest
+        .assets
+        .layers
+        .iter()
+        .map(|layer| layer.digest.clone())
+        .collect();
+    let described: Vec<String> = split_layers
+        .iter()
+        .map(|layer| layer.diff_id.clone())
+        .collect();
+    if named != described {
+        return Err(RegistryError::InvalidManifest(format!(
+            "the base pack names layers {named:?} but the manifest describes {described:?}"
+        )));
+    }
+
+    let mut installed = InstalledLayers::default();
+    let mut done = base_size;
+    for layer in split_layers {
+        if layers.layer_present(&layer.diff_id) {
+            installed.skipped += 1;
+            on_progress(done, grand_total.max(done));
+            continue;
+        }
+        // One writer per blob, exactly as the single-blob path does: a second
+        // pull of the same layer waits here instead of streaming the same bytes
+        // into the partial file.
+        let _download_lock = lock_blob_download(cache, &layer.digest).await?;
+        let blob_path = match cache.get(&layer.digest) {
+            Some(path) => path,
+            None => {
+                let from_peer = if blob_peers.is_empty() {
+                    None
+                } else {
+                    match crate::peer::peer_client() {
+                        Some(peer_client) => crate::peer::fetch_blob_from_peers(
+                            peer_client,
+                            blob_peers,
+                            &layer.digest,
+                            None,
+                            cache,
+                        )
+                        .await
+                        .map(|result| result.path),
+                        None => None,
+                    }
+                };
+                match from_peer {
+                    Some(path) => path,
+                    None => {
+                        tracing::info!(
+                            diff_id = %layer.diff_id,
+                            digest = %layer.digest,
+                            size = layer.size,
+                            "downloading layer blob..."
+                        );
+                        let mut layer_progress = |layer_done: u64, _layer_total: u64| {
+                            on_progress(done + layer_done, grand_total.max(done + layer_done))
+                        };
+                        download_blob(
+                            client,
+                            repo,
+                            &layer.digest,
+                            layer.size,
+                            None,
+                            cache,
+                            RangedPlan::default(),
+                            &mut layer_progress,
+                        )
+                        .await?
+                        .path
+                    }
+                }
+            }
+        };
+
+        // Track A owns decompression, safe untar, digest verification, atomic
+        // `.partial` publication, and the process-scoped hold that protects a
+        // newly installed layer until an extraction records its reference.
+        let shared_root = layers.shared_root.clone();
+        let diff_id = layer.diff_id.clone();
+        let blob = blob_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let reader = std::fs::File::open(&blob).map_err(|error| {
+                RegistryError::InvalidManifest(format!(
+                    "opening layer blob {} failed: {error}",
+                    blob.display()
+                ))
+            })?;
+            smolvm_pack::extract::install_layer_from_stream(&shared_root, &diff_id, reader).map_err(
+                |error| {
+                    RegistryError::InvalidManifest(format!(
+                        "installing layer {diff_id} from {} failed: {error}",
+                        blob.display()
+                    ))
+                },
+            )
+        })
+        .await
+        .map_err(|error| {
+            RegistryError::InvalidManifest(format!("layer install task failed: {error}"))
+        })??;
+
+        // The installed tree is the artifact now; the compressed copy in the
+        // blob cache would only be a second copy of it. Dropping it here also
+        // keeps a multi-GB layer from evicting everything else in the cache.
+        cache.remove(&layer.digest);
+        installed.fetched += 1;
+        installed.bytes += layer.size;
+        done += layer.size;
+        on_progress(done, grand_total.max(done));
+    }
+    Ok(installed)
 }
 
 /// How long an abandoned partial download is kept for a retry to resume.
@@ -334,50 +620,125 @@ async fn download_blob(
     let resumable = tokio::fs::try_exists(&partial_path).await.unwrap_or(false);
     if size >= plan.parallel_min_bytes && !resumable {
         let started = std::time::Instant::now();
-        match fetch_ranged(client, repo, digest, size, &ranged_path, plan, on_progress).await {
-            Ok(true) => {
-                let actual = hash_file(&ranged_path).await?;
-                if actual != *digest {
-                    discard_partial(&ranged_path).await;
-                    return Err(RegistryError::DigestMismatch {
-                        expected: digest.to_string(),
-                        actual,
-                    });
+        // A transient fault resumes the ranged file where it stopped: parts
+        // already on disk are not requested again, so a failed attempt on a
+        // multi-GiB layer costs the parts in flight, not the whole layer.
+        let mut attempt = 1;
+        loop {
+            match fetch_ranged(client, repo, digest, size, &ranged_path, plan, on_progress).await {
+                Ok(true) => {
+                    let actual = hash_file(&ranged_path).await?;
+                    if actual != *digest {
+                        discard_ranged(&ranged_path).await;
+                        return Err(RegistryError::DigestMismatch {
+                            expected: digest.to_string(),
+                            actual,
+                        });
+                    }
+                    tracing::info!(
+                        digest = %digest,
+                        size,
+                        streams = plan.streams,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "blob downloaded in ranged parts"
+                    );
+                    let _ = tokio::fs::remove_file(ranged_parts_path(&ranged_path)).await;
+                    tokio::fs::rename(&ranged_path, &partial_path).await?;
+                    return finish_download(digest, size, output, cache).await;
                 }
-                tracing::info!(
-                    digest = %digest,
-                    size,
-                    streams = plan.streams,
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "blob downloaded in ranged parts"
-                );
-                tokio::fs::rename(&ranged_path, &partial_path).await?;
-                return finish_download(digest, size, output, cache).await;
-            }
-            Ok(false) => {
-                tracing::info!(digest = %digest, "registry does not serve ranges; using one stream");
-            }
-            Err(error) => {
-                tracing::warn!(digest = %digest, %error, "ranged blob download failed; retrying as one stream");
-                discard_partial(&ranged_path).await;
+                Ok(false) => {
+                    tracing::info!(digest = %digest, "registry does not serve ranges; using one stream");
+                    break;
+                }
+                Err(error) if attempt < MAX_ATTEMPTS && is_retryable(&error) => {
+                    tracing::warn!(
+                        digest = %digest,
+                        attempt,
+                        %error,
+                        "ranged blob download interrupted; resuming its missing parts"
+                    );
+                    tokio::time::sleep(RETRY_BACKOFF * 2u32.pow(attempt - 1)).await;
+                    attempt += 1;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        digest = %digest,
+                        %error,
+                        "ranged blob download failed; continuing as one stream"
+                    );
+                    break;
+                }
             }
         }
     }
     download_with_resume(client, repo, digest, size, output, cache, on_progress).await
 }
 
-/// Fetch the blob into `partial_path` as `plan.part_bytes` parts over
-/// `plan.streams` concurrent ranged requests, each written in place.
+/// The record of which parts of a ranged download are on disk: one little-endian
+/// `u64` start offset per part, appended once that part's bytes are synced.
 ///
-/// The first part goes alone: it settles the registry token every other part
-/// reuses, and a registry answering it with the whole blob (200) means ranges
-/// are unsupported, reported as `Ok(false)` before any file is created.
+/// A part missing from the record is fetched again, which is always safe; a part
+/// in the record is never fetched again. That is what lets an interrupted layer
+/// resume where it stopped instead of starting over.
+fn ranged_parts_path(ranged_path: &Path) -> PathBuf {
+    ranged_path.with_extension("parts.partial")
+}
+
+/// Parts a previous attempt finished, from the record beside `ranged_path`.
+///
+/// Nothing is resumable unless the ranged file is there at the blob's full
+/// length; a record without its file, or a file without a record, starts over.
+async fn completed_ranged_parts(ranged_path: &Path, size: u64) -> std::collections::HashSet<u64> {
+    let parts_path = ranged_parts_path(ranged_path);
+    let sized = tokio::fs::metadata(ranged_path)
+        .await
+        .is_ok_and(|meta| meta.len() == size);
+    if !sized {
+        let _ = tokio::fs::remove_file(&parts_path).await;
+        return std::collections::HashSet::new();
+    }
+    tokio::fs::read(&parts_path)
+        .await
+        .unwrap_or_default()
+        .chunks_exact(8)
+        .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("8-byte chunk")))
+        .collect()
+}
+
+/// Record that the part starting at `start` is on disk.
+async fn record_ranged_part(ranged_path: &Path, start: u64) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut record = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(ranged_parts_path(ranged_path))
+        .await?;
+    record.write_all(&start.to_le_bytes()).await?;
+    record.flush().await?;
+    Ok(())
+}
+
+/// Remove a ranged file and its record, after a digest that does not match.
+async fn discard_ranged(ranged_path: &Path) {
+    discard_partial(ranged_path).await;
+    let _ = tokio::fs::remove_file(ranged_parts_path(ranged_path)).await;
+}
+
+/// Fetch the blob into `ranged_path` as `plan.part_bytes` parts over
+/// `plan.streams` concurrent ranged requests, each written in place and recorded
+/// once it is on disk.
+///
+/// A file an earlier attempt left is resumed: parts already in the record are
+/// not requested again. The first part still to fetch goes alone: it settles the
+/// registry token every other part reuses, and a registry answering it with the
+/// whole blob (200) means ranges are unsupported, reported as `Ok(false)` before
+/// any file is created.
 async fn fetch_ranged(
     client: &RegistryClient,
     repo: &str,
     digest: &str,
     size: u64,
-    partial_path: &Path,
+    ranged_path: &Path,
     plan: RangedPlan,
     on_progress: &mut (dyn FnMut(u64, u64) + Send),
 ) -> Result<bool> {
@@ -385,17 +746,38 @@ async fn fetch_ranged(
         .step_by(plan.part_bytes as usize)
         .map(|start| (start, (start + plan.part_bytes).min(size) - 1))
         .collect();
-    let Some(first) = fetch_part(client, repo, digest, parts[0]).await? else {
+    let completed = completed_ranged_parts(ranged_path, size).await;
+    let mut done: u64 = parts
+        .iter()
+        .filter(|(start, _)| completed.contains(start))
+        .map(|(start, end)| end - start + 1)
+        .sum();
+    on_progress(done, size);
+    let pending: Vec<(u64, u64)> = parts
+        .iter()
+        .copied()
+        .filter(|(start, _)| !completed.contains(start))
+        .collect();
+    let Some(&probe) = pending.first() else {
+        return Ok(true);
+    };
+    let Some(first) = fetch_part(client, repo, digest, probe).await? else {
         return Ok(false);
     };
-    let file = tokio::fs::File::create(partial_path).await?;
-    file.set_len(size).await?;
-    drop(file);
-    write_part(partial_path, 0, &first).await?;
-    let mut done = first.len() as u64;
+    if completed.is_empty() {
+        // Sized up front so every part lands at its own offset. A file with no
+        // record behind it is rebuilt from zero, never built on.
+        let file = tokio::fs::File::create(ranged_path).await?;
+        file.set_len(size).await?;
+        drop(file);
+        let _ = tokio::fs::remove_file(ranged_parts_path(ranged_path)).await;
+    }
+    write_part(ranged_path, probe.0, &first).await?;
+    record_ranged_part(ranged_path, probe.0).await?;
+    done += first.len() as u64;
     on_progress(done, size);
 
-    let mut rest = futures_util::stream::iter(parts[1..].iter().copied())
+    let mut rest = futures_util::stream::iter(pending[1..].iter().copied())
         .map(|(start, end)| async move {
             let bytes = fetch_part(client, repo, digest, (start, end))
                 .await?
@@ -403,7 +785,8 @@ async fn fetch_ranged(
                     status: 200,
                     body: "registry stopped serving ranges mid-download".into(),
                 })?;
-            write_part(partial_path, start, &bytes).await?;
+            write_part(ranged_path, start, &bytes).await?;
+            record_ranged_part(ranged_path, start).await?;
             Ok::<u64, RegistryError>(bytes.len() as u64)
         })
         .buffer_unordered(plan.streams);
@@ -433,13 +816,16 @@ async fn fetch_part(
     }
 }
 
-/// Write `bytes` into `path` at `offset`.
+/// Write `bytes` into `path` at `offset`, synced to disk before it returns.
 async fn write_part(path: &Path, offset: u64, bytes: &[u8]) -> Result<()> {
     use tokio::io::AsyncSeekExt;
     let mut file = tokio::fs::OpenOptions::new().write(true).open(path).await?;
     file.seek(std::io::SeekFrom::Start(offset)).await?;
     file.write_all(bytes).await?;
     file.flush().await?;
+    // A part is recorded as on disk only once its bytes are: a record must never
+    // name bytes that a crash could still lose.
+    file.sync_data().await?;
     Ok(())
 }
 
@@ -584,12 +970,12 @@ async fn finish_download(
     } else {
         cached_path
     };
-    Ok(PullResult {
+    Ok(PullResult::of_pack_blob(
         path,
-        digest: digest.to_string(),
+        digest.to_string(),
         size,
-        cached: false,
-    })
+        false,
+    ))
 }
 
 /// Remove a partial download so the next attempt starts from zero.
@@ -746,20 +1132,25 @@ where
         cached_path
     };
 
-    Ok(PullResult {
-        path: result_path,
-        digest: digest.to_string(),
-        size: total_bytes,
-        cached: false,
-    })
+    Ok(PullResult::of_pack_blob(
+        result_path,
+        digest.to_string(),
+        total_bytes,
+        false,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CONFIG_MEDIA_TYPE, MANIFEST_MEDIA_TYPE};
+    use crate::{CONFIG_MEDIA_TYPE, LAYER_MEDIA_TYPE, MANIFEST_MEDIA_TYPE};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A layer store in a fresh shared-root directory, with a lifetime the caller keeps.
+    fn store_in(dir: &Path) -> LayerStore {
+        LayerStore::shared(dir)
+    }
 
     /// With empty `blob_peers`, `pull` takes the registry path exactly as before:
     /// fetch the manifest, then stream the layer blob from `/v2/.../blobs/...`,
@@ -801,9 +1192,17 @@ mod tests {
         let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
         let client = RegistryClient::new(server.uri());
 
-        let result = pull(&client, "myrepo", "latest", None, &cache, &[])
-            .await
-            .expect("registry pull must succeed");
+        let result = pull(
+            &client,
+            "myrepo",
+            "latest",
+            None,
+            &cache,
+            &[],
+            &store_in(tmp.path()),
+        )
+        .await
+        .expect("registry pull must succeed");
 
         assert_eq!(result.digest, digest);
         assert_eq!(result.size, data.len() as u64);
@@ -858,19 +1257,43 @@ mod tests {
         let client = RegistryClient::new(server.uri());
 
         for _ in 0..3 {
-            let result = pull(&client, "myrepo", &pinned, None, &cache, &[])
-                .await
-                .unwrap();
+            let result = pull(
+                &client,
+                "myrepo",
+                &pinned,
+                None,
+                &cache,
+                &[],
+                &store_in(tmp.path()),
+            )
+            .await
+            .unwrap();
             assert_eq!(result.digest, layer);
         }
         for _ in 0..2 {
-            pull(&client, "myrepo", "v1", None, &cache, &[])
-                .await
-                .unwrap();
-        }
-        let other = pull(&client, "other", &pinned, None, &cache, &[])
+            pull(
+                &client,
+                "myrepo",
+                "v1",
+                None,
+                &cache,
+                &[],
+                &store_in(tmp.path()),
+            )
             .await
             .unwrap();
+        }
+        let other = pull(
+            &client,
+            "other",
+            &pinned,
+            None,
+            &cache,
+            &[],
+            &store_in(tmp.path()),
+        )
+        .await
+        .unwrap();
         assert!(other.cached, "the layer blob itself is shared by digest");
         // MockServer drop asserts each manifest endpoint's expected hit count.
     }
@@ -926,9 +1349,10 @@ mod tests {
         let cache = BlobCache::open(tmp.path().to_path_buf(), 16 * 1024 * 1024).unwrap();
         let client = RegistryClient::new(server.uri());
 
+        let store = store_in(tmp.path());
         let (a, b) = tokio::join!(
-            pull(&client, "myrepo", "latest", None, &cache, &[]),
-            pull(&client, "myrepo", "latest", None, &cache, &[]),
+            pull(&client, "myrepo", "latest", None, &cache, &[], &store),
+            pull(&client, "myrepo", "latest", None, &cache, &[], &store),
         );
         let (a, b) = (a.expect("first pull"), b.expect("second pull"));
         assert_eq!(
@@ -978,6 +1402,7 @@ mod tests {
             None,
             &cache,
             &[],
+            &store_in(tmp.path()),
             &mut |done, total| seen.push((done, total)),
         )
         .await
@@ -1046,9 +1471,17 @@ mod tests {
         let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
         let client = RegistryClient::new(server.uri());
 
-        let result = pull(&client, "myrepo", "latest", None, &cache, &[])
-            .await
-            .expect("a truncated transfer must be resumed and completed");
+        let result = pull(
+            &client,
+            "myrepo",
+            "latest",
+            None,
+            &cache,
+            &[],
+            &store_in(tmp.path()),
+        )
+        .await
+        .expect("a truncated transfer must be resumed and completed");
 
         assert_eq!(
             result.size,
@@ -1119,9 +1552,17 @@ mod tests {
         let partial = cache.blob_path_for(&digest).with_extension("partial");
         std::fs::write(&partial, &data).unwrap();
 
-        let result = pull(&client_for(&server), "myrepo", "latest", None, &cache, &[])
-            .await
-            .expect("a complete partial must be adopted, not resumed past its end");
+        let result = pull(
+            &client_for(&server),
+            "myrepo",
+            "latest",
+            None,
+            &cache,
+            &[],
+            &store_in(tmp.path()),
+        )
+        .await
+        .expect("a complete partial must be adopted, not resumed past its end");
         assert_eq!(result.size, data.len() as u64);
         assert_eq!(
             tokio::fs::read(cache.get(&digest).unwrap()).await.unwrap(),
@@ -1141,9 +1582,17 @@ mod tests {
         let partial = cache.blob_path_for(&digest).with_extension("partial");
         std::fs::write(&partial, vec![0u8; data.len()]).unwrap();
 
-        let result = pull(&client_for(&server), "myrepo", "latest", None, &cache, &[])
-            .await
-            .expect("a wrong full-size partial must be replaced");
+        let result = pull(
+            &client_for(&server),
+            "myrepo",
+            "latest",
+            None,
+            &cache,
+            &[],
+            &store_in(tmp.path()),
+        )
+        .await
+        .expect("a wrong full-size partial must be replaced");
         assert_eq!(tokio::fs::read(&result.path).await.unwrap(), data);
     }
 
@@ -1158,9 +1607,17 @@ mod tests {
         let partial = cache.blob_path_for(&digest).with_extension("partial");
         std::fs::write(&partial, &data[..100]).unwrap();
 
-        let result = pull(&client_for(&server), "myrepo", "latest", None, &cache, &[])
-            .await
-            .expect("a 416 on resume must restart from zero");
+        let result = pull(
+            &client_for(&server),
+            "myrepo",
+            "latest",
+            None,
+            &cache,
+            &[],
+            &store_in(tmp.path()),
+        )
+        .await
+        .expect("a 416 on resume must restart from zero");
         assert_eq!(tokio::fs::read(&result.path).await.unwrap(), data);
     }
 
@@ -1194,9 +1651,17 @@ mod tests {
         let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
         let client = RegistryClient::new(server.uri());
 
-        let err = pull(&client, "myrepo", "latest", None, &cache, &[])
-            .await
-            .expect_err("a missing blob must fail");
+        let err = pull(
+            &client,
+            "myrepo",
+            "latest",
+            None,
+            &cache,
+            &[],
+            &store_in(tmp.path()),
+        )
+        .await
+        .expect_err("a missing blob must fail");
         assert!(
             matches!(err, RegistryError::BlobNotFound(_)),
             "expected BlobNotFound, got {err:?}"
@@ -1360,6 +1825,117 @@ mod tests {
         assert_eq!(tokio::fs::read(&cached).await.unwrap(), data);
     }
 
+    /// A registry that serves ranges until `budget` requests are answered, then
+    /// refuses every request: a connection that dies midway through a blob.
+    struct DyingRangeServer {
+        data: Vec<u8>,
+        budget: std::sync::atomic::AtomicUsize,
+        seen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl wiremock::Respond for DyingRangeServer {
+        fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
+            self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let served = self
+                .budget
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |left| left.checked_sub(1),
+                )
+                .is_ok();
+            if !served {
+                return ResponseTemplate::new(404);
+            }
+            RangeServer {
+                data: self.data.clone(),
+                fail_first: 0,
+                seen: Default::default(),
+            }
+            .respond(req)
+        }
+    }
+
+    /// A ranged download cut off midway resumes the parts it has not got: parts
+    /// already recorded on disk are not requested again.
+    #[tokio::test]
+    async fn a_ranged_download_resumes_the_parts_it_has_not_got() {
+        let (data, digest) = test_blob();
+        let total_parts = data.len().div_ceil(300);
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
+        let ranged_path = cache
+            .blob_path_for(&digest)
+            .with_extension(RANGED_PARTIAL_EXTENSION);
+
+        // First attempt: the connection dies after about half the parts.
+        let first_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/myrepo/blobs/{digest}")))
+            .respond_with(DyingRangeServer {
+                data: data.clone(),
+                budget: std::sync::atomic::AtomicUsize::new(total_parts / 2),
+                seen: Default::default(),
+            })
+            .mount(&first_server)
+            .await;
+        let first = download_blob(
+            &RegistryClient::new(first_server.uri()),
+            "myrepo",
+            &digest,
+            data.len() as u64,
+            None,
+            &cache,
+            small_plan(),
+            &mut |_, _| {},
+        )
+        .await;
+        assert!(
+            first.is_err(),
+            "the cut-off attempt must not report success"
+        );
+        let recorded = std::fs::metadata(ranged_parts_path(&ranged_path))
+            .unwrap()
+            .len()
+            / 8;
+        assert!(
+            recorded >= 1 && (recorded as usize) < total_parts,
+            "recorded {recorded} of {total_parts} parts"
+        );
+
+        // Second attempt against a healthy registry: only unrecorded parts go out.
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let second_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/myrepo/blobs/{digest}")))
+            .respond_with(RangeServer {
+                data: data.clone(),
+                fail_first: 0,
+                seen: seen.clone(),
+            })
+            .mount(&second_server)
+            .await;
+        download_blob(
+            &RegistryClient::new(second_server.uri()),
+            "myrepo",
+            &digest,
+            data.len() as u64,
+            None,
+            &cache,
+            small_plan(),
+            &mut |_, _| {},
+        )
+        .await
+        .expect("the resumed download must complete");
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            total_parts - recorded as usize,
+            "the resumed attempt must request exactly the parts not yet on disk"
+        );
+        let cached = cache.get(&digest).expect("blob must be adopted into cache");
+        assert_eq!(tokio::fs::read(&cached).await.unwrap(), data);
+    }
+
     /// A registry that ignores ranges is read once as a whole, not once per part.
     #[tokio::test]
     async fn a_registry_without_ranges_falls_back_to_one_stream() {
@@ -1423,5 +1999,402 @@ mod tests {
             expected: "a".into(),
             actual: "b".into(),
         }));
+    }
+
+    /// A two-layer pack on disk, split into blobs, for the split-pull tests.
+    struct SplitFixture {
+        base_path: PathBuf,
+        base_digest: String,
+        base_size: u64,
+        layers: Vec<SplitFixtureLayer>,
+    }
+
+    struct SplitFixtureLayer {
+        diff_id: String,
+        blob_digest: String,
+        blob_size: u64,
+        blob_bytes: Vec<u8>,
+    }
+
+    /// A one-entry tar, as a layer's bytes.
+    fn layer_tar(name: &str, body: &[u8]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, name, std::io::Cursor::new(body))
+            .unwrap();
+        builder.into_inner().unwrap()
+    }
+
+    /// Build a two-layer pack under `dir` and split it, the way `pack push` and
+    /// `pack pull` do in production.
+    fn split_fixture(dir: &Path) -> SplitFixture {
+        use smolvm_pack::assets::AssetCollector;
+        use smolvm_pack::format::PackManifest;
+        use smolvm_pack::packer::Packer;
+        use smolvm_pack::split::{split_pack, SplitCache};
+
+        let staging = dir.join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("agent-rootfs.tar"), b"rootfs").unwrap();
+        let mut collector = AssetCollector::new(staging).unwrap();
+        collector
+            .add_layer(
+                &format!("sha256:{}", "aa".repeat(32)),
+                &layer_tar("opt/a.txt", b"layer a"),
+            )
+            .unwrap();
+        collector
+            .add_layer(
+                &format!("sha256:{}", "bb".repeat(32)),
+                &layer_tar("opt/b.txt", b"layer b"),
+            )
+            .unwrap();
+        let mut manifest = PackManifest::new(
+            "img".into(),
+            "sha256:0".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        manifest.assets = collector.inventory().clone();
+        let pack = dir.join("golden.smolmachine");
+        Packer::new(manifest)
+            .with_asset_collector(collector)
+            .pack_artifact(&pack)
+            .unwrap();
+
+        let cache = SplitCache::new(dir.join("split-cache"));
+        let split = split_pack(&pack, &cache).unwrap();
+        let layers = split
+            .layers
+            .iter()
+            .map(|layer| SplitFixtureLayer {
+                diff_id: layer.diff_id.clone(),
+                blob_digest: layer.blob_digest.clone(),
+                blob_size: layer.blob_size,
+                blob_bytes: std::fs::read(layer.blob_path(&cache.blobs_dir())).unwrap(),
+            })
+            .collect();
+        SplitFixture {
+            base_path: split.base_path.clone(),
+            base_digest: split.base_digest.clone(),
+            base_size: split.base_size,
+            layers,
+        }
+    }
+
+    /// The split manifest a push of that fixture would publish.
+    fn split_manifest(fixture: &SplitFixture) -> serde_json::Value {
+        let mut layers = vec![serde_json::json!({
+            "mediaType": crate::SPLIT_BASE_MEDIA_TYPE,
+            "digest": fixture.base_digest,
+            "size": fixture.base_size,
+        })];
+        for layer in &fixture.layers {
+            layers.push(serde_json::json!({
+                "mediaType": crate::SPLIT_LAYER_MEDIA_TYPE,
+                "digest": layer.blob_digest,
+                "size": layer.blob_size,
+                "annotations": { crate::LAYER_DIFF_ID_ANNOTATION: layer.diff_id },
+            }));
+        }
+        serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": MANIFEST_MEDIA_TYPE,
+            "artifactType": crate::SPLIT_ARTIFACT_TYPE,
+            "config": {
+                "mediaType": CONFIG_MEDIA_TYPE,
+                "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                "size": 2,
+            },
+            "layers": layers,
+        })
+    }
+
+    /// Serve a manifest and its blobs from a mock registry.
+    async fn mount_split(
+        server: &MockServer,
+        repo: &str,
+        fixture: &SplitFixture,
+        manifest: &serde_json::Value,
+    ) {
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/{repo}/manifests/latest")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(serde_json::to_vec(manifest).unwrap(), MANIFEST_MEDIA_TYPE),
+            )
+            .mount(server)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path(format!("/v2/{repo}/blobs/{}", fixture.base_digest)))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(server)
+            .await;
+        let base = std::fs::read(&fixture.base_path).unwrap();
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/{repo}/blobs/{}", fixture.base_digest)))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(base))
+            .mount(server)
+            .await;
+    }
+
+    /// Fetch a layer blob into the store, as a host that already pulled
+    /// this layer would have them.
+    fn install_layer(store: &LayerStore, layer: &SplitFixtureLayer) {
+        smolvm_pack::extract::install_layer_from_stream(
+            &store.shared_root,
+            &layer.diff_id,
+            std::io::Cursor::new(&layer.blob_bytes),
+        )
+        .unwrap();
+    }
+
+    /// A consumer that already holds one of a split artifact's layers fetches
+    /// only the other: that is the whole point of the split layout, and the
+    /// per-layer request count is how it is observable.
+    #[tokio::test]
+    async fn split_pull_fetches_only_the_missing_layer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = split_fixture(tmp.path());
+        let server = MockServer::start().await;
+        mount_split(&server, "myrepo", &fixture, &split_manifest(&fixture)).await;
+
+        let present = &fixture.layers[0];
+        let missing = &fixture.layers[1];
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/myrepo/blobs/{}", present.blob_digest)))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(present.blob_bytes.clone()))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/myrepo/blobs/{}", missing.blob_digest)))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(missing.blob_bytes.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cache = BlobCache::open(tmp.path().join("cache"), 1 << 30).unwrap();
+        let store = store_in(tmp.path());
+        install_layer(&store, present);
+        assert!(
+            store.layer_present(&present.diff_id),
+            "the pre-installed layer must read as present in the store"
+        );
+
+        let result = pull(
+            &RegistryClient::new(server.uri()),
+            "myrepo",
+            "latest",
+            None,
+            &cache,
+            &[],
+            &store,
+        )
+        .await
+        .expect("split pull must succeed");
+
+        assert_eq!(
+            (result.layers_fetched, result.layers_skipped),
+            (1, 1),
+            "expected one fetched and one already-present layer"
+        );
+        assert_eq!(result.layers_skipped, 1);
+        assert_eq!(result.layer_bytes, missing.blob_size);
+        assert!(store.layer_present(&present.diff_id));
+        assert!(store.layer_present(&missing.diff_id));
+        assert_eq!(
+            std::fs::read(
+                smolvm_pack::extract::shared_layers_dir(&store.shared_root)
+                    .unwrap()
+                    .join(&missing.diff_id[7..])
+                    .join("opt/b.txt"),
+            )
+            .unwrap(),
+            b"layer b"
+        );
+    }
+
+    /// Every layer blob is verified against its descriptor, and a blob that
+    /// fails is fatal for that layer — while the layers already installed stay
+    /// installed, so the next attempt only has to get the bad one.
+    #[tokio::test]
+    async fn split_pull_fails_closed_on_a_corrupt_layer_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = split_fixture(tmp.path());
+        let server = MockServer::start().await;
+        mount_split(&server, "myrepo", &fixture, &split_manifest(&fixture)).await;
+
+        let first = &fixture.layers[0];
+        let corrupt = &fixture.layers[1];
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/myrepo/blobs/{}", first.blob_digest)))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(first.blob_bytes.clone()))
+            .mount(&server)
+            .await;
+        // The registry hands back bytes of the promised length that are not the
+        // blob the manifest promised.
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/myrepo/blobs/{}", corrupt.blob_digest)))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(vec![0x58_u8; corrupt.blob_bytes.len()]),
+            )
+            .mount(&server)
+            .await;
+
+        let cache = BlobCache::open(tmp.path().join("cache"), 1 << 30).unwrap();
+        let store = store_in(tmp.path());
+
+        let error = pull(
+            &RegistryClient::new(server.uri()),
+            "myrepo",
+            "latest",
+            None,
+            &cache,
+            &[],
+            &store,
+        )
+        .await
+        .expect_err("a corrupt layer blob must fail the pull");
+
+        assert!(
+            matches!(error, RegistryError::DigestMismatch { .. }),
+            "expected a digest mismatch, got {error}"
+        );
+        assert!(
+            store.layer_present(&first.diff_id),
+            "the layer that arrived intact must stay installed"
+        );
+        assert!(
+            !store.layer_present(&corrupt.diff_id),
+            "the layer that failed must not read as installed"
+        );
+    }
+
+    /// A partial layer download resumes: the transfer picks up at the bytes
+    /// already on disk, so the registry is asked for a range rather than for the
+    /// blob a second time.
+    #[tokio::test]
+    async fn split_layer_download_resumes_from_the_partial_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = split_fixture(tmp.path());
+        let server = MockServer::start().await;
+        mount_split(&server, "myrepo", &fixture, &split_manifest(&fixture)).await;
+
+        // One layer is already installed, so the pull works on the other alone.
+        let present = &fixture.layers[0];
+        let resumed = &fixture.layers[1];
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/myrepo/blobs/{}", present.blob_digest)))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(present.blob_bytes.clone()))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let cache = BlobCache::open(tmp.path().join("cache"), 1 << 30).unwrap();
+        let store = store_in(tmp.path());
+        install_layer(&store, present);
+
+        // What an interrupted attempt leaves behind: the first bytes of the blob.
+        let have = (resumed.blob_bytes.len() / 2) as u64;
+        let partial = cache
+            .blob_path_for(&resumed.blob_digest)
+            .with_extension("partial");
+        std::fs::create_dir_all(partial.parent().unwrap()).unwrap();
+        std::fs::write(&partial, &resumed.blob_bytes[..have as usize]).unwrap();
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let resumed_bytes = resumed.blob_bytes.clone();
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/myrepo/blobs/{}", resumed.blob_digest)))
+            .respond_with(move |request: &wiremock::Request| {
+                let range = request
+                    .headers
+                    .get("range")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                recorder.lock().unwrap().push(range.clone());
+                let offset = range
+                    .strip_prefix("bytes=")
+                    .and_then(|rest| rest.strip_suffix('-'))
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                ResponseTemplate::new(206).set_body_bytes(resumed_bytes[offset..].to_vec())
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = pull(
+            &RegistryClient::new(server.uri()),
+            "myrepo",
+            "latest",
+            None,
+            &cache,
+            &[],
+            &store,
+        )
+        .await
+        .expect("a resumed split pull must succeed");
+
+        let ranges = seen.lock().unwrap().clone();
+        assert_eq!(ranges, vec![format!("bytes={have}-")]);
+        assert_eq!(result.layers_fetched, 1);
+        assert_eq!(result.layer_bytes, resumed.blob_size);
+        assert!(store.layer_present(&resumed.diff_id));
+        assert!(!partial.exists(), "the resumed partial must be consumed");
+    }
+
+    /// An artifact type this build does not know fails closed before a single
+    /// blob is requested, so a newer layout can never be half-consumed.
+    #[tokio::test]
+    async fn pull_refuses_an_unknown_artifact_type() {
+        let server = MockServer::start().await;
+        let digest = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": MANIFEST_MEDIA_TYPE,
+            "artifactType": "application/vnd.smolmachines.smolmachine.v9+future",
+            "config": { "mediaType": CONFIG_MEDIA_TYPE, "digest": digest, "size": 2 },
+            "layers": [ { "mediaType": "application/vnd.smolmachines.machine.v9", "digest": digest, "size": 10 } ],
+        });
+        Mock::given(method("GET"))
+            .and(path("/v2/myrepo/manifests/latest"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(serde_json::to_vec(&manifest).unwrap(), MANIFEST_MEDIA_TYPE),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/myrepo/blobs/{digest}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"nope".to_vec()))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().join("cache"), 1 << 20).unwrap();
+        let error = pull(
+            &RegistryClient::new(server.uri()),
+            "myrepo",
+            "latest",
+            None,
+            &cache,
+            &[],
+            &store_in(tmp.path()),
+        )
+        .await
+        .expect_err("an unknown artifact type must be refused");
+        assert!(
+            error.to_string().contains("v9+future"),
+            "the error must name the artifact type: {error}"
+        );
     }
 }

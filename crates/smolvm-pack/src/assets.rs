@@ -1775,6 +1775,45 @@ pub fn decompress_assets_from_file(compressed_path: &Path, output_dir: &Path) ->
     Ok(())
 }
 
+/// Unpack a zstd-compressed assets blob from `reader`, skipping the members
+/// `should_skip` selects and handing each of them to `visit` instead.
+///
+/// Taking the archive from a reader and splitting members on the way through is
+/// what lets a split publish read a pack once: the layer members stream into
+/// their own compressed blobs while everything else lands in a staging
+/// directory, so neither copy is ever written out in full.
+pub fn unpack_assets_skipping<R: Read>(
+    reader: R,
+    output_dir: &Path,
+    should_skip: impl Fn(&Path) -> bool,
+    mut visit: impl FnMut(&Path, &mut dyn Read) -> Result<()>,
+) -> Result<()> {
+    fs::create_dir_all(output_dir)?;
+
+    let decoder =
+        zstd::stream::Decoder::new(reader).map_err(|e| PackError::Compression(e.to_string()))?;
+    let mut archive = tar::Archive::new(decoder);
+    let entries = archive
+        .entries()
+        .map_err(|e| PackError::Tar(e.to_string()))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|e| PackError::Tar(e.to_string()))?;
+        let path = entry
+            .path()
+            .map_err(|e| PackError::Tar(e.to_string()))?
+            .into_owned();
+        if should_skip(&path) {
+            visit(&path, &mut entry)?;
+            continue;
+        }
+        entry
+            .unpack_in(output_dir)
+            .map_err(|e| PackError::Tar(e.to_string()))?;
+    }
+
+    Ok(())
+}
+
 /// Calculate CRC32 checksum of data.
 pub fn crc32(data: &[u8]) -> u32 {
     crc32fast::hash(data)

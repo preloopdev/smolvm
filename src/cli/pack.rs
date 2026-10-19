@@ -63,6 +63,8 @@ pub enum PackCmd {
 
     /// Clean up cached pack extractions to free disk space
     Prune(PackPruneCmd),
+    /// Install one verified split-artifact layer into the shared digest-keyed store
+    InstallLayer(PackInstallLayerCmd),
 }
 
 impl PackCmd {
@@ -75,6 +77,7 @@ impl PackCmd {
             PackCmd::List(cmd) => cmd.run(),
             PackCmd::Inspect(cmd) => cmd.run(),
             PackCmd::Prune(cmd) => cmd.run(),
+            PackCmd::InstallLayer(cmd) => cmd.run(),
         }
     }
 }
@@ -1616,6 +1619,11 @@ impl PackCreateCmd {
 ///   smolvm pack prune --keep 2     # keep 2 most recent
 ///   smolvm pack prune --all        # remove everything
 ///   smolvm pack prune --dry-run    # show what would be removed
+///   smolvm pack prune --layers-only  # reclaim only layers no entry names
+///
+/// `--layers-only` touches nothing but the shared digest-keyed layer store on
+/// Linux: no pack entry and no machine pointer is removed, and a layer any
+/// entry still names (or a live pull holds) is kept.
 #[derive(Args, Debug)]
 pub struct PackPruneCmd {
     /// Number of unused cached entries to keep (default: 5)
@@ -1629,10 +1637,17 @@ pub struct PackPruneCmd {
     /// Show what would be removed without actually removing
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Only reclaim shared layers that no pack entry names; remove no entry
+    #[arg(long)]
+    pub layers_only: bool,
 }
 
 impl PackPruneCmd {
     pub fn run(self) -> smolvm::Result<()> {
+        if self.layers_only {
+            return self.run_layers_only();
+        }
         let keep = if self.all { 0 } else { self.keep };
 
         let mut total_freed: u64 = 0;
@@ -1717,6 +1732,47 @@ impl PackPruneCmd {
             println!("No cached entries to remove.");
         }
 
+        Ok(())
+    }
+
+    /// The store-only pass: reclaim shared layers no entry names, and nothing
+    /// else. Exits 0 with a count when the store is busy (an install holds it),
+    /// so a caller that retries later does not have to treat that as a failure.
+    fn run_layers_only(&self) -> smolvm::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let root = crate::agent::shared_pack_cache_root();
+            let report =
+                match smolvm_pack::extract::collect_layer_store_with(&root, false, self.dry_run) {
+                    Ok(report) => report,
+                    Err(error) => {
+                        return Err(smolvm::Error::agent(
+                            "prune shared layers",
+                            error.to_string(),
+                        ))
+                    }
+                };
+            let verb = if self.dry_run {
+                "Would remove"
+            } else {
+                "Removed"
+            };
+            println!(
+                "{verb} {} shared layer(s), reclaimed {}",
+                report.layers_removed,
+                crate::cli::format_bytes(report.bytes_reclaimed)
+            );
+            if report.partials_discarded > 0 {
+                println!(
+                    "  {} interrupted install(s) discarded",
+                    report.partials_discarded
+                );
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            println!("No shared layer store on this platform.");
+        }
         Ok(())
     }
 
@@ -1807,6 +1863,40 @@ impl PackPruneCmd {
         Ok((freed, removed))
     }
 }
+/// Install one zstd-compressed split-artifact layer into the shared digest-keyed
+/// store. The stream is verified against its uncompressed `diff_id` by
+/// `smolvm_pack::extract::install_layer_from_stream` before publication.
+#[derive(Args, Debug)]
+pub struct PackInstallLayerCmd {
+    /// `sha256:<64 hex>` identity of the uncompressed layer tar.
+    #[arg(long, value_name = "DIGEST")]
+    pub diff_id: String,
+
+    /// Path to the zstd-compressed layer blob.
+    #[arg(long, value_name = "PATH")]
+    pub blob: PathBuf,
+
+    /// Shared pack-cache root containing the digest-keyed `layers/` directory.
+    #[arg(long = "store-root", value_name = "DIR")]
+    pub store_root: Option<PathBuf>,
+}
+
+impl PackInstallLayerCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let root = self
+            .store_root
+            .unwrap_or_else(smolvm::agent::shared_pack_cache_root);
+        let reader = std::fs::File::open(&self.blob).map_err(|error| {
+            Error::agent(
+                "open split layer blob",
+                format!("{}: {error}", self.blob.display()),
+            )
+        })?;
+        smolvm_pack::extract::install_layer_from_stream(&root, &self.diff_id, reader)
+            .map_err(|error| Error::agent("install split layer", error.to_string()))?;
+        Ok(())
+    }
+}
 
 // ============================================================================
 // Push / Pull — registry operations for .smolmachine artifacts
@@ -1826,6 +1916,22 @@ pub struct PackPushCmd {
     /// Path to the .smolmachine file to push
     #[arg(short = 'f', long, value_name = "PATH")]
     pub file: PathBuf,
+
+    /// Publish the pack as one blob instead of a base pack plus one blob per
+    /// layer.
+    ///
+    /// Splitting is the default because it is what makes a republish cheap: each
+    /// layer travels as its own content-addressed blob, so a push that changed
+    /// nothing uploads nothing and a push that changed one layer uploads one
+    /// layer. A single blob is only useful for a consumer that cannot read a
+    /// split artifact.
+    #[arg(long)]
+    pub no_split_layers: bool,
+
+    /// Where to keep the split pack's base and per-layer blobs between pushes
+    /// (default: beside the pack cache)
+    #[arg(long, value_name = "DIR")]
+    pub split_cache: Option<PathBuf>,
 }
 
 impl PackPushCmd {
@@ -1856,16 +1962,70 @@ impl PackPushCmd {
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| Error::agent("create tokio runtime", e.to_string()))?;
 
+        // A pack with layers is split by default: the layers are already
+        // separate members of the pack, and publishing them as separate blobs
+        // is what lets a republish send nothing and a consumer fetch only what
+        // it lacks. A pack without layers has nothing to split, and
+        // `--no-split-layers` keeps the historical single blob for a consumer
+        // that cannot read the split layout.
+        let layer_count = smolvm_pack::read_manifest_from_sidecar(&self.file)
+            .map(|manifest| manifest.assets.layers.len())
+            .unwrap_or(0);
+        if self.no_split_layers || layer_count == 0 {
+            if !self.no_split_layers {
+                eprintln!("This pack carries no layers; pushing it as a single blob");
+            }
+            let result = rt
+                .block_on(smolvm_registry::push(&client, &repo, tag, &self.file))
+                .map_err(|e| Error::agent("registry push", e.to_string()))?;
+            eprintln!(
+                "Pushed successfully\n  Layer:    {} ({} bytes)\n  Manifest: {}",
+                result.layer_digest, result.layer_size, result.manifest_digest,
+            );
+            return Ok(());
+        }
+
+        let cache = split_cache(&self.split_cache);
+        eprintln!("Splitting the pack into a base pack and {layer_count} layer blob(s)");
         let result = rt
-            .block_on(smolvm_registry::push(&client, &repo, tag, &self.file))
+            .block_on(smolvm_registry::push_split(
+                &client, &repo, tag, &self.file, &cache,
+            ))
             .map_err(|e| Error::agent("registry push", e.to_string()))?;
 
         eprintln!(
-            "Pushed successfully\n  Layer:    {} ({} bytes)\n  Manifest: {}",
-            result.layer_digest, result.layer_size, result.manifest_digest,
+            "Pushed successfully\n  Base:     {} ({} bytes{})\n  Layers:   {} uploaded, {} already present\n  Uploaded: {}\n  Manifest: {}",
+            result.base_digest,
+            result.base_size,
+            if result.base_uploaded { "" } else { ", already present" },
+            result.layers_uploaded(),
+            result.layers_skipped(),
+            crate::cli::format_bytes(result.bytes_uploaded()),
+            result.manifest_digest,
         );
         Ok(())
     }
+}
+
+/// The split cache directory: an explicit `--split-cache`, else beside the pack
+/// cache so a republish of the same pack re-reads neither its layers nor its
+/// base.
+fn split_cache(explicit: &Option<PathBuf>) -> smolvm_pack::split::SplitCache {
+    let root = explicit
+        .clone()
+        .unwrap_or_else(|| smolvm::agent::shared_pack_cache_root().join("pack-split"));
+    smolvm_pack::split::SplitCache::new(root)
+}
+
+/// The shared root a split pull installs layers into.
+///
+/// `--layers-store` overrides it (tests, or a store on another volume); the
+/// default is the shared root beside the pack cache. The runtime's
+/// `smolvm_pack::extract` module owns the platform-specific `layers/` directory
+/// and its atomic install/hold protocol.
+pub fn layer_store(explicit: Option<PathBuf>) -> smolvm_registry::pull::LayerStore {
+    let root = explicit.unwrap_or_else(smolvm::agent::shared_pack_cache_root);
+    smolvm_registry::pull::LayerStore::shared(root)
 }
 
 /// Pull a .smolmachine artifact from a registry.
@@ -1883,6 +2043,11 @@ pub struct PackPullCmd {
     /// Output path for the downloaded .smolmachine file
     #[arg(short = 'o', long, value_name = "PATH")]
     pub output: Option<PathBuf>,
+
+    /// Directory holding extracted layers for a split artifact (default: the
+    /// shared layer store beside the pack cache)
+    #[arg(long, value_name = "DIR")]
+    pub layers_store: Option<PathBuf>,
 }
 
 impl PackPullCmd {
@@ -1909,6 +2074,11 @@ impl PackPullCmd {
         let cache = smolvm_registry::BlobCache::open_default()
             .map_err(|e| Error::agent("open blob cache", e.to_string()))?;
 
+        // A split artifact installs its layers into a digest-keyed store, so a
+        // layer this host already holds is never fetched again. The store is the
+        // same one the runtime extracts packs into.
+        let layers = layer_store(self.layers_store.clone());
+
         // Optional brokered P2P peers for this one-shot CLI pull. Process-global
         // env is fine here (single-shot command). Comma-separated node base URLs;
         // empty/unset ⇒ registry-only.
@@ -1928,8 +2098,9 @@ impl PackPullCmd {
         // `\r`, which does nothing in a log file, so a CI run would collect
         // hundreds of stacked lines instead of one.
         let show_progress = std::io::IsTerminal::is_terminal(&std::io::stderr());
-        // The layer size is only known once the manifest is fetched, so the bar
-        // cannot be built until the first callback carries the total.
+        // The artifact's size is only known once the manifest is fetched, so the
+        // bar cannot be built until the first callback carries the total. A split
+        // artifact reports one total for all of its blobs.
         let mut bar: Option<crate::cli::ProgressBar> = None;
         let result = rt
             .block_on(smolvm_registry::pull_with_progress(
@@ -1939,6 +2110,7 @@ impl PackPullCmd {
                 self.output.as_deref(),
                 &cache,
                 &blob_peers,
+                &layers,
                 &mut |done, total| {
                     if !show_progress {
                         return;
@@ -1951,7 +2123,7 @@ impl PackPullCmd {
             ))
             .map_err(|e| Error::agent("registry pull", e.to_string()))?;
         if let Some(bar) = bar.take() {
-            bar.finish(result.size);
+            bar.finish(result.size + result.layer_bytes);
         }
 
         if result.cached {
@@ -1965,6 +2137,15 @@ impl PackPullCmd {
             dest.display(),
             crate::cli::format_bytes(result.size),
         );
+        if result.layers_fetched > 0 || result.layers_skipped > 0 {
+            eprintln!(
+                "  Layers:   {} fetched ({}), {} already present in {}",
+                result.layers_fetched,
+                crate::cli::format_bytes(result.layer_bytes),
+                result.layers_skipped,
+                layers.shared_root.display(),
+            );
+        }
         if into_cache {
             // The blob path is not meant to be typed: name the artifact by the
             // reference it was pulled as, which reuses this cached copy. The

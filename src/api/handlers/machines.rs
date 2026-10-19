@@ -7416,19 +7416,27 @@ pub(crate) async fn pull_smolmachine(
         "pulling .smolmachine from registry"
     );
 
-    let result = smolvm_registry::pull(&client, &repo, tag_or_digest, None, &cache, blob_peers)
-        .await
-        .map_err(|e| match &e {
-            // A missing image/manifest is the caller's mistake (typo'd ref, or a
-            // bare name that resolved to an empty repo) — surface it as 404, not a
-            // 500. A 500 here misreports a client error as a server fault and
-            // pollutes the fleet error-rate SLO on every bad reference.
-            smolvm_registry::RegistryError::BlobNotFound(_)
-            | smolvm_registry::RegistryError::ApiError { status: 404, .. } => {
-                ApiError::NotFound(format!("image not found in registry: {}", e))
-            }
-            _ => ApiError::internal(format!("registry pull failed: {}", e)),
-        })?;
+    let result = smolvm_registry::pull(
+        &client,
+        &repo,
+        tag_or_digest,
+        None,
+        &cache,
+        blob_peers,
+        &crate::cli::pack::layer_store(None),
+    )
+    .await
+    .map_err(|e| match &e {
+        // A missing image/manifest is the caller's mistake (typo'd ref, or a
+        // bare name that resolved to an empty repo) — surface it as 404, not a
+        // 500. A 500 here misreports a client error as a server fault and
+        // pollutes the fleet error-rate SLO on every bad reference.
+        smolvm_registry::RegistryError::BlobNotFound(_)
+        | smolvm_registry::RegistryError::ApiError { status: 404, .. } => {
+            ApiError::NotFound(format!("image not found in registry: {}", e))
+        }
+        _ => ApiError::internal(format!("registry pull failed: {}", e)),
+    })?;
 
     Ok(result)
 }
