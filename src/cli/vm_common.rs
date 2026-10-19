@@ -516,6 +516,8 @@ pub struct CreateVmParams {
     pub cuda_vram_limit_mib: Option<u64>,
     /// Expose the guest's Docker daemon socket to the host as a Unix socket.
     pub docker_socket: bool,
+    /// Keep a local image archive's layers apart instead of flattening them.
+    pub preserve_image_layers: bool,
     /// Enable GPU acceleration (virtio-gpu with Venus/Vulkan).
     /// Expose host virtualization extensions so the guest can run KVM.
     pub nested_virt: bool,
@@ -864,6 +866,7 @@ pub(crate) fn build_vm_record_for(
     record.cuda_fork_pool_size = params.cuda_fork_pool_size;
     record.cuda_vram_limit_mib = params.cuda_vram_limit_mib;
     record.docker_socket = params.docker_socket;
+    record.preserve_image_layers = params.preserve_image_layers;
     record.dns_filter_hosts = params.dns_filter_hosts.clone();
     if let Some(policy) = params.credential_policy.as_ref().filter(|p| !p.is_empty()) {
         smolvm::credentials::require_host_sources(policy)?;
@@ -1896,6 +1899,7 @@ fn start_vm_named_with_db(
         ssh_agent_socket,
         cuda: record.cuda,
         expose_docker: record.docker_socket,
+        preserve_image_layers: record.preserve_image_layers,
         published_sockets: record.published_sockets.clone(),
         dns_filter_hosts: record.dns_filter_hosts.clone(),
         credentials: smolvm::credentials::CredentialLaunch::for_record(name, &record),

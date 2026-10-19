@@ -180,6 +180,7 @@ pub fn build_create_params(
                 cuda_fork_pool_size: None,
                 cuda_vram_limit_mib: None,
                 docker_socket: false,
+                preserve_image_layers: false,
                 gpu: false,
                 nested_virt: false,
                 gpu_vram_mib: None,
@@ -448,6 +449,8 @@ pub fn build_create_params(
         cuda_fork_pool_size: fork.pool_size,
         cuda_vram_limit_mib: fork.cuda_vram_limit_mib,
         docker_socket: sf.docker_socket.unwrap_or(false),
+        // A Smolfile has no layering key yet; the CLI flag sets this on top.
+        preserve_image_layers: false,
         gpu,
         gpu_vram_mib: sf.gpu_vram,
         rosetta,

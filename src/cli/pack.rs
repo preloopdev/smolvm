@@ -61,6 +61,9 @@ pub enum PackCmd {
     /// Inspect a .smolmachine artifact in a registry (without downloading)
     Inspect(PackInspectCmd),
 
+    /// List the image layers of a local .smolmachine sidecar, bottom to top
+    Layers(PackLayersCmd),
+
     /// Clean up cached pack extractions to free disk space
     Prune(PackPruneCmd),
 }
@@ -74,8 +77,49 @@ impl PackCmd {
             PackCmd::Pull(cmd) => cmd.run(),
             PackCmd::List(cmd) => cmd.run(),
             PackCmd::Inspect(cmd) => cmd.run(),
+            PackCmd::Layers(cmd) => cmd.run(),
             PackCmd::Prune(cmd) => cmd.run(),
         }
+    }
+}
+
+/// List the layers of a local `.smolmachine` sidecar, bottom to top.
+///
+/// Each layer is printed as its digest (sha256 of the uncompressed layer tar)
+/// and its size. A pack that was exported with `--preserve-layers` lists the
+/// base image's own layers followed by the machine's contract layer, so a
+/// caller can record which digests a golden is made of.
+#[derive(clap::Args, Debug)]
+pub struct PackLayersCmd {
+    /// Path to the .smolmachine sidecar
+    #[arg(value_name = "FILE")]
+    pub file: PathBuf,
+
+    /// Print a JSON object with a `layers` array instead of one line per layer
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl PackLayersCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let manifest = smolvm_pack::packer::read_manifest_from_sidecar(&self.file)
+            .map_err(|e| smolvm::Error::config("read pack layers", e.to_string()))?;
+        if self.json {
+            let layers: Vec<serde_json::Value> = manifest
+                .assets
+                .layers
+                .iter()
+                .map(|layer| serde_json::json!({ "digest": layer.digest, "size": layer.size }))
+                .collect();
+            let text = serde_json::to_string_pretty(&serde_json::json!({ "layers": layers }))
+                .map_err(|e| smolvm::Error::config("read pack layers", e.to_string()))?;
+            println!("{text}");
+        } else {
+            for layer in &manifest.assets.layers {
+                println!("{} {}", layer.digest, layer.size);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -443,6 +487,19 @@ pub struct PackCreateCmd {
     /// Also capture the machine's /workspace, so a machine made from the pack starts with those files. It lives on the storage disk, which packs otherwise never carry.
     #[arg(long = "include-workspace", requires = "from_vm")]
     pub include_workspace: bool,
+
+    /// Keep the machine's image layers as separate layers of the pack, and ship
+    /// the machine's own writes as one new top layer, instead of flattening all
+    /// of it into one. The base layers keep their diff ids, so a rebake that
+    /// changes only the top layer leaves every base layer byte-identical. Needs
+    /// a machine created from a local archive with --preserve-image-layers, or
+    /// from a pack that was itself exported this way.
+    #[arg(
+        long = "preserve-layers",
+        requires = "from_vm",
+        conflicts_with = "rebase_from_image"
+    )]
+    pub preserve_layers: bool,
 
     /// Output file path for the packed binary
     #[arg(short = 'o', long, value_name = "PATH")]
@@ -1140,6 +1197,7 @@ impl PackCreateCmd {
             no_proxy: self.proxy_opts.no_proxy(),
             rebase_from_image: self.rebase_from_image,
             include_workspace: self.include_workspace,
+            preserve_layers: self.preserve_layers,
             dns: smolvm::pack_export::export_dns(self.dns, vm),
         };
         let assets = smolvm::pack_export::collect_from_vm_assets(
@@ -2505,6 +2563,7 @@ mod tests {
             from_vm: None,
             rebase_from_image: false,
             include_workspace: false,
+            preserve_layers: false,
             output: PathBuf::from("test-output"),
             cpus: Some(2),
             mem: Some(1024),

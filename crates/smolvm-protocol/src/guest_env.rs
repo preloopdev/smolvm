@@ -59,6 +59,12 @@ pub const CUDA_EXPANDABLE_SEGMENTS: &str = "SMOLVM_CUDA_EXPANDABLE_SEGMENTS";
 /// This is a boolean sentinel — the value is [`VALUE_ON`] when set.
 pub const ROSETTA: &str = "SMOLVM_ROSETTA";
 
+/// Boolean sentinel the host sets when a machine asked for its local image
+/// archive's layers to be kept apart ([`VALUE_ON`]) instead of flattened into one
+/// rootfs. The guest agent imports the archive one directory per layer, named by
+/// diff id, so the machine's lowerdirs are the image's own layers.
+pub const PRESERVE_IMAGE_LAYERS: &str = "SMOLVM_PRESERVE_IMAGE_LAYERS";
+
 /// Filename of this VM's readiness marker, written by the agent into the virtiofs
 /// rootfs when boot completes. Per VM (so concurrent boots don't race on one
 /// shared file); the host pre-creates and polls the same name. Unset → the agent

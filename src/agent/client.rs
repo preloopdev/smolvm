@@ -35,6 +35,22 @@ fn explain_unsupported_flatten(error: Error) -> Error {
     error
 }
 
+/// The directory-layer counterpart of [`explain_unsupported_flatten`]: an agent
+/// that predates `export_directory_layer` cannot write `--preserve-layers` packs.
+fn explain_unsupported_directory_layer(error: Error) -> Error {
+    if let Error::Agent { reason, .. } = &error {
+        if reason.contains("unknown variant") && reason.contains("export_directory_layer") {
+            return Error::agent(
+                "export directory layer",
+                "the guest agent does not support layer-preserving pack export \
+                 (`--preserve-layers`); install an agent-rootfs from this smolvm release, or \
+                 export flattened",
+            );
+        }
+    }
+    error
+}
+
 /// Metadata applied to an uploaded file after it lands: permissions and
 /// ownership. Ownership matters for non-root workload images — a root-owned
 /// upload is unreadable/unwritable to the user the container actually runs as.
@@ -1958,6 +1974,27 @@ impl AgentClient {
         })?;
         self.receive_stream_to_path(local_path, cap, on_progress, "flatten layers")
             .map_err(explain_unsupported_flatten)
+    }
+
+    /// Stream a guest directory out as an OCI image layer tar into `local_path`.
+    ///
+    /// Unlike [`Self::flatten_layers_to_path`] this does not merge: the directory
+    /// (an overlayfs upper) is written as one layer, with its overlay markers in
+    /// OCI form. An agent that predates the request rejects it as an unknown
+    /// variant, which is reported as version skew rather than a generic failure.
+    pub fn export_directory_layer_to_path<F: FnMut(u64)>(
+        &mut self,
+        source: &str,
+        local_path: &std::path::Path,
+        cap: u64,
+        on_progress: F,
+    ) -> Result<u64> {
+        let _timeout_guard = self.set_extended_read_timeout(flatten_timeout())?;
+        self.send_raw(&AgentRequest::ExportDirectoryLayer {
+            source: source.to_string(),
+        })?;
+        self.receive_stream_to_path(local_path, cap, on_progress, "export directory layer")
+            .map_err(explain_unsupported_directory_layer)
     }
 
     /// Get storage status.

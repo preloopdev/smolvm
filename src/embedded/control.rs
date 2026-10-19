@@ -318,6 +318,12 @@ fn merge_record_launch_features(record: &VmRecord, mut features: LaunchFeatures)
         features
             .allow_image_pull_egress(record.image.as_deref(), record.source_smolmachine.is_some());
     }
+    // The layer-preserving import is a property of how the machine was created,
+    // so every launch of that machine (a start after a stop, a fork clone, a
+    // resume) has to import the same way. A caller that decides explicitly wins.
+    if record.preserve_image_layers {
+        features.preserve_image_layers = true;
+    }
     features
 }
 

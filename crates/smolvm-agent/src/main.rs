@@ -2313,6 +2313,12 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             continue;
         }
 
+        // Handle ExportDirectoryLayer with chunked streaming
+        if let AgentRequest::ExportDirectoryLayer { ref source } = request {
+            handle_streaming_export_directory_layer(stream, source)?;
+            continue;
+        }
+
         // Handle FileRead with chunked streaming (replaces the old
         // single-shot FileData path that capped files at ~16 MiB).
         if let AgentRequest::FileRead {
@@ -2769,7 +2775,9 @@ fn handle_request(
 
         // Streaming read goes through `handle_connection`'s explicit
         // dispatch so it can emit multiple responses per request.
-        AgentRequest::FileRead { .. } | AgentRequest::ArchiveDirectory { .. } => {
+        AgentRequest::FileRead { .. }
+        | AgentRequest::ArchiveDirectory { .. }
+        | AgentRequest::ExportDirectoryLayer { .. } => {
             AgentResponse::error(
                 "streaming read must be handled at connection level",
                 error_codes::INTERNAL_ERROR,
@@ -7314,6 +7322,163 @@ fn handle_streaming_flatten_layers(
                 error_codes::EXPORT_FAILED,
             ),
         ),
+    }
+}
+
+/// Stream one directory out as an OCI image layer tar.
+///
+/// The directory is an overlayfs upper (see
+/// [`AgentRequest::ExportDirectoryLayer`]), so the tar is produced in-process by
+/// the shared layer writer rather than by `tar cf`: the overlayfs markers have
+/// to be translated into OCI `.wh.` entries on the way out, and overlayfs
+/// whiteouts must not be shipped as device nodes.
+///
+/// The writer runs on a worker thread feeding a bounded byte pipe, so a layer
+/// of any size streams straight to the client with backpressure and nothing is
+/// staged on the guest's disk.
+fn handle_streaming_export_directory_layer(
+    stream: &mut impl Write,
+    source: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    info!(source = %source, "exporting directory as an image layer (streamed)");
+
+    let source = std::path::PathBuf::from(source);
+    if !source.is_dir() {
+        send_response(
+            stream,
+            &AgentResponse::error(
+                format!("layer source {} is not a directory", source.display()),
+                error_codes::EXPORT_FAILED,
+            ),
+        )?;
+        return Ok(());
+    }
+
+    let (mut reader, mut writer) = BytePipe::new();
+    let producer = std::thread::spawn(move || {
+        // The pipe write end is dropped when this returns, which is what ends
+        // the stream; an error travels through the pipe so the reader raises it.
+        let result = smolvm_oci_layer::export_layer_tar(&source, &mut writer);
+        if let Err(error) = &result {
+            writer.fail(std::io::Error::new(error.kind(), error.to_string()));
+        }
+        result.map(|stats| {
+            info!(
+                entries = stats.entries,
+                bytes = stats.bytes,
+                whiteouts = stats.whiteouts,
+                opaque_dirs = stats.opaque_dirs,
+                skipped = stats.skipped,
+                "exported directory as an image layer"
+            );
+            stats
+        })
+    });
+
+    let streamed = send_data_chunks(
+        stream,
+        &mut reader,
+        LAYER_CHUNK_SIZE,
+        "failed to read layer archive",
+        error_codes::EXPORT_FAILED,
+    );
+    // The reader end is dropped here so a producer still blocked on a full pipe
+    // does not keep this connection open.
+    drop(reader);
+    let produced = producer.join().unwrap_or_else(|_| {
+        Err(std::io::Error::other("layer export worker panicked"))
+    });
+
+    match (produced, streamed) {
+        // The chunk stream already reported its own failure.
+        (_, Err(error)) => Err(error),
+        // A producer that failed reported through the pipe, so the client saw
+        // the error response instead of the terminating `done` frame and cannot
+        // mistake a partial tar for a complete layer. Reaching here means the
+        // reader was already gone and the report had nowhere to go.
+        (Err(_), Ok(())) => Ok(()),
+        (Ok(_), Ok(())) => Ok(()),
+    }
+}
+
+/// A bounded byte pipe between a producer thread and the vsock stream.
+///
+/// Standard library pipes for this shape are `std::io::pipe`, which needs a
+/// newer toolchain than the workspace pins, and a temp file would stage a
+/// multi-GiB layer on the guest's disk. A small channel of chunks gives the
+/// same backpressure with neither.
+struct BytePipe;
+
+impl BytePipe {
+    fn new() -> (BytePipeReader, BytePipeWriter) {
+        // Eight chunks in flight: enough to keep the writer busy while the
+        // client drains a slow link, small enough that a stalled client cannot
+        // pin memory.
+        let (sender, receiver) = std::sync::mpsc::sync_channel(8);
+        (
+            BytePipeReader {
+                receiver,
+                chunk: Vec::new(),
+                offset: 0,
+            },
+            BytePipeWriter { sender },
+        )
+    }
+}
+
+struct BytePipeWriter {
+    sender: std::sync::mpsc::SyncSender<std::io::Result<Vec<u8>>>,
+}
+
+impl BytePipeWriter {
+    /// Hand the reader the producer's failure, so it stops with the real cause
+    /// instead of a truncated-archive success.
+    fn fail(&mut self, error: std::io::Error) {
+        let _ = self.sender.send(Err(error));
+    }
+}
+
+impl Write for BytePipeWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        self.sender
+            .send(Ok(buf.to_vec()))
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "reader is gone"))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct BytePipeReader {
+    receiver: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    chunk: Vec<u8>,
+    offset: usize,
+}
+
+impl Read for BytePipeReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.offset < self.chunk.len() {
+                let take = (self.chunk.len() - self.offset).min(buf.len());
+                buf[..take].copy_from_slice(&self.chunk[self.offset..self.offset + take]);
+                self.offset += take;
+                return Ok(take);
+            }
+            match self.receiver.recv() {
+                Ok(Ok(chunk)) => {
+                    self.chunk = chunk;
+                    self.offset = 0;
+                }
+                Ok(Err(error)) => return Err(error),
+                // The producer finished and dropped its end.
+                Err(_) => return Ok(0),
+            }
+        }
     }
 }
 

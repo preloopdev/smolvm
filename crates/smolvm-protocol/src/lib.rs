@@ -714,6 +714,24 @@ pub enum AgentRequest {
         layer_index: usize,
     },
 
+    /// Archive ONE directory as an OCI image layer tar.
+    ///
+    /// `pack create --from-vm --preserve-layers` ships the machine's own writes
+    /// as a layer of their own, on top of the image's unchanged layers, and that
+    /// directory is an overlayfs upper. Its deletions are 0:0 character devices
+    /// (or zero-size files carrying `*.overlay.whiteout`), and a directory it
+    /// replaced carries `*.overlay.opaque` — none of which exist in a layer tar.
+    /// The agent walks the tree and writes the OCI representation
+    /// (`.wh.<name>`, `.wh..wh..opq`) on the way out, which `tar cf` cannot do.
+    ///
+    /// Distinct from [`AgentRequest::ExportLayer`], which re-tars one of the
+    /// image's own already-extracted layer directories: those are already in
+    /// layer form, so they need no translation.
+    ExportDirectoryLayer {
+        /// Guest directory whose contents become the layer.
+        source: String,
+    },
+
     /// Merge a stack of directories into a single tar archive.
     ///
     /// `pack create --from-vm` ships the machine's image layers plus whatever the
@@ -1156,6 +1174,7 @@ impl AgentRequest {
             AgentRequest::NetworkTest { .. } => "NetworkTest".into(),
             AgentRequest::Shutdown { .. } => "Shutdown".into(),
             AgentRequest::ExportLayer { .. } => "ExportLayer".into(),
+            AgentRequest::ExportDirectoryLayer { .. } => "ExportDirectoryLayer".into(),
             AgentRequest::FlattenLayers { lowerdirs, .. } => {
                 format!("FlattenLayers {{ count: {} }}", lowerdirs.len())
             }
@@ -1903,6 +1922,20 @@ mod tests {
         let req: AgentRequest = serde_json::from_str(streamed).unwrap();
         match req {
             AgentRequest::FlattenLayers { output, .. } => assert_eq!(output, None),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn export_directory_layer_names_its_source() {
+        // The wire name and field are what an agent built from this protocol
+        // crate reads; a rename here silently breaks the pack export.
+        let request = r#"{"method":"export_directory_layer","source":"/mnt/x/upper"}"#;
+        let req: AgentRequest = serde_json::from_str(request).unwrap();
+        match req {
+            AgentRequest::ExportDirectoryLayer { source } => {
+                assert_eq!(source, "/mnt/x/upper");
+            }
             other => panic!("unexpected: {other:?}"),
         }
     }
