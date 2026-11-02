@@ -946,18 +946,19 @@ fn has_host_unpacked_layers(cache_dir: &Path, streamed: Option<&Path>) -> bool {
 
 /// Whether this host unpacks a pack's layer members as they stream past.
 ///
-/// On by default on Linux only. Two other platforms have a reason to stay off
-/// until they are checked, and both can be forced on with
-/// `SMOLVM_STREAM_LAYERS=on`:
+/// On by default on Linux and macOS. Windows streams through
+/// alternate-data-stream xattrs, which this tree has not been run against end
+/// to end, so it stays opt-in there with `SMOLVM_STREAM_LAYERS=on`.
 ///
-/// - macOS keeps the trees in a case-sensitive volume at
-///   `cache_dir/layers-cs` ([`extraction_layers_dir`]), a different filesystem
-///   from the entry's `layers/`. `pack export --from-vm` stages a machine's
-///   layers out of `layers/` (`ordered_cached_layer_ids`) and cannot see a
-///   streamed entry's trees there, so streaming would break re-export of the
-///   golden flow. Stock macOS keeps the staged tars, so it does not.
-/// - Windows streams through alternate-data-stream xattrs, which this tree has
-///   not been run against.
+/// macOS used to keep this off because the trees live in a case-sensitive
+/// volume at `cache_dir/layers-cs` ([`extraction_layers_dir`]), a different
+/// filesystem from the entry's `layers/`, and the readers that look for a
+/// machine's cached layers (`ordered_cached_layer_ids`, the cache-healing
+/// check) only knew about staged tars there. Those readers now follow the
+/// extraction's recorded order and the store the trees were installed into,
+/// so a streamed macOS entry is exportable and healable like a staged one.
+/// The volume is still mounted before the first streamed byte, since a
+/// streamed tree can only land in it.
 ///
 /// `SMOLVM_STREAM_LAYERS=off` disables it anywhere, which is what a caller
 /// wanting the staged-tar layout sets.
@@ -965,7 +966,7 @@ fn stream_layers_enabled() -> bool {
     match std::env::var("SMOLVM_STREAM_LAYERS").ok().as_deref() {
         Some("off") => false,
         Some("on") => true,
-        _ => cfg!(target_os = "linux"),
+        _ => cfg!(any(target_os = "linux", target_os = "macos")),
     }
 }
 

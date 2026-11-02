@@ -23,11 +23,13 @@ use smolvm_pack::format::PackManifest;
 use smolvm_pack::{read_footer_from_sidecar, sidecar_path_for, Packer};
 
 /// A host whose libkrun serves the override xattr (cpane's does: `krun_add_virtiofs4`
-/// is in the bundled libkrun.so), and — on macOS, where the path is off by
-/// default — an explicit opt-in to the streaming unpack.
+/// is in the bundled libkrun.so).
+///
+/// Only the probe is forced: streaming runs by default on Linux and macOS, so
+/// the suite exercises that default rather than an opt-in. `stream_layers_off`
+/// is the binary that pins the `SMOLVM_STREAM_LAYERS=off` escape hatch.
 fn host_that_streams_layers() {
     smolvm_pack::extract::set_host_layers_probe(|| true);
-    std::env::set_var("SMOLVM_STREAM_LAYERS", "on");
 }
 
 /// A directory on a filesystem that stores user xattrs: the streaming path
