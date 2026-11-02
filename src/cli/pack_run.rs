@@ -31,6 +31,23 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// The node's digest-keyed layer store an ephemeral pack extraction references.
+///
+/// macOS always has one (`agent::layer_store_root()`); Linux's is the shared
+/// pack root, and a `pack run` references it too: a split artifact's base pack
+/// carries its layers only by name, so without the store the entry boots with
+/// an empty `layers/` and the guest fails with "no image layers are present in
+/// /packed_layers". Windows has no store to reference.
+fn boot_layer_store() -> Option<PathBuf> {
+    if cfg!(target_os = "macos") {
+        Some(smolvm::agent::layer_store_root())
+    } else if smolvm_pack::extract::shared_layer_store_enabled() {
+        Some(smolvm::agent::shared_pack_cache_root())
+    } else {
+        None
+    }
+}
+
 /// Default timeout waiting for the agent to become ready.
 ///
 /// A packed VM assembles its container rootfs *inside the guest* on first boot
@@ -568,11 +585,12 @@ impl PackRunCmd {
         let cache_dir = extract::get_cache_dir(footer.checksum)
             .map_err(|e| Error::agent("get cache dir", e.to_string()))?;
 
-        // macOS shares image layers through the node's digest-keyed store: a
-        // pack that carries a layer another pack already installed references
-        // it (an APFS clone) instead of unpacking it again. Linux's shared
-        // store covers that fleet; Windows has no store to reference.
-        let store = cfg!(target_os = "macos").then(smolvm::agent::layer_store_root);
+        // Share image layers through the node's digest-keyed store: a pack
+        // that carries a layer another pack already installed references it
+        // (APFS clones on macOS, hard links on Linux) instead of unpacking it
+        // again, and a split artifact's base pack can only boot by naming the
+        // store its pull installed into.
+        let store = boot_layer_store();
         match store.as_deref() {
             Some(store) => extract::extract_sidecar_for_agent_with_store(
                 &sidecar_path,
@@ -2241,9 +2259,9 @@ fn ensure_extracted(mode: &PackedMode, force: bool, debug: bool) -> smolvm::Resu
                 footer,
                 ..
             } => {
-                // Same store as the agent path above: on macOS the layers are
-                // installed once per node and each cache references them.
-                let store = cfg!(target_os = "macos").then(smolvm::agent::layer_store_root);
+                // Same store as the agent path above: the layers are installed
+                // once per node and each cache references them.
+                let store = boot_layer_store();
                 match store.as_deref() {
                     Some(store) => extract::extract_sidecar_with_store(
                         sidecar_path,

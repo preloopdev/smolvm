@@ -287,9 +287,17 @@ pub async fn resolve_pack_ref(
     tracing::info!(image = %image, "reference is a smolmachine pack; pulling sidecar on the host");
     let cache = smolvm_registry::BlobCache::open_default()
         .map_err(|e| Error::agent("open blob cache", e.to_string()))?;
-    let result = smolvm_registry::pull(&client, &repo, reference, None, &cache, blob_peers)
-        .await
-        .map_err(|e| Error::agent("pull smolmachine artifact", e.to_string()))?;
+    let result = smolvm_registry::pull(
+        &client,
+        &repo,
+        reference,
+        None,
+        &cache,
+        blob_peers,
+        &crate::cli::pack::layer_store(None),
+    )
+    .await
+    .map_err(|e| Error::agent("pull smolmachine artifact", e.to_string()))?;
     Ok(Some(result.path))
 }
 

@@ -3630,6 +3630,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "smolvm-pack",
+ "tar",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",

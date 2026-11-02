@@ -602,6 +602,55 @@ mod packs {
             }
         }
     }
+    /// A split artifact's base pack names its layers but carries no layer
+    /// members: `pack pull` installed them into the shared store. Extracting
+    /// that base with the store named must link those trees into the entry, or
+    /// the machine boots with an empty `layers/` and fails in the guest.
+    #[test]
+    fn a_base_pack_with_named_layers_takes_them_from_the_shared_store() {
+        use smolvm_pack::extract::extract_sidecar_with_store;
+        use smolvm_pack::split::{split_pack, SplitCache};
+
+        let tmp = scratch("layer-store-split-");
+        let shared_root = tmp.path().join("_shared");
+        let layer = layer_tar(&[("etc/split.conf", b"split layer")]);
+        let id = layer_id(&layer);
+        let sidecar = build_sidecar(&tmp.path().join("pack"), &[&layer]);
+
+        // What `pack push` publishes: a base pack with the layer only named.
+        let split = split_pack(&sidecar, &SplitCache::new(tmp.path().join("split-cache"))).unwrap();
+        assert_eq!(split.layers.len(), 1);
+        assert_eq!(split.layers[0].diff_id.trim_start_matches("sha256:"), id);
+
+        // What `pack pull` does: install the layer into the store.
+        let blob = zstd::stream::encode_all(&layer[..], 3).unwrap();
+        install_layer_from_stream(&shared_root, &split.layers[0].diff_id, &blob[..]).unwrap();
+
+        // What `machine run --from <pulled>.smolmachine` does: extract the base
+        // pack, naming the store the pull installed into.
+        let entry = tmp.path().join("entry");
+        let footer = read_footer_from_sidecar(&split.base_path).unwrap();
+        extract_sidecar_with_store(
+            &split.base_path,
+            &entry,
+            &footer,
+            false,
+            false,
+            &shared_root,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(entry.join("layers").join(&id).join("etc/split.conf")).unwrap(),
+            b"split layer",
+            "the base pack's named layer must be linked from the store"
+        );
+        let record = fs::read_to_string(entry.join("layers").join(STREAMED_LAYERS_FILE)).unwrap();
+        assert!(
+            record.lines().any(|line| line == id),
+            "the entry must name the layer it took from the store: {record:?}"
+        );
+    }
 }
 
 /// macOS: the store lives in a case-sensitive APFS volume that cannot share
