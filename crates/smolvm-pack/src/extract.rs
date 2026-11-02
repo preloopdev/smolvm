@@ -5758,7 +5758,7 @@ pub unsafe fn extract_from_section(
 
     // Mach-O section self-exec stub: same as embedded mode — name-sort fallback,
     // and likewise self-consistent on staging.
-    post_process_extraction(cache_dir, &[], true, debug, false, None)?;
+    post_process_extraction(cache_dir, &[], true, debug, false, None, None)?;
     Ok(())
 }
 
@@ -7648,6 +7648,8 @@ mod tests {
                 "owner_xattr={owner_xattr}"
             );
         }
+    }
+
     /// A store id becomes a path component, so only a real digest may through:
     /// anything else — a traversal, a separator, an absolute path — is refused
     /// rather than joined onto the store root.

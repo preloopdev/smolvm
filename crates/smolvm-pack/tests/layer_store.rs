@@ -13,12 +13,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
-#[cfg(target_os = "linux")]
-use smolvm_pack::extract::{collect_layer_store_with, force_detach_layers_volume};
 use smolvm_pack::extract::{
     collect_layer_store, install_layer_from_stream, layer_present, shared_layers_dir,
     PARTIAL_DIR_SUFFIX, STREAMED_LAYERS_FILE,
 };
+#[cfg(target_os = "linux")]
+use smolvm_pack::extract::{collect_layer_store_with, force_detach_layers_volume};
 
 /// The staging name a layer is unpacked under before it takes its own.
 fn staging_dir(layer_dir: &Path) -> PathBuf {

@@ -1740,20 +1740,21 @@ impl PackPruneCmd {
         #[cfg(target_os = "linux")]
         {
             let root = crate::agent::shared_pack_cache_root();
-            let report = match smolvm_pack::extract::collect_layer_store_with(
-                &root,
-                false,
-                self.dry_run,
-            ) {
-                Ok(report) => report,
-                Err(error) => {
-                    return Err(smolvm::Error::agent(
-                        "prune shared layers",
-                        error.to_string(),
-                    ))
-                }
+            let report =
+                match smolvm_pack::extract::collect_layer_store_with(&root, false, self.dry_run) {
+                    Ok(report) => report,
+                    Err(error) => {
+                        return Err(smolvm::Error::agent(
+                            "prune shared layers",
+                            error.to_string(),
+                        ))
+                    }
+                };
+            let verb = if self.dry_run {
+                "Would remove"
+            } else {
+                "Removed"
             };
-            let verb = if self.dry_run { "Would remove" } else { "Removed" };
             println!(
                 "{verb} {} shared layer(s), reclaimed {}",
                 report.layers_removed,

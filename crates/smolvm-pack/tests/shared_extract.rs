@@ -94,7 +94,9 @@ fn file_map(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
                 // sparse disk image; its on-disk bytes are metadata, not image
                 // content, and two extractions of the same pack write different
                 // images. Everything the layer trees hold is compared below.
-                if p.extension().is_some_and(|extension| extension == "sparseimage") {
+                if p.extension()
+                    .is_some_and(|extension| extension == "sparseimage")
+                {
                     continue;
                 }
                 let rel = p.strip_prefix(root).unwrap().to_string_lossy().to_string();
