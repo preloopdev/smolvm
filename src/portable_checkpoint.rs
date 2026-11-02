@@ -3701,8 +3701,17 @@ pub fn materialize_pack_layers_with_options(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(Error::agent("clear packed layers cache", error.to_string())),
     }
-    smolvm_pack::extract::extract_sidecar_for_machine(sidecar, &cache_dir, &footer)
-        .map_err(|error| Error::agent("extract sidecar", error.to_string()))
+    // macOS references the node's digest-keyed layer store, so a pack whose
+    // layers another pack already carries costs clones instead of a fresh
+    // unpack. Linux's shared store covers that fleet; Windows has none.
+    let store = cfg!(target_os = "macos").then(crate::agent::layer_store_root);
+    smolvm_pack::extract::extract_sidecar_for_machine_with_store(
+        sidecar,
+        &cache_dir,
+        &footer,
+        store.as_deref(),
+    )
+    .map_err(|error| Error::agent("extract sidecar", error.to_string()))
 }
 
 /// After a checkpoint is installed, mount the pack its image layers came from,

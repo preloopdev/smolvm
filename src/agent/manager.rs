@@ -417,6 +417,18 @@ pub fn shared_pack_cache_root() -> PathBuf {
     vm_cache_root().join("_shared")
 }
 
+/// Node-level digest-keyed layer store: `<vm_cache_root>/_layers`.
+///
+/// Packs extracted on this node stream their image layers here once, and each
+/// machine (or `pack run` cache) references them instead of unpacking a private
+/// copy: hard links where the entry and the store share a filesystem (Linux),
+/// APFS clones where the store lives in its own case-sensitive volume (macOS).
+/// The leading `_` keeps it out of the sweep that reaps data directories no
+/// machine owns, exactly like `_shared` and `_pack-templates`.
+pub fn layer_store_root() -> PathBuf {
+    vm_cache_root().join("_layers")
+}
+
 /// Actual host disk consumed by a machine's data dir, in MiB. Sums *real blocks*
 /// (`st_blocks × 512`), not apparent file lengths — the disk images are sparse, so
 /// a 20 GiB image that the guest has barely written to consumes only a few MiB.

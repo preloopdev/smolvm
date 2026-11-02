@@ -551,13 +551,28 @@ impl LaunchFeatures {
             }
             let footer = smolvm_pack::packer::read_footer_from_sidecar(sidecar)
                 .map_err(|e| Error::agent("read sidecar footer", e.to_string()))?;
-            smolvm_pack::extract::extract_sidecar(
-                sidecar,
-                layers_cache_dir,
-                &footer,
-                marker_present,
-                false,
-            )
+            // macOS references the node's digest-keyed layer store, so a pack
+            // whose layers another pack already carries costs clones instead of
+            // a fresh unpack. Linux's shared store owns that fleet; Windows has
+            // no store to reference.
+            let store = cfg!(target_os = "macos").then(crate::agent::layer_store_root);
+            match store.as_deref() {
+                Some(store) => smolvm_pack::extract::extract_sidecar_with_store(
+                    sidecar,
+                    layers_cache_dir,
+                    &footer,
+                    marker_present,
+                    false,
+                    store,
+                ),
+                None => smolvm_pack::extract::extract_sidecar(
+                    sidecar,
+                    layers_cache_dir,
+                    &footer,
+                    marker_present,
+                    false,
+                ),
+            }
             .map_err(|e| Error::agent("extract sidecar", e.to_string()))?;
         }
 
