@@ -870,7 +870,25 @@ struct SafeUnpackLimits {
     /// written out for a later unpack step. `None` — the default, and what
     /// every caller but [`extract_sidecar_inner`] passes — keeps the staged-tar
     /// path byte for byte. See [`stream_layer_member`].
-    stream_layers: Option<PathBuf>,
+    stream_layers: Option<StreamLayers>,
+}
+
+/// Which directory a streaming extraction installs a pack's layer trees in,
+/// and how it owns them.
+///
+/// Both modes describe the same trees the staged-tar unpack would produce: the
+/// override one chowns each entry to 0:0 and records the archived owner in
+/// `user.containers.override_stat`, the faithful one restores the archived
+/// uid/gid on disk. Streaming only ever runs when *this* host unpacks the
+/// layers, so it has to reproduce whichever of the two that host would have
+/// done, not pick one.
+#[derive(Clone, Debug)]
+struct StreamLayers {
+    /// The host layer directory — on macOS the mounted case-sensitive volume.
+    store: PathBuf,
+    /// Whether ownership is described to the guest through
+    /// [`OVERRIDE_STAT_XATTR`] rather than restored numerically.
+    owner_xattr: bool,
 }
 
 impl SafeUnpackLimits {
@@ -884,12 +902,13 @@ impl SafeUnpackLimits {
     }
 
     /// [`Self`] with the layer tars unpacked into `store` as the assets
-    /// stream past. `store` must be resolved by the caller *before* the
-    /// archive is opened — on macOS it is the mounted case-sensitive volume
-    /// ([`extraction_layers_dir`]), which a streamed tree must land in rather
-    /// than on the case-insensitive volume the cache directory usually sits on.
-    fn streaming_layers(mut self, store: PathBuf) -> Self {
-        self.stream_layers = Some(store);
+    /// stream past, owned the way `owner_xattr` describes. `store` must be
+    /// resolved by the caller *before* the archive is opened — on macOS it is
+    /// the mounted case-sensitive volume ([`extraction_layers_dir`]), which a
+    /// streamed tree must land in rather than on the case-insensitive volume
+    /// the cache directory usually sits on.
+    fn streaming_layers(mut self, store: PathBuf, owner_xattr: bool) -> Self {
+        self.stream_layers = Some(StreamLayers { store, owner_xattr });
         self
     }
 
@@ -1034,6 +1053,7 @@ fn stream_layer_member<R: Read>(
     entry: &mut R,
     dest: &Path,
     store: &Path,
+    owner_xattr: bool,
     id: &str,
     limits: &SafeUnpackLimits,
     debug: bool,
@@ -1072,9 +1092,11 @@ fn stream_layer_member<R: Read>(
         let reader: Box<dyn Read + '_> = Box::new(&mut hashing);
         let mut archive = tar::Archive::new(reader);
         // The archived owner and mode are the layer's own, and this host is
-        // the one unpacking it (streaming is only enabled then), so the
-        // override xattr describes them exactly as the staged unpack did.
-        safe_unpack_with_policy(&mut archive, &staging, &nested_limits, false, true)
+        // the one unpacking it (streaming is only enabled then), so the tree
+        // is owned exactly as the staged-tar unpack would have owned it:
+        // through the override xattr on the path that describes ownership to
+        // the guest, numerically on a root host that restores it.
+        safe_unpack_with_policy(&mut archive, &staging, &nested_limits, false, owner_xattr)
             .map(|_report| ())
     };
     // Whatever the nested archive did not read belongs to this member too, and
@@ -1653,10 +1675,18 @@ fn safe_unpack_skipping<R: Read>(
         // is the *mounted* case-sensitive volume: a streamed tree can never be
         // written through the case-insensitive path that would silently drop
         // paths differing only in case.
-        if let Some(store) = limits.stream_layers.as_deref() {
+        if let Some(stream) = limits.stream_layers.as_ref() {
             if !required_here && entry_type == tar::EntryType::Regular {
                 if let Some(id) = layer_member_id(&entry_path) {
-                    stream_layer_member(&mut entry, dest, store, &id, limits, false)?;
+                    stream_layer_member(
+                        &mut entry,
+                        dest,
+                        &stream.store,
+                        stream.owner_xattr,
+                        &id,
+                        limits,
+                        false,
+                    )?;
                     report.entries += 1;
                     continue;
                 }
@@ -4610,27 +4640,33 @@ mod resume_extract_tests {
 /// the volume from the tars it just wrote and preflights them before unpacking;
 /// streamed, neither exists, so the manifest's layer sizes — the same
 /// uncompressed bytes the tars would hold — stand in for them.
+///
+/// Both host-unpack modes stream (see [`stream_layers_mode`]); only the
+/// guest-unpack fallback keeps its tars, because the guest is the one that
+/// needs them.
 fn stream_layers_store(
     cache_dir: &Path,
     manifest: Option<&crate::format::PackManifest>,
     agent_version: Option<&str>,
     debug: bool,
-) -> std::io::Result<Option<PathBuf>> {
-    if !stream_layers_enabled() {
-        return Ok(None);
-    }
+) -> std::io::Result<Option<StreamLayers>> {
     let Some(manifest) = manifest else {
         return Ok(None);
     };
     if manifest.assets.layers.is_empty() {
         return Ok(None);
     }
-    if !host_unpacks_layers(
+    let host_unpacks = host_unpacks_layers(
         agent_version.or(Some(manifest.smolvm_version.as_str())),
         cache_dir,
-    ) {
+    );
+    let Some(owner_xattr) = stream_layers_mode(
+        stream_layers_enabled(),
+        host_unpacks,
+        host_unpack_preserves_ownership(),
+    ) else {
         return Ok(None);
-    }
+    };
     // Every layer, so the volume is created large enough for the whole image;
     // only the ones not already in the store cost room and speed.
     let total: u64 = manifest.assets.layers.iter().map(|layer| layer.size).sum();
@@ -4661,7 +4697,32 @@ fn stream_layers_store(
             }
         );
     }
-    Ok(Some(store))
+    Ok(Some(StreamLayers { store, owner_xattr }))
+}
+
+/// Which ownership the streamed layer trees must be given, when this host is
+/// the one unpacking them at all.
+///
+/// `None` means this host is not the one that unpacks the layers: the tars are
+/// staged and the guest installs them, so streaming them instead would leave
+/// the guest with nothing to unpack. `Some(true)` is the override-xattr host
+/// (uid drop active, pack agent new enough, server honors the xattr);
+/// `Some(false)` is a root host that restores the archive's owners itself,
+/// which used to write and re-read every tar for no reason — streaming is just
+/// as faithful there, as long as the streamed trees are chowned like
+/// [`materialize_tar_dir`] would chown them.
+fn stream_layers_mode(
+    streaming_enabled: bool,
+    host_unpacks: bool,
+    preserves_ownership: bool,
+) -> Option<bool> {
+    if !streaming_enabled {
+        return None;
+    }
+    if host_unpacks {
+        return Some(true);
+    }
+    preserves_ownership.then_some(false)
 }
 
 /// Whether an error is a streamed layer whose bytes do not hash to its name.
@@ -4674,14 +4735,14 @@ fn is_layer_digest_mismatch(error: &std::io::Error) -> bool {
 const LAYER_DIGEST_MISMATCH: &str = "layer digest mismatch";
 
 /// Unpack a pack's assets from `sidecar_file`, streaming its layer members into
-/// `streamed_layers_dir` when given. Opens nothing itself, so the caller can
+/// `streamed_layers`' store when given. Opens nothing itself, so the caller can
 /// rewind by opening a fresh reader.
 fn unpack_pack_assets(
     sidecar_file: &mut ExtractDigestReader,
     cache_dir: &Path,
     footer: &PackFooter,
     manifest: Option<&crate::format::PackManifest>,
-    streamed_layers_dir: Option<&Path>,
+    streamed_layers: Option<&StreamLayers>,
 ) -> std::io::Result<()> {
     let limited_reader = (&mut *sidecar_file).take(footer.assets_size);
     let decoder = zstd::stream::Decoder::new(limited_reader)
@@ -4691,8 +4752,10 @@ fn unpack_pack_assets(
     // possible: the tars are never written then, so a decision read off the
     // extracted tree afterwards (`has_layer_tars`) would say "stage for the
     // guest" about a tree this host already unpacked.
-    let limits = match streamed_layers_dir {
-        Some(store) => SafeUnpackLimits::from_env().streaming_layers(store.to_path_buf()),
+    let limits = match streamed_layers {
+        Some(stream) => {
+            SafeUnpackLimits::from_env().streaming_layers(stream.store.clone(), stream.owner_xattr)
+        }
         None => SafeUnpackLimits::from_env(),
     };
     safe_unpack_with_policy(
@@ -4730,7 +4793,7 @@ fn extract_sidecar_inner(
     // [`stream_layers_store`]. The store is resolved (and the case-sensitive
     // volume mounted, on macOS) *before* the archive is opened, so no streamed
     // byte can ever be written through the wrong path.
-    let mut streamed_layers_dir =
+    let mut streamed_layers =
         stream_layers_store(cache_dir, manifest.as_ref(), agent_version, debug)?;
     let mut sidecar_file = ExtractDigestReader::open(sidecar_path, digest_out.is_some())?;
     let unpacked = unpack_pack_assets(
@@ -4738,10 +4801,10 @@ fn extract_sidecar_inner(
         cache_dir,
         footer,
         manifest.as_ref(),
-        streamed_layers_dir.as_deref(),
+        streamed_layers.as_ref(),
     );
     if let Err(error) = &unpacked {
-        if streamed_layers_dir.is_some() && is_layer_digest_mismatch(error) {
+        if streamed_layers.is_some() && is_layer_digest_mismatch(error) {
             // A layer whose bytes are not the digest its name claims: the name
             // is not a content address for this pack (a single-layer export
             // re-creates its tar, so its bytes need not hash to the image's
@@ -4758,7 +4821,7 @@ fn extract_sidecar_inner(
             // every in-place re-extraction); the retry rewrites what the
             // streamed attempt wrote, and that attempt removed its own partial
             // layer trees when it failed.
-            streamed_layers_dir = None;
+            streamed_layers = None;
             sidecar_file = ExtractDigestReader::open(sidecar_path, digest_out.is_some())?;
             unpack_pack_assets(
                 &mut sidecar_file,
@@ -4797,7 +4860,12 @@ fn extract_sidecar_inner(
     let pack_version =
         agent_version.or_else(|| manifest.as_ref().map(|m| m.smolvm_version.as_str()));
     let host_layers = (has_layer_tars(cache_dir)
-        || has_host_unpacked_layers(cache_dir, streamed_layers_dir.as_deref()))
+        || has_host_unpacked_layers(
+            cache_dir,
+            streamed_layers
+                .as_ref()
+                .map(|stream| stream.store.as_path()),
+        ))
         && host_unpacks_layers(pack_version, cache_dir);
     let guest_unpacks_layers =
         !host_layers && pack_version.is_some_and(packed_agent_unpacks_staged_layers);
@@ -4833,7 +4901,9 @@ fn extract_sidecar_inner(
         guest_unpacks_layers,
         debug,
         host_layers,
-        streamed_layers_dir.as_deref(),
+        streamed_layers
+            .as_ref()
+            .map(|stream| stream.store.as_path()),
     )?;
     if let Some(slot) = digest_out {
         *slot = sidecar_file.finish()?;
@@ -6691,6 +6761,86 @@ mod tests {
                 super::layer_member_id(TestPath::new(&path)).as_deref(),
                 expected,
                 "for {path}"
+            );
+        }
+    }
+
+    /// Streaming must engage for both host-unpack modes — the override-xattr
+    /// path and a root host that restores the archive's owners itself — and
+    /// only for them: the guest-unpack fallback needs its tars, so it must not
+    /// be streamed.
+    #[test]
+    fn only_a_host_that_unpacks_layers_itself_streams_them() {
+        // (streaming enabled, host unpacks, restores owners) -> owner_xattr
+        assert_eq!(super::stream_layers_mode(true, true, false), Some(true));
+        assert_eq!(super::stream_layers_mode(true, false, true), Some(false));
+        // Neither host-unpack mode: the guest installs the tars.
+        assert_eq!(super::stream_layers_mode(true, false, false), None);
+        // Disabled outright (macOS by default, `SMOLVM_STREAM_LAYERS=off`).
+        assert_eq!(super::stream_layers_mode(false, true, true), None);
+        assert_eq!(super::stream_layers_mode(false, false, true), None);
+    }
+
+    /// A streamed layer has to be owned the way the staged-tar unpack would
+    /// have owned it: the override xattr on the host that describes ownership
+    /// to the guest, and plain numeric owners on a root host that restores
+    /// them. The chown itself needs root (an unprivileged run cannot observe
+    /// it), but the representation is observable at any privilege.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_streamed_layer_carries_the_ownership_its_host_would_have_restored() {
+        let root = tempfile::tempdir().unwrap();
+        if !user_xattrs_supported(root.path()) {
+            return;
+        }
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(0o644);
+        header.set_uid(4242);
+        header.set_gid(4343);
+        header.set_size(4);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "etc/owned", &b"data"[..])
+            .unwrap();
+        let blob = builder.into_inner().unwrap();
+        let id = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(&blob);
+            format!("{:x}", hasher.finalize())
+        };
+
+        for (owner_xattr, expected) in [(false, None), (true, Some("4242:4343:0644".to_string()))] {
+            let dest = root.path().join(format!("entry-{owner_xattr}"));
+            fs::create_dir_all(&dest).unwrap();
+            let store = root.path().join(format!("layers-{owner_xattr}"));
+            fs::create_dir_all(&store).unwrap();
+            let limits =
+                super::SafeUnpackLimits::from_env().streaming_layers(store.clone(), owner_xattr);
+            super::stream_layer_member(
+                &mut &blob[..],
+                &dest,
+                &store,
+                owner_xattr,
+                &id,
+                &limits,
+                false,
+            )
+            .unwrap();
+
+            let file = store.join(&id).join("etc/owned");
+            assert!(file.is_file(), "owner_xattr={owner_xattr}");
+            assert_eq!(
+                fs::read(&file).unwrap(),
+                b"data",
+                "owner_xattr={owner_xattr}"
+            );
+            assert_eq!(
+                read_user_xattr(&file, super::OVERRIDE_STAT_XATTR),
+                expected,
+                "owner_xattr={owner_xattr}"
             );
         }
     }
