@@ -568,14 +568,30 @@ impl PackRunCmd {
         let cache_dir = extract::get_cache_dir(footer.checksum)
             .map_err(|e| Error::agent("get cache dir", e.to_string()))?;
 
-        extract::extract_sidecar_for_agent(
-            &sidecar_path,
-            &cache_dir,
-            &footer,
-            self.force_extract,
-            self.debug,
-            self.local_bake.then_some(smolvm::VERSION),
-        )
+        // macOS shares image layers through the node's digest-keyed store: a
+        // pack that carries a layer another pack already installed references
+        // it (an APFS clone) instead of unpacking it again. Linux's shared
+        // store covers that fleet; Windows has no store to reference.
+        let store = cfg!(target_os = "macos").then(smolvm::agent::layer_store_root);
+        match store.as_deref() {
+            Some(store) => extract::extract_sidecar_for_agent_with_store(
+                &sidecar_path,
+                &cache_dir,
+                &footer,
+                self.force_extract,
+                self.debug,
+                self.local_bake.then_some(smolvm::VERSION),
+                store,
+            ),
+            None => extract::extract_sidecar_for_agent(
+                &sidecar_path,
+                &cache_dir,
+                &footer,
+                self.force_extract,
+                self.debug,
+                self.local_bake.then_some(smolvm::VERSION),
+            ),
+        }
         .map_err(|e| Error::agent("extract assets", e.to_string()))?;
 
         // 7. Set up paths — use a unique runtime directory per invocation so
@@ -2223,8 +2239,23 @@ fn ensure_extracted(mode: &PackedMode, force: bool, debug: bool) -> smolvm::Resu
                 footer,
                 ..
             } => {
-                extract::extract_sidecar(sidecar_path, &cache_dir, footer, force, debug)
-                    .map_err(|e| Error::agent("extract sidecar assets", e.to_string()))?;
+                // Same store as the agent path above: on macOS the layers are
+                // installed once per node and each cache references them.
+                let store = cfg!(target_os = "macos").then(smolvm::agent::layer_store_root);
+                match store.as_deref() {
+                    Some(store) => extract::extract_sidecar_with_store(
+                        sidecar_path,
+                        &cache_dir,
+                        footer,
+                        force,
+                        debug,
+                        store,
+                    ),
+                    None => {
+                        extract::extract_sidecar(sidecar_path, &cache_dir, footer, force, debug)
+                    }
+                }
+                .map_err(|e| Error::agent("extract sidecar assets", e.to_string()))?;
             }
         }
     }

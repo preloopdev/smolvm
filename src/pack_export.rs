@@ -1308,7 +1308,16 @@ fn export_flattened_from_artifact_sourced(
     let layers_lease = smolvm_pack::extract::acquire_layers_lease(&pack_content_dir, false)
         .map_err(|error| Error::agent("lease export layers", error.to_string()))?;
     let store = layers_lease.path.clone();
-    let mut layer_ids = ordered_cached_layer_ids(&pack_content_dir, &store);
+    // The helper mounts one host directory as `/packed_layers`, so layer ids are
+    // relative to it. Normally that is the pack content dir; a store-backed
+    // macOS entry's trees are inside the node's store volume instead, and then
+    // the entry's own directory there is what gets mounted.
+    let mut layers_root = if store.starts_with(&pack_content_dir) {
+        pack_content_dir.clone()
+    } else {
+        store.clone()
+    };
+    let mut layer_ids = ordered_cached_layer_ids(&pack_content_dir, &store, &layers_root);
     // Self-heal a missing or damaged layer cache from the machine's source
     // artifact (a cache cleaner can delete the layer files while leaving the
     // extraction marker, in which case a start does NOT re-extract either —
@@ -1319,9 +1328,29 @@ fn export_flattened_from_artifact_sourced(
             eprintln!("Imported layer cache is missing; re-extracting from the source artifact...");
             let footer = smolvm_pack::packer::read_footer_from_sidecar(sidecar)
                 .map_err(|e| Error::agent("read sidecar footer", e.to_string()))?;
-            smolvm_pack::extract::extract_sidecar(sidecar, &cache_dir, &footer, true, false)
-                .map_err(|e| Error::agent("re-extract source artifact", e.to_string()))?;
-            layer_ids = ordered_cached_layer_ids(&pack_content_dir, &store);
+            // The re-extraction uses the same store a create would (macOS), so
+            // the repaired entry lands where a boot would look for it.
+            let store = cfg!(target_os = "macos").then(crate::agent::layer_store_root);
+            match store.as_deref() {
+                Some(store) => smolvm_pack::extract::extract_sidecar_with_store(
+                    sidecar, &cache_dir, &footer, true, false, store,
+                ),
+                None => {
+                    smolvm_pack::extract::extract_sidecar(sidecar, &cache_dir, &footer, true, false)
+                }
+            }
+            .map_err(|e| Error::agent("re-extract source artifact", e.to_string()))?;
+            // The repair may have changed where the trees live (a store-backed
+            // entry versus the entry's own volume), so lease and look again.
+            let repaired = smolvm_pack::extract::acquire_layers_lease(&pack_content_dir, false)
+                .map_err(|error| Error::agent("lease export layers", error.to_string()))?;
+            let repaired_store = repaired.path.clone();
+            layers_root = if repaired_store.starts_with(&pack_content_dir) {
+                pack_content_dir.clone()
+            } else {
+                repaired_store.clone()
+            };
+            layer_ids = ordered_cached_layer_ids(&pack_content_dir, &repaired_store, &layers_root);
         }
     }
     let layer_ids = layer_ids.ok_or_else(|| {
@@ -1340,7 +1369,7 @@ fn export_flattened_from_artifact_sourced(
     })?;
 
     // No network, as above: the layers are staged from the host's own pack dir.
-    let export_vm = ExportVm::start(vm_name, vm_dir, Some(pack_content_dir.clone()), false, None)?;
+    let export_vm = ExportVm::start(vm_name, vm_dir, Some(layers_root.clone()), false, None)?;
     let mut client = export_vm.connect()?;
     export_vm.mount_source_storage(&mut client)?;
 
@@ -1393,36 +1422,57 @@ fn export_flattened_from_artifact_sourced(
 }
 
 /// The cached layers of an imported pack, bottom -> top, as paths relative to
-/// the pack content dir — the directory the export helper mounts as
-/// `/packed_layers`.
+/// `layers_root` — the directory the export helper mounts as `/packed_layers`.
 ///
 /// A layer is a staged tar (`layers/<id>.tar`, hosts that leave extraction to
 /// the guest), an extracted dir in the entry itself (`layers/<id>`), or a tree
 /// in this host's layer store (`store/<id>`; on macOS the store is the
-/// case-sensitive volume at `layers-cs/`, mounted by the caller). All three are
-/// written by the artifact import, so all three must be exportable: a
-/// streaming extraction writes only the last one.
+/// case-sensitive volume at `layers-cs/`). All three are written by the
+/// artifact import, so all three must be exportable: a streaming extraction
+/// writes only the last one.
+///
+/// `layers_root` is normally the pack content dir, which reaches the entry's
+/// `layers/` and, on macOS without a digest-keyed store, its `layers-cs/`
+/// volume. A store-backed macOS entry keeps its trees inside the node's store
+/// volume instead, which is not under the content dir — there the caller mounts
+/// the entry's directory in the store as `/packed_layers`, so the ids are bare
+/// layer names.
 ///
 /// The order comes from the extraction's own record — `layer-order` (every
 /// host) or `streamed-layers` (written beside it for an entry whose trees are
 /// in a store rather than in `layers/`). `None` when the cache, or its
 /// ordering, is gone.
-fn ordered_cached_layer_ids(pack_content_dir: &Path, store: &Path) -> Option<Vec<String>> {
+fn ordered_cached_layer_ids(
+    pack_content_dir: &Path,
+    store: &Path,
+    layers_root: &Path,
+) -> Option<Vec<String>> {
     let layers_dir = pack_content_dir.join("layers");
-    // Ids are returned relative to the content dir, so the store has to be
-    // reachable through it for the helper's single virtiofs share.
-    let store_prefix = store.strip_prefix(pack_content_dir).ok();
+    // Only a path the helper can reach through its single virtiofs share may be
+    // returned; anything outside `layers_root` cannot be mounted alongside it.
+    let reachable = |path: &Path| -> Option<String> {
+        path.strip_prefix(layers_root)
+            .ok()
+            .map(|rel| rel.to_string_lossy().into_owned())
+    };
     let cached_form = |id: &str| -> Option<String> {
-        if layers_dir.join(format!("{id}.tar")).is_file() {
-            return Some(format!("layers/{id}.tar"));
+        let tar = layers_dir.join(format!("{id}.tar"));
+        if tar.is_file() {
+            if let Some(rel) = reachable(&tar) {
+                return Some(rel);
+            }
         }
-        if layers_dir.join(id).is_dir() {
-            return Some(format!("layers/{id}"));
+        let dir = layers_dir.join(id);
+        if dir.is_dir() {
+            if let Some(rel) = reachable(&dir) {
+                return Some(rel);
+            }
         }
-        let prefix = store_prefix?;
-        if store.join(id).is_dir() {
-            let rel = prefix.join(id);
-            return Some(rel.to_string_lossy().into_owned());
+        let tree = store.join(id);
+        if tree.is_dir() {
+            if let Some(rel) = reachable(&tree) {
+                return Some(rel);
+            }
         }
         None
     };
@@ -1441,18 +1491,24 @@ fn ordered_cached_layer_ids(pack_content_dir: &Path, store: &Path) -> Option<Vec
         return ids.iter().map(|id| cached_form(id)).collect();
     }
     // No record: only unambiguous for a single cached layer, wherever it is.
+    // Only digest-shaped names can be layers; the store also holds its own
+    // bookkeeping directories (`entries/`), which are not layers of anything.
+    let is_layer_name =
+        |name: &str| name.len() >= 12 && name.bytes().all(|byte| byte.is_ascii_hexdigit());
     let mut names: Vec<String> = std::fs::read_dir(&layers_dir)
         .into_iter()
         .flatten()
         .flatten()
         .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .filter(|name| is_layer_name(name.strip_suffix(".tar").unwrap_or(name)))
         .collect();
     if let Ok(entries) = std::fs::read_dir(store) {
         names.extend(
             entries
                 .flatten()
                 .filter(|e| e.path().is_dir())
-                .filter_map(|e| e.file_name().to_str().map(str::to_string)),
+                .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                .filter(|name| is_layer_name(name)),
         );
     }
     let mut entries: Vec<String> = names
@@ -1974,7 +2030,7 @@ mod cached_layer_lookup_tests {
         fs::write(content.join("layers/streamed-layers"), "aaaa\nbbbb\n").unwrap();
 
         assert_eq!(
-            ordered_cached_layer_ids(content, &store),
+            ordered_cached_layer_ids(content, &store, content),
             Some(vec!["layers-cs/aaaa".into(), "layers-cs/bbbb".into()]),
             "the record orders the trees and they resolve inside the entry"
         );
@@ -1994,8 +2050,51 @@ mod cached_layer_lookup_tests {
         fs::write(content.join("layers/layer-order"), "aaaa\n").unwrap();
 
         assert_eq!(
-            ordered_cached_layer_ids(content, &store),
+            ordered_cached_layer_ids(content, &store, content),
             Some(vec!["layers/aaaa.tar".into()]),
+        );
+    }
+
+    /// A store-backed macOS entry keeps its trees inside the node's store
+    /// volume, which the helper cannot reach through the entry's share. The
+    /// caller mounts the entry's directory in the store instead, so the ids are
+    /// bare layer names — not paths under the content dir.
+    #[test]
+    fn a_store_backed_entry_resolves_against_its_own_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let content = root.path().join("machine/pack");
+        fs::create_dir_all(content.join("layers")).unwrap();
+        let store = root.path().join("_layers/layers-cs/entries/abcdef");
+        let (first, second) = ("aaaaaaaaaaaa", "bbbbbbbbbbbb");
+        for id in [first, second] {
+            fs::create_dir_all(store.join(id)).unwrap();
+        }
+        fs::write(
+            content.join("layers/streamed-layers"),
+            format!("{first}\n{second}\n"),
+        )
+        .unwrap();
+
+        let layers_root = &store;
+        assert_eq!(
+            ordered_cached_layer_ids(&content, &store, layers_root),
+            Some(vec![first.to_string(), second.to_string()]),
+            "the store entry is mounted as /packed_layers, so its ids are bare"
+        );
+
+        // Without a record the store's own bookkeeping must not be mistaken for
+        // a layer: `entries/` is a directory inside the store, not an image.
+        fs::remove_file(content.join("layers/streamed-layers")).unwrap();
+        fs::create_dir_all(store.join("entries")).unwrap();
+        assert_eq!(
+            ordered_cached_layer_ids(&content, &store, layers_root),
+            None,
+            "two trees and a bookkeeping directory are ambiguous, and `entries` is not a layer"
+        );
+        fs::remove_dir_all(store.join(second)).unwrap();
+        assert_eq!(
+            ordered_cached_layer_ids(&content, &store, layers_root),
+            Some(vec![first.to_string()]),
         );
     }
 
@@ -2006,18 +2105,19 @@ mod cached_layer_lookup_tests {
         let root = tempfile::tempdir().unwrap();
         let content = root.path();
         let store = content.join("layers");
-        fs::create_dir_all(store.join("aaaa")).unwrap();
-        fs::write(content.join("layers/aaaa.tar"), b"tar").unwrap();
+        let id = "aaaaaaaaaaaa";
+        fs::create_dir_all(store.join(id)).unwrap();
+        fs::write(content.join("layers").join(format!("{id}.tar")), b"tar").unwrap();
 
         assert_eq!(
-            ordered_cached_layer_ids(content, &store),
-            Some(vec!["layers/aaaa.tar".into()]),
+            ordered_cached_layer_ids(content, &store, content),
+            Some(vec![format!("layers/{id}.tar")]),
         );
         // Without the tar, the tree in the entry itself resolves the same way.
-        fs::remove_file(content.join("layers/aaaa.tar")).unwrap();
+        fs::remove_file(content.join("layers").join(format!("{id}.tar"))).unwrap();
         assert_eq!(
-            ordered_cached_layer_ids(content, &store),
-            Some(vec!["layers/aaaa".into()]),
+            ordered_cached_layer_ids(content, &store, content),
+            Some(vec![format!("layers/{id}")]),
         );
     }
 }

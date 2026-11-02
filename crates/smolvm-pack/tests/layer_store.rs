@@ -446,45 +446,54 @@ fn a_collection_reports_the_bytes_it_frees_and_dry_runs_change_nothing() {
     assert!(!layer_present(&shared_root, &unique_id));
 }
 
+/// The digest a layer is known by: the sha256 of its uncompressed tar, which is
+/// the diff_id a pack manifest names it by.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn digest_of(layer: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(layer))
+}
+
+/// [`digest_of`] as a bare, path-safe id.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn layer_id(layer: &[u8]) -> String {
+    digest_of(layer).trim_start_matches("sha256:").to_string()
+}
+
+/// Build a `.smolmachine` sidecar carrying `layers` as its OCI image layers.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn build_sidecar(dir: &Path, layers: &[&[u8]]) -> PathBuf {
+    use smolvm_pack::assets::AssetCollector;
+    use smolvm_pack::format::PackManifest;
+    use smolvm_pack::{sidecar_path_for, Packer};
+
+    fs::create_dir_all(dir).unwrap();
+    let stub = dir.join("stub");
+    fs::write(&stub, b"#!/bin/sh\necho stub").unwrap();
+    let mut collector = AssetCollector::new(dir.join("staging")).unwrap();
+    for layer in layers {
+        collector.add_layer(&digest_of(layer), layer).unwrap();
+    }
+    let manifest = PackManifest::new(
+        "test:latest".to_string(),
+        digest_of(layers[0]),
+        "linux/x86_64".to_string(),
+        "linux/x86_64".to_string(),
+    );
+    let output = dir.join("packed");
+    Packer::new(manifest)
+        .with_stub(&stub)
+        .with_assets(collector)
+        .pack(&output)
+        .unwrap();
+    sidecar_path_for(&output)
+}
+
 /// Two packs that share a layer: the second one references the store instead of
 /// extracting the layer again, and an entry's trees are the store's inodes.
 #[cfg(target_os = "linux")]
 mod packs {
     use super::*;
-    use smolvm_pack::assets::AssetCollector;
-    use smolvm_pack::format::PackManifest;
-    use smolvm_pack::{read_footer_from_sidecar, sidecar_path_for, Packer};
-
-    fn digest_of(layer: &[u8]) -> String {
-        format!("sha256:{:x}", Sha256::digest(layer))
-    }
-
-    fn layer_id(layer: &[u8]) -> String {
-        digest_of(layer).trim_start_matches("sha256:").to_string()
-    }
-
-    fn build_sidecar(dir: &Path, layers: &[&[u8]]) -> PathBuf {
-        fs::create_dir_all(dir).unwrap();
-        let stub = dir.join("stub");
-        fs::write(&stub, b"#!/bin/sh\necho stub").unwrap();
-        let mut collector = AssetCollector::new(dir.join("staging")).unwrap();
-        for layer in layers {
-            collector.add_layer(&digest_of(layer), layer).unwrap();
-        }
-        let manifest = PackManifest::new(
-            "test:latest".to_string(),
-            digest_of(layers[0]),
-            "linux/x86_64".to_string(),
-            "linux/x86_64".to_string(),
-        );
-        let output = dir.join("packed");
-        Packer::new(manifest)
-            .with_stub(&stub)
-            .with_assets(collector)
-            .pack(&output)
-            .unwrap();
-        sidecar_path_for(&output)
-    }
+    use smolvm_pack::read_footer_from_sidecar;
 
     struct Volume(PathBuf);
 
@@ -591,6 +600,285 @@ mod packs {
                     entry.display()
                 );
             }
+        }
+    }
+}
+
+/// macOS: the store lives in a case-sensitive APFS volume that cannot share
+/// inodes with the host volume, so an entry references a layer with APFS
+/// clones. Two packs that share a layer therefore cost the layer's bytes once,
+/// and the disk grows by the layers a pack does not share.
+#[cfg(target_os = "macos")]
+mod macos_packs {
+    use super::*;
+    use smolvm_pack::read_footer_from_sidecar;
+
+    /// The store's volume, detached when the test ends: a temp directory that
+    /// is still a mount point cannot be removed, and the mounts must not leak
+    /// into the next test.
+    struct StoreVolume(PathBuf);
+
+    impl StoreVolume {
+        fn image(&self) -> PathBuf {
+            self.0.join("layers-cs.sparseimage")
+        }
+
+        fn mount(&self) -> PathBuf {
+            self.0.join("layers-cs")
+        }
+
+        fn detach(&self) {
+            let _ = std::process::Command::new("hdiutil")
+                .args(["detach", "-quiet", "-force"])
+                .arg(self.mount())
+                .output();
+        }
+
+        /// Host bytes the volume actually holds, after a detach flushed it.
+        fn allocated(&self) -> u64 {
+            self.detach();
+            allocated(&self.image())
+        }
+    }
+
+    impl Drop for StoreVolume {
+        fn drop(&mut self) {
+            self.detach();
+        }
+    }
+
+    /// The host disk a path actually consumes (`st_blocks`, not its length).
+    fn allocated(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path)
+            .map(|meta| meta.blocks().saturating_mul(512))
+            .unwrap_or(0)
+    }
+
+    fn inode(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path).unwrap().ino()
+    }
+
+    fn links(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path).unwrap().nlink()
+    }
+
+    /// One layer holding a single file of `size` incompressible bytes.
+    fn layer_of(size: usize, seed: u8) -> Vec<u8> {
+        let bytes: Vec<u8> = (0..size).map(|i| (i as u8) ^ seed).collect();
+        layer_tar(&[("data/blob.bin", &bytes)])
+    }
+
+    const MIB: usize = 1024 * 1024;
+
+    /// Two packs sharing an 8 MiB layer, each with a 4 MiB layer of its own.
+    /// With the store the second pack adds only its own layer; without it, each
+    /// pack unpacks the whole set again into its own volume.
+    #[test]
+    fn a_second_pack_adds_only_the_layers_it_does_not_share() {
+        let tmp = scratch("layer-store-macos-");
+        let store_root = tmp.path().join("_layers");
+        let store = StoreVolume(store_root.clone());
+
+        let shared_layer = layer_of(8 * MIB, 0x11);
+        let first_only = layer_of(4 * MIB, 0x22);
+        let second_only = layer_of(4 * MIB, 0x33);
+        let (shared_id, first_id, second_id) = (
+            layer_id(&shared_layer),
+            layer_id(&first_only),
+            layer_id(&second_only),
+        );
+        let sidecar_a = build_sidecar(&tmp.path().join("build-a"), &[&shared_layer, &first_only]);
+        let sidecar_b = build_sidecar(&tmp.path().join("build-b"), &[&shared_layer, &second_only]);
+        let footer_a = read_footer_from_sidecar(&sidecar_a).unwrap();
+        let footer_b = read_footer_from_sidecar(&sidecar_b).unwrap();
+        assert_ne!(footer_a.checksum, footer_b.checksum, "distinct packs");
+
+        // With the store: one volume for both packs.
+        let entry_a = tmp.path().join("a");
+        let entry_b = tmp.path().join("b");
+        smolvm_pack::extract::extract_sidecar_with_store(
+            &sidecar_a,
+            &entry_a,
+            &footer_a,
+            false,
+            false,
+            &store_root,
+        )
+        .unwrap();
+        let after_a = store.allocated();
+        smolvm_pack::extract::extract_sidecar_with_store(
+            &sidecar_b,
+            &entry_b,
+            &footer_b,
+            false,
+            false,
+            &store_root,
+        )
+        .unwrap();
+        let after_b = store.allocated();
+
+        // Both entries see their layers, and the trees are clones: same bytes,
+        // separate inodes, no link between the store's copy and the entry's.
+        let store_layers = shared_layers_dir(&store_root).unwrap();
+        for (entry, ids) in [
+            (&entry_a, [&shared_id, &first_id]),
+            (&entry_b, [&shared_id, &second_id]),
+        ] {
+            assert!(
+                smolvm_pack::extract::cached_layers_usable(entry),
+                "{} must read as usable",
+                entry.display()
+            );
+            for id in ids {
+                let entry_file = smolvm_pack::extract::layer_store_entry_dir(&store_layers, entry)
+                    .join(id)
+                    .join("data/blob.bin");
+                let store_file = store_layers.join(id).join("data/blob.bin");
+                assert_eq!(
+                    fs::read(&entry_file).unwrap(),
+                    fs::read(&store_file).unwrap(),
+                    "the entry's clone must hold the layer's bytes"
+                );
+                assert_ne!(
+                    inode(&entry_file),
+                    inode(&store_file),
+                    "macOS entries clone, they cannot share the store's inodes"
+                );
+                assert_eq!(links(&entry_file), 1, "a clone is its own inode");
+            }
+        }
+
+        // Without the store: each pack unpacks its own copy of every layer,
+        // which is what the store exists to avoid.
+        let plain_a = tmp.path().join("plain-a");
+        let plain_b = tmp.path().join("plain-b");
+        smolvm_pack::extract::extract_sidecar(&sidecar_a, &plain_a, &footer_a, false, false)
+            .unwrap();
+        smolvm_pack::extract::force_detach_layers_volume(&plain_a);
+        smolvm_pack::extract::extract_sidecar(&sidecar_b, &plain_b, &footer_b, false, false)
+            .unwrap();
+        smolvm_pack::extract::force_detach_layers_volume(&plain_b);
+        let plain_bytes = allocated(&plain_a.join("layers-cs.sparseimage"))
+            + allocated(&plain_b.join("layers-cs.sparseimage"));
+
+        let second_growth = after_b.saturating_sub(after_a);
+        let shared_bytes = (8 * MIB) as u64;
+        eprintln!(
+            "store: {after_a} bytes after pack A, {after_b} after pack B \
+             (second pack added {second_growth}); without the store: {plain_bytes} bytes"
+        );
+        // The second pack adds its own 4 MiB layer and clone metadata for the
+        // 8 MiB one — well under the shared layer it must not unpack again.
+        assert!(
+            second_growth < shared_bytes,
+            "the second pack re-stored the shared layer: it added {second_growth} bytes \
+             for a pack whose unique layer is {} bytes",
+            second_only.len()
+        );
+        assert!(
+            second_growth >= (4 * MIB) as u64,
+            "the second pack's own layer did not land: {second_growth} bytes added"
+        );
+        assert!(
+            second_growth < (6 * MIB) as u64,
+            "the second pack added more than its own layer and clone metadata: \
+             {second_growth} bytes"
+        );
+        // The whole store holds the three layers once (~16 MiB); the plain
+        // extractions hold the shared layer a second time (~32 MiB).
+        assert!(
+            after_b + shared_bytes / 2 < plain_bytes,
+            "the store did not save the shared layer: {after_b} bytes with it, \
+             {plain_bytes} without"
+        );
+        assert!(store_layers.join(&first_id).join("data/blob.bin").is_file());
+        assert!(store_layers
+            .join(&second_id)
+            .join("data/blob.bin")
+            .is_file());
+    }
+
+    /// A collection reads references from the entries' records, not from link
+    /// counts: a clone shares no inode with the store, so only the record can
+    /// keep its layer alive. An entry whose extraction is gone stops protecting
+    /// anything, and the layers nothing else names are collected.
+    #[test]
+    fn a_collection_keeps_the_layers_a_store_entry_names() {
+        let tmp = scratch("layer-store-macos-gc-");
+        let store_root = tmp.path().join("_layers");
+        let _store = StoreVolume(store_root.clone());
+
+        let shared_layer = layer_tar(&[("etc/shared.conf", b"shared")]);
+        let first_only = layer_tar(&[("etc/first.conf", b"first")]);
+        let second_only = layer_tar(&[("etc/second.conf", b"second")]);
+        let (shared_id, first_id, second_id) = (
+            layer_id(&shared_layer),
+            layer_id(&first_only),
+            layer_id(&second_only),
+        );
+        let sidecar_a = build_sidecar(&tmp.path().join("build-a"), &[&shared_layer, &first_only]);
+        let sidecar_b = build_sidecar(&tmp.path().join("build-b"), &[&shared_layer, &second_only]);
+        let footer_a = read_footer_from_sidecar(&sidecar_a).unwrap();
+        let footer_b = read_footer_from_sidecar(&sidecar_b).unwrap();
+        let entry_a = tmp.path().join("a");
+        let entry_b = tmp.path().join("b");
+        smolvm_pack::extract::extract_sidecar_with_store(
+            &sidecar_a,
+            &entry_a,
+            &footer_a,
+            false,
+            false,
+            &store_root,
+        )
+        .unwrap();
+        smolvm_pack::extract::extract_sidecar_with_store(
+            &sidecar_b,
+            &entry_b,
+            &footer_b,
+            false,
+            false,
+            &store_root,
+        )
+        .unwrap();
+
+        let store_layers = shared_layers_dir(&store_root).unwrap();
+        let clone = smolvm_pack::extract::layer_store_entry_dir(&store_layers, &entry_a)
+            .join(&shared_id)
+            .join("etc/shared.conf");
+        assert_eq!(links(&clone), 1, "the entry holds a clone, not a link");
+        assert_ne!(
+            inode(&clone),
+            inode(&store_layers.join(&shared_id).join("etc/shared.conf"))
+        );
+
+        // Both entries name their layers: nothing may go while they exist.
+        let report = collect_layer_store(&store_root, false).unwrap();
+        assert_eq!(report.layers_removed, 0, "both entries reference the store");
+        assert_eq!(report.entries_removed, 0);
+        for id in [&shared_id, &first_id, &second_id] {
+            assert!(layer_present(&store_root, id), "layer {id} must be kept");
+        }
+
+        // Pack A's extraction is gone (a deleted machine): its entry directory
+        // stops protecting anything, and only the layer only it named goes.
+        fs::remove_dir_all(&entry_a).unwrap();
+        let report = collect_layer_store(&store_root, false).unwrap();
+        assert_eq!(report.entries_removed, 1, "the stale entry is discarded");
+        assert_eq!(report.layers_removed, 1, "only pack A's unique layer");
+        assert!(layer_present(&store_root, &shared_id));
+        assert!(layer_present(&store_root, &second_id));
+        assert!(!layer_present(&store_root, &first_id));
+
+        // With pack B gone too, nothing references the store any more.
+        fs::remove_dir_all(&entry_b).unwrap();
+        let report = collect_layer_store(&store_root, false).unwrap();
+        assert_eq!(report.entries_removed, 1);
+        assert_eq!(report.layers_removed, 2);
+        for id in [&shared_id, &first_id, &second_id] {
+            assert!(!layer_present(&store_root, id), "layer {id} must be gone");
         }
     }
 }

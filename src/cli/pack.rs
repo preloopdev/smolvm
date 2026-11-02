@@ -1737,9 +1737,14 @@ impl PackPruneCmd {
     /// else. Exits 0 with a count when the store is busy (an install holds it),
     /// so a caller that retries later does not have to treat that as a failure.
     fn run_layers_only(&self) -> smolvm::Result<()> {
+        // Linux keeps its store under the shared pack root; macOS has a node
+        // level store that every private pack extraction references.
         #[cfg(target_os = "linux")]
+        let root = crate::agent::shared_pack_cache_root();
+        #[cfg(target_os = "macos")]
+        let root = crate::agent::layer_store_root();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            let root = crate::agent::shared_pack_cache_root();
             let report =
                 match smolvm_pack::extract::collect_layer_store_with(&root, false, self.dry_run) {
                     Ok(report) => report,
@@ -1766,8 +1771,14 @@ impl PackPruneCmd {
                     report.partials_discarded
                 );
             }
+            if report.entries_removed > 0 {
+                println!(
+                    "  {} store entr(ies) of deleted extractions discarded",
+                    report.entries_removed
+                );
+            }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             println!("No shared layer store on this platform.");
         }

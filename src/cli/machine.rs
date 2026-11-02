@@ -5617,10 +5617,17 @@ impl CreateCmd {
                 #[cfg(not(target_os = "linux"))]
                 unreachable!("shared pack extraction is Linux-only")
             } else {
-                smolvm_pack::extract::extract_sidecar_for_machine(
+                // macOS shares the pack's image layers through the node's
+                // digest-keyed store: the layers stream in once and each
+                // machine's entry gets APFS clones of them, instead of every
+                // machine unpacking its own copy. Linux's shared store above
+                // covers its own fleet; Windows has no store to reference.
+                let store = cfg!(target_os = "macos").then(smolvm::agent::layer_store_root);
+                smolvm_pack::extract::extract_sidecar_for_machine_with_store(
                     sidecar_path,
                     &cache_dir,
                     footer.as_ref().expect("file artifact has a footer"),
+                    store.as_deref(),
                 )
                 .map(|()| (cache_dir.clone(), None::<String>))
                 .map_err(|e| smolvm::Error::agent("extract sidecar", e.to_string()))
