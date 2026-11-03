@@ -5077,6 +5077,45 @@ mod writer_thread_tests {
         }
     }
 
+    /// How long the process went without running this sampler.
+    ///
+    /// A wall-clock bound on teardown measures the runner as much as the code:
+    /// a runner that stops scheduling the process for seconds — a VM resumed
+    /// from a snapshot advances `Instant` by the pause — inflates any elapsed
+    /// time without the writer waiting on anything. Sampling the clock beside
+    /// the drop tells the two apart. A teardown that waits on the peer keeps
+    /// the sampler ticking on schedule; a stalled runner leaves one gap the
+    /// size of the elapsed time.
+    struct SchedulingGaps {
+        stop: Arc<AtomicBool>,
+        handle: std::thread::JoinHandle<Duration>,
+    }
+
+    impl SchedulingGaps {
+        fn start() -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_stop = Arc::clone(&stop);
+            let handle = std::thread::spawn(move || {
+                let mut worst = Duration::ZERO;
+                let mut previous = Instant::now();
+                while !thread_stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(20));
+                    let now = Instant::now();
+                    worst = worst.max(now.saturating_duration_since(previous));
+                    previous = now;
+                }
+                worst
+            });
+            Self { stop, handle }
+        }
+
+        /// Stop sampling and return the longest gap it saw.
+        fn finish(self) -> Duration {
+            self.stop.store(true, Ordering::Relaxed);
+            self.handle.join().expect("sampler thread joined")
+        }
+    }
+
     #[test]
     fn stalled_peer_does_not_abort_or_reorder_the_stream() {
         let (client_stream, mut peer) = UdsStream::pair().unwrap();
@@ -5162,12 +5201,15 @@ mod writer_thread_tests {
             "peer never applied backpressure; test is not exercising a parked writer"
         );
 
+        let gaps = SchedulingGaps::start();
         let start = Instant::now();
         drop(writer);
         let elapsed = start.elapsed();
+        let stalled = gaps.finish();
         assert!(
-            elapsed < WRITER_WRITE_TIMEOUT * 3,
-            "dropping the writer must not wait on the peer (took {elapsed:?})"
+            elapsed < WRITER_WRITE_TIMEOUT * 3 || stalled > WRITER_WRITE_TIMEOUT,
+            "dropping the writer must not wait on the peer (took {elapsed:?}, \
+             longest scheduling gap {stalled:?})"
         );
         drop(peer);
     }
