@@ -24,7 +24,10 @@ mod archive;
 #[cfg(unix)]
 mod export;
 
-pub use archive::{for_each_archive_layer, read_archive_layers, ArchiveLayer};
+pub use archive::{
+    archive_layer_bytes, for_each_archive_layer, read_archive_layers, read_archive_layers_for,
+    ArchiveLayer,
+};
 #[cfg(unix)]
 pub use export::{export_layer_tar, ExportStats};
 

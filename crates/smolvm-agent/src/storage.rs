@@ -1726,7 +1726,10 @@ fn extract_archive_layers_with_progress<F>(
 where
     F: FnMut(&str, u64),
 {
-    let layers = smolvm_oci_layer::read_archive_layers(archive)
+    // The guest is Linux and unpacks the image it will run, so select that
+    // platform when the archive's index offers several.
+    let platform = format!("linux/{}", std::env::consts::ARCH);
+    let layers = smolvm_oci_layer::read_archive_layers_for(archive, Some(&platform))
         .map_err(|e| StorageError::new(format!("read image archive layers: {e}")))?;
     progress("extracting image layers", 0);
     let mut order: Vec<String> = vec![String::new(); layers.len()];

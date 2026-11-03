@@ -1428,7 +1428,14 @@ fn stage_archive_layers_verbatim(
     archive: &Path,
     collector: &mut AssetCollector,
 ) -> crate::Result<Vec<String>> {
-    let layers = smolvm_oci_layer::read_archive_layers(archive)
+    // The machine's guest is Linux on the host's architecture, which is the
+    // platform this export can boot; name it so a multi-platform archive's
+    // index selects the same manifest the guest imported.
+    let platform = format!(
+        "linux/{}",
+        crate::platform::Platform::current().arch.oci_arch()
+    );
+    let layers = smolvm_oci_layer::read_archive_layers_for(archive, Some(&platform))
         .map_err(|e| Error::agent("read image archive", e.to_string()))?;
     println!(
         "Copying {} image layer(s) unchanged out of the archive...",
