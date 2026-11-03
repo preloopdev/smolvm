@@ -2033,6 +2033,7 @@ impl RunCmd {
             &vm_name,
             seed_image.as_deref(),
             params.storage_gb,
+            params.overlay_gb,
             self.seed_digest_ttl,
             self.proxy_opts.resolved_proxy()?.as_deref(),
             self.proxy_opts.no_proxy().as_deref(),
