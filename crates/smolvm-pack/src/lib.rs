@@ -18,6 +18,7 @@ pub mod format;
 pub mod macho;
 pub mod packer;
 pub mod signing;
+pub mod split;
 
 pub use detect::{detect_packed_mode, PackedMode};
 pub use format::{

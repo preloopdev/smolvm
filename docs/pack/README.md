@@ -59,6 +59,22 @@ The `.smolmachine` manifest also records `host_platform`, the host OS and archit
 runs on (`darwin/arm64`, distinct from `platform`, the guest's), `created`, an RFC 3339 timestamp of
 the pack, and `smolvm_version`, the release that built it.
 
+## Split-layer registry artifacts
+
+`smolvm pack push` publishes packs with layers as separate, content-addressed OCI blobs by
+default. The registry checks each base and layer blob with `HEAD` first, so an unchanged
+republish uploads zero layer bytes; a consumer that already has a layer skips it. Pulls resume
+each missing blob from its partial file and install it into the shared digest-keyed layer store.
+
+```bash
+smolvm pack push 127.0.0.1:5005/team/app:v1 -f app.smolmachine
+smolvm pack pull 127.0.0.1:5005/team/app:v1 -o app.smolmachine
+```
+
+Use `--no-split-layers` when publishing a legacy single-blob artifact for clients that do not
+understand the split media type. Older clients refuse split artifacts rather than selecting an
+unknown descriptor.
+
 ## Assert a value, not a boot
 
 **A pack that lost its rootfs still boots, still prints a guest kernel and still exits zero.** Write

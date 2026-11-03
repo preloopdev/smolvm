@@ -30,5 +30,8 @@ futures-util = "0.3"
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
 wiremock = "0.6"
+# The split-pull tests build real layer tars, because a layer's identity is the
+# digest of the uncompressed tar and the store installs exactly that.
+tar = "0.4"
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 tokio-rustls = "0.26"
