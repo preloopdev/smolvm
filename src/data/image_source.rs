@@ -438,6 +438,54 @@ pub fn archive_signature(archive: &Path) -> Result<(u64, u64)> {
     Ok((meta.len(), mtime))
 }
 
+/// Storage GiB an archive imported with `--preserve-image-layers` needs: its
+/// layers unpacked onto the machine's storage disk, plus headroom.
+pub fn preserve_layers_storage_gib(archive: &Path) -> Result<u64> {
+    let platform = format!(
+        "linux/{}",
+        crate::platform::Platform::current().arch.oci_arch()
+    );
+    let (bytes, _layers) = smolvm_oci_layer::archive_layer_bytes(archive, Some(&platform))
+        .map_err(|e| {
+            Error::config(
+                "--preserve-image-layers",
+                format!("cannot size the image archive {}: {e}", archive.display()),
+            )
+        })?;
+    Ok(storage_gib_for_layer_bytes(bytes))
+}
+
+/// Storage GiB for `bytes` of unpacked layers: the bytes plus a quarter for
+/// filesystem metadata and growth, and at least 1 GiB of headroom, rounded up.
+pub fn storage_gib_for_layer_bytes(bytes: u64) -> u64 {
+    const GIB: u64 = 1 << 30;
+    let headroom = (bytes / 4).max(GIB);
+    bytes.saturating_add(headroom).div_ceil(GIB)
+}
+
+/// Decide the storage size for a layer-preserving import.
+///
+/// `None` for the requested size means "size it": the caller applies the
+/// returned GiB. A requested size that cannot hold the unpacked layers is
+/// refused here, before the machine is created or its disk is written, so the
+/// failure names what is needed instead of surfacing as a full disk inside the
+/// guest.
+pub fn plan_preserve_layers_storage(requested: Option<u64>, needed: u64) -> Result<Option<u64>> {
+    match requested {
+        None => Ok(Some(needed)),
+        Some(given) if given < needed => Err(Error::config(
+            "--storage",
+            format!(
+                "--preserve-image-layers unpacks this image's layers onto the machine's storage \
+                 disk, which needs at least {needed} GiB; --storage is {given} GiB. Raise \
+                 --storage to at least {needed}, or drop --preserve-image-layers to flatten the \
+                 image instead."
+            ),
+        )),
+        Some(_) => Ok(None),
+    }
+}
+
 /// Set a staged archive's modification time to `mtime` seconds since the epoch.
 pub fn set_archive_mtime(archive: &Path, mtime: u64) -> Result<()> {
     std::fs::File::options()
@@ -847,5 +895,24 @@ mod classify_tests {
                 "{reference} must be a registry reference"
             );
         }
+    }
+
+    #[test]
+    fn layer_bytes_size_the_storage_disk_with_headroom() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(storage_gib_for_layer_bytes(0), 1);
+        assert_eq!(storage_gib_for_layer_bytes(GIB), 2);
+        assert_eq!(storage_gib_for_layer_bytes(8 * GIB), 10);
+        assert_eq!(storage_gib_for_layer_bytes(40 * GIB + GIB / 2), 51);
+    }
+
+    #[test]
+    fn a_storage_choice_too_small_for_the_layers_is_refused() {
+        assert_eq!(plan_preserve_layers_storage(None, 47).unwrap(), Some(47));
+        assert_eq!(plan_preserve_layers_storage(Some(47), 47).unwrap(), None);
+        let error = plan_preserve_layers_storage(Some(20), 47).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("47 GiB"), "{message}");
+        assert!(message.contains("20 GiB"), "{message}");
     }
 }

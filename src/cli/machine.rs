@@ -545,6 +545,7 @@ pub struct RunCmd {
     /// import (only meaningful with an archive or rootfs directory image). The
     /// guest's lowerdirs then are the image's own layers, so
     /// `pack create --from-vm --preserve-layers` can copy them unchanged.
+    /// Storage is sized from the archive's layers when `--storage` is not given.
     #[arg(long)]
     pub preserve_image_layers: bool,
 
@@ -1387,6 +1388,32 @@ fn explain_vm_death(manager: &smolvm::agent::AgentManager, error: smolvm::Error)
     }
 }
 
+/// Size or check `--storage` for an image imported with `--preserve-image-layers`.
+///
+/// The guest extracts every layer onto the machine's storage disk, so the
+/// default can be far too small for a real image. When the flag is used with a
+/// local archive, size the disk from the archive's unpacked layer bytes; if the
+/// user chose a size, refuse early when it cannot hold them.
+fn apply_preserve_layers_storage(
+    params: &mut vm_common::CreateVmParams,
+    archive: Option<&std::path::Path>,
+) -> smolvm::Result<()> {
+    let Some(archive) = archive else {
+        return Ok(());
+    };
+    let needed = smolvm::data::image_source::preserve_layers_storage_gib(archive)?;
+    if let Some(gib) =
+        smolvm::data::image_source::plan_preserve_layers_storage(params.storage_gb, needed)?
+    {
+        let chosen = gib.max(smolvm::storage::DEFAULT_STORAGE_SIZE_GIB);
+        eprintln!(
+            "Sizing storage to {chosen} GiB for the image's layers (pass --storage to override)."
+        );
+        params.storage_gb = Some(chosen);
+    }
+    Ok(())
+}
+
 impl RunCmd {
     pub fn run(mut self) -> smolvm::Result<()> {
         use smolvm::Error;
@@ -1984,6 +2011,12 @@ impl RunCmd {
         // archive seeds under its resolved `local:<hash>` reference, which is
         // what the seed cache keys on. Best-effort: without a seed the guest
         // pulls or flattens as before.
+        if params.preserve_image_layers {
+            let archive = image
+                .as_deref()
+                .and_then(smolvm::data::image_source::archive_file_for_ref);
+            apply_preserve_layers_storage(&mut params, archive.as_deref())?;
+        }
         let seed_image = if packed_layers_dir.is_some() {
             image.clone()
         } else {
@@ -4480,6 +4513,7 @@ pub struct CreateCmd {
     /// import (only meaningful with an archive or rootfs directory image). The
     /// guest's lowerdirs then are the image's own layers, so
     /// `pack create --from-vm --preserve-layers` can copy them unchanged.
+    /// Storage is sized from the archive's layers when `--storage` is not given.
     #[arg(long)]
     pub preserve_image_layers: bool,
 
@@ -4993,6 +5027,13 @@ impl CreateCmd {
         params.allow_system_mounts = self.allow_system_mounts;
         if self.preserve_image_layers {
             params.preserve_image_layers = true;
+        }
+        if params.preserve_image_layers {
+            let archive = params
+                .image
+                .as_deref()
+                .and_then(smolvm::data::image_source::archive_file_for_ref);
+            apply_preserve_layers_storage(&mut params, archive.as_deref())?;
         }
         if self.auto_graph {
             smolvm::util::enable_cuda_auto_graph_env_specs(&mut params.env);

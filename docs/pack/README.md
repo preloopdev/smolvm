@@ -94,6 +94,15 @@ Layer-preserving export requires the source machine to have been created from
 the local archive; registry-image and already-packed machines must use the
 default flattened export.
 
+Because the layers are unpacked inside the guest, `--preserve-image-layers`
+needs room on the machine's storage disk for all of them: when `--storage` is
+not given, it is sized from the archive's unpacked layer bytes (plus headroom),
+and a `--storage` too small for them is refused before the machine is created.
+A multi-platform archive is imported for the platform it actually carries:
+when its image index names several platforms but only packages one, that
+platform's manifest is selected, and asking for a platform the archive does
+not carry fails with a message naming what is present.
+
 Both pack paths boot a helper VM first. `pack create --image` pulls in one fixed at 8192 MiB, which `--mem` does not
 change (`--mem` is the artifact's). `pack create --from-vm` boots an export helper: 8192 MiB through v1.16.1, and from
 v1.16.2 4096 MiB, less on a Linux host with less available, set by `SMOLVM_EXPORT_HELPER_MEMORY_MIB`. `SKILL.md` step 1
