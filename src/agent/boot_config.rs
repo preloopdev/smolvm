@@ -55,6 +55,10 @@ pub struct BootConfig {
     /// VM data dir; the guest agent proxies it to `/var/run/docker.sock`.
     #[serde(default)]
     pub expose_docker: bool,
+    /// Keep a local image archive's layers apart, one directory per diff id. The
+    /// boot subprocess tells the guest so through `SMOLVM_PRESERVE_IMAGE_LAYERS`.
+    #[serde(default)]
+    pub preserve_image_layers: bool,
     /// User-published Unix-socket bridges (`--expose-socket` / `--mount-socket`),
     /// carried into the boot subprocess and applied by the launcher.
     #[serde(default)]

@@ -374,6 +374,13 @@ pub(crate) const IMAGE_PULL_TIMEOUT_SECS: u64 = 600;
 /// so this remains an inactivity timeout rather than a total operation limit.
 const DETACHED_START_TIMEOUT_SECS: u64 = 600;
 
+/// Throughput floor assumed while an image is unpacked into guest storage.
+///
+/// Measured cold unpacking runs at 9.5–40 MiB/s on a loaded disk; the floor is
+/// deliberately below that so a larger or slower image gets a long enough
+/// silence window instead of being cut off mid-unpack.
+const UNPACK_MIN_BYTES_PER_SEC: u64 = 2 * 1024 * 1024;
+
 /// Resolve the detached-start read window, honoring `SMOLVM_START_TIMEOUT_SECS`
 /// (seconds, must be > 0). A pack-backed machine's FIRST boot unpacks the whole
 /// flattened layer into guest storage before the workload can start, which on a
@@ -386,6 +393,45 @@ fn detached_start_timeout() -> Duration {
         .filter(|&s| s > 0)
         .unwrap_or(DETACHED_START_TIMEOUT_SECS);
     Duration::from_secs(secs)
+}
+
+/// The read window for unpacking `image`: the configured base, or the time a
+/// staged archive needs at the floor throughput, whichever is longer.
+///
+/// The window is an inactivity limit, but a guest unpacking a 47 GB archive
+/// emits no progress for long stretches on a loaded disk, so it scales with the
+/// bytes a local archive carries. Registry pulls keep the base window: their
+/// size is not known here.
+fn unpack_timeout(base: Duration, image: &str) -> Duration {
+    let bytes = crate::data::image_source::archive_file_for_ref(image)
+        .and_then(|path| std::fs::metadata(path).ok())
+        .map_or(0, |meta| meta.len());
+    unpack_timeout_for_bytes(base, bytes)
+}
+
+/// [`unpack_timeout`]'s computation, without the archive lookup.
+fn unpack_timeout_for_bytes(base: Duration, bytes: u64) -> Duration {
+    base.max(Duration::from_secs(
+        bytes.div_ceil(UNPACK_MIN_BYTES_PER_SEC),
+    ))
+}
+
+/// Turn the read timeout of an unpacking wait into a message that says which
+/// timeout fired and how to raise it.
+fn explain_unpack_stall(error: Error, timeout: Duration) -> Error {
+    let message = error.to_string();
+    if message.contains("timed out") || message.contains("timed out waiting") {
+        return Error::agent(
+            "image unpack",
+            format!(
+                "the guest reported no progress for {}s while unpacking the image; \
+                 raise SMOLVM_START_TIMEOUT_SECS (seconds) to allow a larger or slower \
+                 image, or use an image already flattened on the host ({message})",
+                timeout.as_secs()
+            ),
+        );
+    }
+    error
 }
 
 // (Removed INTERACTIVE_TIMEOUT_SECS — no-user-timeout execs now disable
@@ -1669,9 +1715,16 @@ impl AgentClient {
         request: AgentRequest,
         mut progress: Option<F>,
     ) -> Result<ImageInfo> {
-        // Use a long timeout for pull - large images can take minutes to download/extract.
-        // The guard resets the timeout on drop (including error paths).
-        self.set_read_timeout(Duration::from_secs(IMAGE_PULL_TIMEOUT_SECS))?;
+        // Use a long timeout for pull - large images can take minutes to
+        // download/extract. A staged archive is sized from its own bytes so a
+        // cold unpack of a large image is not cut off mid-way; the guard resets
+        // the timeout on drop (including error paths).
+        let image = match &request {
+            AgentRequest::Pull { image, .. } => image.as_str(),
+            _ => "",
+        };
+        let timeout = unpack_timeout(detached_start_timeout(), image);
+        self.set_read_timeout(timeout)?;
         let _timeout_guard = ReadTimeoutGuard::new(&self.stream);
 
         // Send the pull request
@@ -1683,7 +1736,11 @@ impl AgentClient {
 
         // Read responses - loop until we get Ok or Error (skip Progress)
         loop {
-            match self.receive()? {
+            let response = match self.receive() {
+                Ok(response) => response,
+                Err(error) => return Err(explain_unpack_stall(error, timeout)),
+            };
+            match response {
                 AgentResponse::Progress {
                     percent,
                     layer,
@@ -1969,6 +2026,26 @@ impl AgentClient {
             output: None,
         })?;
         self.receive_stream_to_path(local_path, cap, on_progress, "flatten layers")
+    }
+
+    /// Stream a guest directory out as an OCI image layer tar into `local_path`.
+    ///
+    /// Unlike [`Self::flatten_layers_to_path`] this does not merge: the directory
+    /// (an overlayfs upper) is written as one layer, with its overlay markers in
+    /// OCI form. An agent that predates the request rejects it as an unknown
+    /// variant, which is reported as version skew rather than a generic failure.
+    pub fn export_directory_layer_to_path<F: FnMut(u64)>(
+        &mut self,
+        source: &str,
+        local_path: &std::path::Path,
+        cap: u64,
+        on_progress: F,
+    ) -> Result<u64> {
+        let _timeout_guard = self.set_extended_read_timeout(flatten_timeout())?;
+        self.send_raw(&AgentRequest::ExportDirectoryLayer {
+            source: source.to_string(),
+        })?;
+        self.receive_stream_to_path(local_path, cap, on_progress, "export directory layer")
     }
 
     /// Get storage status.
@@ -2834,7 +2911,9 @@ impl AgentClient {
         // Container startup involves overlay setup, a one-time flatten of a local
         // image archive into guest storage, and crun init, which can far exceed
         // the default 30s read timeout on first run (cold overlay, cold image).
-        let _timeout_guard = self.set_extended_read_timeout(detached_start_timeout())?;
+        // The window scales with a staged archive's size.
+        let timeout = unpack_timeout(detached_start_timeout(), &config.image);
+        let _timeout_guard = self.set_extended_read_timeout(timeout)?;
 
         self.send(&AgentRequest::Run {
             image: config.image,
@@ -2857,7 +2936,11 @@ impl AgentClient {
             stop_timeout_secs: config.stop_timeout_secs,
         })?;
         let resp = loop {
-            match self.receive()? {
+            let response = match self.receive() {
+                Ok(response) => response,
+                Err(error) => return Err(explain_unpack_stall(error, timeout)),
+            };
+            match response {
                 AgentResponse::Progress { message, .. } => {
                     tracing::info!(message = %message, "detached start progress");
                 }
@@ -5631,6 +5714,9 @@ mod flatten_version_tests {
 #[cfg(test)]
 mod agent_error_skew_tests {
     use super::describe_agent_error;
+    use super::{explain_unpack_stall, unpack_timeout_for_bytes, UNPACK_MIN_BYTES_PER_SEC};
+    use crate::error::Error;
+    use std::time::Duration;
 
     #[test]
     fn unknown_variant_becomes_a_version_mismatch_message() {
@@ -5644,6 +5730,49 @@ mod agent_error_skew_tests {
         assert!(described.contains("flatten_layers"), "{described}");
         assert!(described.contains("agent rootfs"), "{described}");
         assert!(!described.contains("expected one of"), "{described}");
+    }
+
+    #[test]
+    fn unpack_timeouts_scale_with_the_archive_and_keep_the_floor() {
+        let base = Duration::from_secs(600);
+        assert_eq!(unpack_timeout_for_bytes(base, 0), base);
+        assert_eq!(
+            unpack_timeout_for_bytes(base, 600 * UNPACK_MIN_BYTES_PER_SEC),
+            base,
+            "a small archive keeps the default window"
+        );
+        let image = 47_u64 * 1024 * 1024 * 1024;
+        let scaled = unpack_timeout_for_bytes(base, image);
+        assert_eq!(
+            scaled,
+            Duration::from_secs(image.div_ceil(UNPACK_MIN_BYTES_PER_SEC))
+        );
+        assert!(
+            scaled > Duration::from_secs(3600),
+            "a 47 GiB image must get hours, not minutes: {scaled:?}"
+        );
+    }
+
+    #[test]
+    fn a_stalled_unpack_names_the_timeout_and_how_to_raise_it() {
+        let timeout = Duration::from_secs(7200);
+        let stalled = explain_unpack_stall(
+            Error::agent(
+                "read frame",
+                "timed out waiting for an agent response frame",
+            ),
+            timeout,
+        );
+        let message = stalled.to_string();
+        assert!(message.contains("7200s"), "{message}");
+        assert!(message.contains("SMOLVM_START_TIMEOUT_SECS"), "{message}");
+        assert!(message.contains("no progress"), "{message}");
+
+        let other = explain_unpack_stall(
+            Error::agent("read frame", "connection reset"),
+            Duration::from_secs(600),
+        );
+        assert!(!other.to_string().contains("SMOLVM_START_TIMEOUT_SECS"));
     }
 
     #[test]

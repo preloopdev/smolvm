@@ -541,6 +541,14 @@ pub struct RunCmd {
     #[arg(short = 'I', long, value_name = "IMAGE", value_parser = parse_image)]
     pub image: Option<String>,
 
+    /// Keep a local image archive's layers apart instead of flattening them on
+    /// import (only meaningful with an archive or rootfs directory image). The
+    /// guest's lowerdirs then are the image's own layers, so
+    /// `pack create --from-vm --preserve-layers` can copy them unchanged.
+    /// Storage is sized from the archive's layers when `--storage` is not given.
+    #[arg(long)]
+    pub preserve_image_layers: bool,
+
     /// Raise the max accepted local image-archive size (e.g. 16GiB, 512M, or a
     /// raw byte count); default 8GiB. For legitimately large images — sets
     /// SMOLVM_MAX_IMAGE_BYTES for this run.
@@ -1380,6 +1388,32 @@ fn explain_vm_death(manager: &smolvm::agent::AgentManager, error: smolvm::Error)
     }
 }
 
+/// Size or check `--storage` for an image imported with `--preserve-image-layers`.
+///
+/// The guest extracts every layer onto the machine's storage disk, so the
+/// default can be far too small for a real image. When the flag is used with a
+/// local archive, size the disk from the archive's unpacked layer bytes; if the
+/// user chose a size, refuse early when it cannot hold them.
+fn apply_preserve_layers_storage(
+    params: &mut vm_common::CreateVmParams,
+    archive: Option<&std::path::Path>,
+) -> smolvm::Result<()> {
+    let Some(archive) = archive else {
+        return Ok(());
+    };
+    let needed = smolvm::data::image_source::preserve_layers_storage_gib(archive)?;
+    if let Some(gib) =
+        smolvm::data::image_source::plan_preserve_layers_storage(params.storage_gb, needed)?
+    {
+        let chosen = gib.max(smolvm::storage::DEFAULT_STORAGE_SIZE_GIB);
+        eprintln!(
+            "Sizing storage to {chosen} GiB for the image's layers (pass --storage to override)."
+        );
+        params.storage_gb = Some(chosen);
+    }
+    Ok(())
+}
+
 impl RunCmd {
     pub fn run(mut self) -> smolvm::Result<()> {
         use smolvm::Error;
@@ -1540,6 +1574,9 @@ impl RunCmd {
         params.disks = parse_attached_disks(&self.disk)?;
         params.cache_disk = parse_cache_disk(self.cache_disk.as_deref())?;
         params.allow_system_mounts = self.allow_system_mounts;
+        if self.preserve_image_layers {
+            params.preserve_image_layers = true;
+        }
         if self.auto_graph {
             smolvm::util::enable_cuda_auto_graph_env_specs(&mut params.env);
             params.cuda = true;
@@ -1974,6 +2011,12 @@ impl RunCmd {
         // archive seeds under its resolved `local:<hash>` reference, which is
         // what the seed cache keys on. Best-effort: without a seed the guest
         // pulls or flattens as before.
+        if params.preserve_image_layers {
+            let archive = image
+                .as_deref()
+                .and_then(smolvm::data::image_source::archive_file_for_ref);
+            apply_preserve_layers_storage(&mut params, archive.as_deref())?;
+        }
         let seed_image = if packed_layers_dir.is_some() {
             image.clone()
         } else {
@@ -1990,6 +2033,7 @@ impl RunCmd {
             &vm_name,
             seed_image.as_deref(),
             params.storage_gb,
+            params.overlay_gb,
             self.seed_digest_ttl,
             self.proxy_opts.resolved_proxy()?.as_deref(),
             self.proxy_opts.no_proxy().as_deref(),
@@ -2026,6 +2070,7 @@ impl RunCmd {
             ssh_agent_socket,
             cuda: self.cuda || params.cuda,
             expose_docker: self.docker_socket || params.docker_socket,
+            preserve_image_layers: params.preserve_image_layers,
             dns_filter_hosts: params.dns_filter_hosts.clone(),
             credentials: params.credential_policy.as_ref().and_then(|policy| {
                 smolvm::credentials::CredentialLaunch::from_parts(
@@ -4465,6 +4510,14 @@ pub struct CreateCmd {
     #[arg(short = 'I', long, value_name = "IMAGE", value_parser = parse_image)]
     pub image: Option<String>,
 
+    /// Keep a local image archive's layers apart instead of flattening them on
+    /// import (only meaningful with an archive or rootfs directory image). The
+    /// guest's lowerdirs then are the image's own layers, so
+    /// `pack create --from-vm --preserve-layers` can copy them unchanged.
+    /// Storage is sized from the archive's layers when `--storage` is not given.
+    #[arg(long)]
+    pub preserve_image_layers: bool,
+
     /// Raise the max accepted local image-archive size (e.g. 16GiB, 512M, or a
     /// raw byte count); default 8GiB. For legitimately large images — sets
     /// SMOLVM_MAX_IMAGE_BYTES for this run.
@@ -4973,6 +5026,16 @@ impl CreateCmd {
             });
         }
         params.allow_system_mounts = self.allow_system_mounts;
+        if self.preserve_image_layers {
+            params.preserve_image_layers = true;
+        }
+        if params.preserve_image_layers {
+            let archive = params
+                .image
+                .as_deref()
+                .and_then(smolvm::data::image_source::archive_file_for_ref);
+            apply_preserve_layers_storage(&mut params, archive.as_deref())?;
+        }
         if self.auto_graph {
             smolvm::util::enable_cuda_auto_graph_env_specs(&mut params.env);
             params.cuda = true;
@@ -5466,6 +5529,7 @@ impl CreateCmd {
             cuda_fork_pool_size: None,
             cuda_vram_limit_mib: None,
             docker_socket: self.docker_socket,
+            preserve_image_layers: self.preserve_image_layers,
             dns_filter_hosts,
             published_sockets: parse_published_sockets(&self.expose_socket, &self.mount_socket)?,
             gpu: manifest.gpu,

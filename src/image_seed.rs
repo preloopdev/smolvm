@@ -78,6 +78,7 @@ pub fn seed_first_start(
                 &image,
                 &crate::registry::PullAuth::FromConfig,
                 record.storage_gb,
+                record.overlay_gb,
                 digest_ttl,
                 proxy,
                 no_proxy,
@@ -100,11 +101,14 @@ pub fn seed_ephemeral_run(
     name: &str,
     image: Option<&str>,
     storage_gb: Option<u64>,
+    overlay_gb: Option<u64>,
     digest_ttl: Option<u64>,
     proxy: Option<&str>,
     no_proxy: Option<&str>,
 ) {
-    seed_ephemeral_run_with_trust(name, image, storage_gb, digest_ttl, proxy, no_proxy, false);
+    seed_ephemeral_run_with_trust(
+        name, image, storage_gb, overlay_gb, digest_ttl, proxy, no_proxy, false,
+    );
 }
 
 /// Seed an ephemeral run whose workload also trusts the host's certificates.
@@ -113,6 +117,7 @@ pub fn seed_ephemeral_run_with_trust(
     name: &str,
     image: Option<&str>,
     storage_gb: Option<u64>,
+    overlay_gb: Option<u64>,
     digest_ttl: Option<u64>,
     proxy: Option<&str>,
     no_proxy: Option<&str>,
@@ -130,6 +135,7 @@ pub fn seed_ephemeral_run_with_trust(
                 &image,
                 &crate::registry::PullAuth::FromConfig,
                 storage_gb,
+                overlay_gb,
                 digest_ttl,
                 proxy,
                 no_proxy,
@@ -163,6 +169,7 @@ pub fn seed_storage(
     _: &crate::registry::PullAuth,
     _: Option<u64>,
     _: Option<u64>,
+    _: Option<u64>,
     _: Option<&str>,
     _: Option<&str>,
 ) -> crate::Result<bool> {
@@ -177,6 +184,7 @@ pub fn seed_storage_with_trust(
     _: &str,
     _: &str,
     _: &crate::registry::PullAuth,
+    _: Option<u64>,
     _: Option<u64>,
     _: Option<u64>,
     _: Option<&str>,
@@ -244,7 +252,7 @@ mod imp {
     /// seed: a registry image or staged archive, no storage disk yet, and
     /// seeding on. A disk at or above the default size is the default seed
     /// grown (see [`grow`]); a smaller one gets a seed built at its own size
-    /// (see [`small_seed_gb`]).
+    /// (see [`seed_gb`]).
     pub fn seedable_image(
         name: &str,
         image: Option<&str>,
@@ -444,12 +452,13 @@ mod imp {
         image: &str,
         auth: &PullAuth,
         storage_gb: Option<u64>,
+        overlay_gb: Option<u64>,
         digest_ttl: Option<u64>,
         proxy: Option<&str>,
         no_proxy: Option<&str>,
     ) -> Result<bool> {
         seed_storage_with_trust(
-            exe, name, image, auth, storage_gb, digest_ttl, proxy, no_proxy, false,
+            exe, name, image, auth, storage_gb, overlay_gb, digest_ttl, proxy, no_proxy, false,
         )
     }
 
@@ -462,6 +471,7 @@ mod imp {
         image: &str,
         auth: &PullAuth,
         storage_gb: Option<u64>,
+        overlay_gb: Option<u64>,
         digest_ttl: Option<u64>,
         proxy: Option<&str>,
         no_proxy: Option<&str>,
@@ -480,7 +490,8 @@ mod imp {
             proxy,
             no_proxy,
             trust_host_certs,
-            small_seed_gb(storage_gb),
+            seed_gb(storage_gb),
+            overlay_gb,
         )?;
         let Some((seed, format)) = seed_disk(&key_dir) else {
             return Err(Error::config(
@@ -500,12 +511,18 @@ mod imp {
         Ok(true)
     }
 
-    /// The size of the seed a disk of `storage_gb` needs when it is below the
-    /// default: a seed's filesystem fills the builder's disk and cannot be cut
-    /// down without resize2fs, so a smaller disk gets a seed built at exactly
-    /// its size. `None` means the default seed, grown as needed.
-    pub(super) fn small_seed_gb(storage_gb: Option<u64>) -> Option<u64> {
-        storage_gb.filter(|gb| *gb < crate::storage::DEFAULT_STORAGE_SIZE_GIB)
+    /// The size a seed must be built at for a machine whose storage disk is
+    /// `storage_gb`, or `None` for the default seed.
+    ///
+    /// A seed's filesystem fills the builder's disk and cannot be cut down
+    /// without resize2fs, so a smaller disk gets a seed built at exactly its
+    /// size. A larger one needs it too: building the default seed and growing
+    /// the clone afterwards leaves the *filesystem* too small for an image
+    /// whose layers do not fit 20 GiB, and the unpack fills it and stalls.
+    pub(super) fn seed_gb(storage_gb: Option<u64>) -> Option<u64> {
+        storage_gb
+            .filter(|gb| *gb > 0)
+            .filter(|gb| *gb != crate::storage::DEFAULT_STORAGE_SIZE_GIB)
     }
 
     /// The seed directory for `image` once its seed exists, holding the shared
@@ -518,8 +535,8 @@ mod imp {
     }
 
     /// Make sure the seed for `image` at its current digest exists, building it
-    /// (with `exe`) when it does not. `small_gb` asks for the seed of a disk
-    /// below the default size (see [`small_seed_gb`]).
+    /// (with `exe`) when it does not. `seed_gb` asks for the seed of a disk
+    /// whose size is not the default (see [`seed_gb`]).
     #[allow(clippy::too_many_arguments)]
     fn ensure_seed(
         exe: &Path,
@@ -529,7 +546,8 @@ mod imp {
         proxy: Option<&str>,
         no_proxy: Option<&str>,
         trust_host_certs: bool,
-        small_gb: Option<u64>,
+        seed_gb: Option<u64>,
+        overlay_gb: Option<u64>,
     ) -> Result<EnsuredSeed> {
         let template = storage_template();
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -543,7 +561,7 @@ mod imp {
             Some(hash) => hash.to_string(),
             None => resolved_digest(image, auth, digest_ttl, resolve)?,
         };
-        let key = seed_key(image, &digest, template.as_deref(), small_gb)?;
+        let key = seed_key(image, &digest, template.as_deref(), seed_gb)?;
         let root = seed_root();
         std::fs::create_dir_all(&root).map_err(|e| Error::config("image seed", e.to_string()))?;
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o711))
@@ -570,7 +588,8 @@ mod imp {
                     proxy,
                     no_proxy,
                     trust_host_certs,
-                    small_gb,
+                    seed_gb,
+                    overlay_gb,
                 )?;
                 // The builder pulled the tag, not the digest. If the tag moved
                 // in the meantime, discard the seed rather than miskey it. An
@@ -723,6 +742,7 @@ mod imp {
                 None,
                 false,
                 None,
+                None,
             ) {
                 Ok(EnsuredSeed { built, .. }) => tracing::info!(
                     %image,
@@ -780,12 +800,12 @@ mod imp {
                     rt.block_on(crate::image_store::authorized_reference_digest(image, auth))?
                 }
             };
-            let small_gb = small_seed_gb(
+            let seed_gb = seed_gb(
                 crate::db::SmolvmDb::open()?
                     .get_vm(name)?
                     .and_then(|record| record.storage_gb),
             );
-            let key_dir = root.join(seed_key(image, &digest, template.as_deref(), small_gb)?);
+            let key_dir = root.join(seed_key(image, &digest, template.as_deref(), seed_gb)?);
             seed_disk(&key_dir)
                 .map(|(seed, _)| seed)
                 .ok_or_else(|| Error::config("image seed", "no seed for the authorized digest"))
@@ -812,6 +832,57 @@ mod imp {
     /// Pull `image` once in a throwaway machine that never runs a workload, and
     /// publish its storage disk as the seed.
     #[allow(clippy::too_many_arguments)]
+    /// The `machine create` arguments for a seed builder.
+    ///
+    /// The builder is created at the requesting machine's disk sizes when they
+    /// differ from the defaults: a smaller storage disk gets a smaller seed
+    /// (the seed filesystem cannot be cut down), and a larger one gets a seed
+    /// big enough to unpack the image into at all. The overlay is the builder's
+    /// own scratch space for that unpack, so it follows the request too.
+    pub(super) fn builder_create_args(
+        name: &str,
+        image: &str,
+        archive_path: Option<&str>,
+        trust_host_certs: bool,
+        storage_gb: Option<u64>,
+        overlay_gb: Option<u64>,
+    ) -> Vec<String> {
+        let mut create = match archive_path {
+            Some(path) => vec![
+                "machine".to_string(),
+                "create".to_string(),
+                "--name".to_string(),
+                name.to_string(),
+                "--image".to_string(),
+                path.to_string(),
+            ],
+            None => vec![
+                "machine".to_string(),
+                "create".to_string(),
+                "--name".to_string(),
+                name.to_string(),
+                "--image".to_string(),
+                image.to_string(),
+                "--net".to_string(),
+            ],
+        };
+        if trust_host_certs {
+            create.push("--trust-host-certs".to_string());
+        }
+        if let Some(size) = storage_gb
+            .filter(|gb| *gb > 0)
+            .filter(|gb| *gb != crate::storage::DEFAULT_STORAGE_SIZE_GIB)
+        {
+            create.extend(["--storage".to_string(), size.to_string()]);
+        }
+        if let Some(size) = overlay_gb.filter(|gb| *gb != crate::storage::DEFAULT_OVERLAY_SIZE_GIB)
+        {
+            create.extend(["--overlay".to_string(), size.to_string()]);
+        }
+        create
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn build_seed(
         exe: &Path,
         image: &str,
@@ -821,7 +892,8 @@ mod imp {
         proxy: Option<&str>,
         no_proxy: Option<&str>,
         trust_host_certs: bool,
-        small_gb: Option<u64>,
+        storage_seed_gb: Option<u64>,
+        overlay_gb: Option<u64>,
     ) -> Result<()> {
         reap_stale_builders(exe);
         let tmp = format!("{SEED_MACHINE_PREFIX}{}-{}", &key[..16], std::process::id());
@@ -834,24 +906,16 @@ mod imp {
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned());
         let built = (|| -> Result<()> {
-            // An archive boots from its staged file with no network, exactly as
-            // the machines that will use the seed do.
-            let mut create = match archive_path.as_deref() {
-                Some(path) => vec!["machine", "create", "--name", &tmp, "--image", path],
-                None => vec![
-                    "machine", "create", "--name", &tmp, "--image", image, "--net",
-                ],
-            };
-            if trust_host_certs {
-                create.push("--trust-host-certs");
-            }
-            // A small disk's seed is built on a disk of that size, so the
-            // filesystem the guest grows into it fits the machines it seeds.
-            let small_size = small_gb.map(|gb| gb.to_string());
-            if let Some(size) = small_size.as_deref() {
-                create.extend(["--storage", size]);
-            }
-            run(exe, &create)?;
+            let create = builder_create_args(
+                &tmp,
+                image,
+                archive_path.as_deref(),
+                trust_host_certs,
+                storage_seed_gb,
+                overlay_gb,
+            );
+            let create_args: Vec<&str> = create.iter().map(String::as_str).collect();
+            run(exe, &create_args)?;
             let mut start = vec!["machine", "start", "--name", &tmp, "--no-workload"];
             if let Some(proxy) = proxy {
                 start.extend(["--proxy", proxy]);
@@ -1390,6 +1454,48 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn a_seed_builder_is_created_at_the_requested_disk_sizes() {
+        let defaults = builder_create_args(
+            "image-seed-x",
+            "alpine",
+            None,
+            false,
+            Some(crate::storage::DEFAULT_STORAGE_SIZE_GIB),
+            Some(crate::storage::DEFAULT_OVERLAY_SIZE_GIB),
+        );
+        assert!(
+            !defaults.iter().any(|arg| arg == "--storage"),
+            "{defaults:?}"
+        );
+        assert!(
+            !defaults.iter().any(|arg| arg == "--overlay"),
+            "{defaults:?}"
+        );
+
+        let sized = builder_create_args("image-seed-x", "alpine", None, false, Some(60), Some(20));
+        let pair = |flag: &str| {
+            let at = sized
+                .iter()
+                .position(|arg| arg == flag)
+                .unwrap_or_else(|| panic!("{flag} missing from {sized:?}"));
+            sized[at + 1].clone()
+        };
+        assert_eq!(pair("--storage"), "60");
+        assert_eq!(pair("--overlay"), "20");
+        // The archive path still comes through as the image, with no pull.
+        let local = builder_create_args(
+            "image-seed-x",
+            "local:abc",
+            Some("/cache/archive.tar"),
+            false,
+            Some(60),
+            None,
+        );
+        assert_eq!(local[5], "/cache/archive.tar");
+        assert!(!local.iter().any(|arg| arg == "--net"));
+    }
+
+    #[test]
     fn recently_used_images_are_prewarmed_newest_first_within_the_window() {
         let root = tempfile::tempdir().unwrap();
         assert!(prewarm_candidates(root.path(), 0).is_empty());
@@ -1413,10 +1519,11 @@ mod tests {
         assert!(seedable_image(name, Some("alpine"), Some(default)).is_some());
         assert!(seedable_image(name, Some("alpine"), Some(default * 5)).is_some());
         assert!(seedable_image(name, Some("alpine"), Some(8)).is_some());
-        assert_eq!(small_seed_gb(None), None);
-        assert_eq!(small_seed_gb(Some(default)), None);
-        assert_eq!(small_seed_gb(Some(default * 5)), None);
-        assert_eq!(small_seed_gb(Some(8)), Some(8));
+        assert_eq!(seed_gb(None), None);
+        assert_eq!(seed_gb(Some(default)), None);
+        assert_eq!(seed_gb(Some(default * 5)), Some(default * 5));
+        assert_eq!(seed_gb(Some(8)), Some(8));
+        assert_eq!(seed_gb(Some(0)), None);
     }
 
     #[test]
