@@ -61,5 +61,6 @@ macOS arm64, where throwaway-machine's says `result=blocked`; its `SKILL.md` say
 | [browser-display.md](browser-display.md) | a machine's display in the browser or a VNC client, with keyboard and pointer |
 | [hardware-video.md](hardware-video.md) | H.264 streaming of a machine's browser display |
 | [kubernetes.md](kubernetes.md) | pods as microVMs through a `RuntimeClass` |
+| [framed-exec.md](framed-exec.md) | framed exec for drivers, and a relay to a guest loopback port |
 | [install-arch.md](install-arch.md), [install-debian.md](install-debian.md), [install-fedora.md](install-fedora.md), [install-nix.md](install-nix.md) | the packaged installs |
 | [DEVELOPMENT.md](DEVELOPMENT.md) | building and testing smolvm itself |

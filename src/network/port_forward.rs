@@ -1,4 +1,4 @@
-//! Host side of live port forwarding for machines without virtio-net.
+//! Host side of live port forwarding.
 //!
 //! TSI binds no host ports, so a machine started without published ports has
 //! nothing a later `machine update -p` could extend. Instead each live-published
@@ -7,6 +7,9 @@
 //! [`smolvm_protocol::ports::PORT_FORWARD`] vsock port), names the guest port on
 //! one line, and relays both ways. Every listener is accepted on one shared
 //! thread ([`TcpAcceptorSet`]), so the number of ports costs sockets, not threads.
+//!
+//! `machine port-connect` dials the same socket directly, for any machine: it
+//! names a guest port and relays one host stdin/stdout pair to it.
 //!
 //! TCP only. A UDP server inside a TSI machine cannot answer a client that is
 //! also inside it: TSI routes a datagram reply to the host unless the guest

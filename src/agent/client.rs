@@ -151,11 +151,26 @@ impl InteractiveInputSender {
     /// Queue one input event, waiting while the channel is full.
     pub async fn send(&self, input: InteractiveInput) -> std::result::Result<(), InputClosed> {
         self.tx.send(input).await.map_err(|_| InputClosed)?;
+        self.wake();
+        Ok(())
+    }
+
+    /// Queue one input event from a plain thread, waiting while the channel is
+    /// full. Panics inside an async runtime; the framed CLI transport is the
+    /// only caller and owns its reader thread.
+    pub fn send_blocking(&self, input: InteractiveInput) -> std::result::Result<(), InputClosed> {
+        self.tx.blocking_send(input).map_err(|_| InputClosed)?;
+        self.wake();
+        Ok(())
+    }
+
+    /// Wake the session loop so it forwards the queued event at once rather
+    /// than at the next poll timeout.
+    fn wake(&self) {
         // A full wake buffer already holds a pending wake-up, so a failed
         // write loses nothing.
         #[cfg(unix)]
         let _ = (&*self.wake).write(&[0]);
-        Ok(())
     }
 }
 
@@ -3108,11 +3123,16 @@ impl AgentClient {
 
     /// Interactive VM exec driven by channels (remote PTY). Counterpart to
     /// [`Self::vm_exec_interactive`] that does not bind the host terminal.
+    ///
+    /// `timeout` is enforced by the guest, which kills the command and reports
+    /// exit code 124 when it expires.
+    #[allow(clippy::too_many_arguments)]
     pub fn vm_exec_interactive_io<F>(
         &mut self,
         command: Vec<String>,
         env: Vec<(String, String)>,
         workdir: Option<String>,
+        timeout: Option<Duration>,
         tty: bool,
         input: InteractiveInputReceiver,
         on_output: F,
@@ -3126,7 +3146,7 @@ impl AgentClient {
                 command,
                 env,
                 workdir,
-                timeout_ms: None,
+                timeout_ms: timeout.map(|t| t.as_millis() as u64),
                 interactive: true,
                 tty,
                 background: false,
@@ -3160,7 +3180,7 @@ impl AgentClient {
                 workdir: config.workdir,
                 user: config.user,
                 mounts: config.mounts,
-                timeout_ms: None,
+                timeout_ms: config.timeout.map(|t| t.as_millis() as u64),
                 interactive: true,
                 tty,
                 detached: false,

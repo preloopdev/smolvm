@@ -123,6 +123,8 @@ smolvm machine mount rm --name NAME -t GUEST              # unmount it, revoking
 smolvm machine mount ls --name NAME [--json]              # list mounts added this boot
 smolvm machine cp SRC DST                         # copy files (host↔VM)
 smolvm machine exec --stream --name NAME -- CMD   # streaming output
+smolvm machine exec --frames --name NAME -- CMD   # stdin/stdout as framed events (drivers)
+smolvm machine port-connect --name NAME --port N  # relay stdin/stdout to guest 127.0.0.1:N
 smolvm machine monitor [--name NAME]              # foreground health + restart
 
 smolvm pack create --image IMAGE -o PATH          # package
@@ -187,6 +189,9 @@ rejected with a hint to build first (`docker build … && docker save … | … 
 | `--smolfile` | `-s` | run, create, pack create | Load config from Smolfile |
 | `--interactive` | `-i` | run, exec, pack run | Keep stdin open |
 | `--tty` | `-t` | run, exec, pack run | Allocate pseudo-TTY |
+| `--frames` | | exec | Carry stdin and stdout as framed events (1-byte type, 4-byte big-endian length, 64 KiB max) instead of raw bytes; see `docs/framed-exec.md` |
+| `--cols` | | exec | Initial PTY width for `--frames` with `--tty` (default 80) |
+| `--rows` | | exec | Initial PTY height for `--frames` with `--tty` (default 24) |
 | `--allow-cidr` | | run, create, update | CIDR egress filter (implies --net) |
 | `--block-private` | | run, create | Block private and internal destinations, keep the public internet (implies --net) |
 | `--allow-private` | | run, create | Re-open one private CIDR under `--block-private` |

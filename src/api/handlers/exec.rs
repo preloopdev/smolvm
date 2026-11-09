@@ -711,7 +711,9 @@ pub async fn exec_interactive(
                             })
                     } else {
                         client
-                            .vm_exec_interactive_io(command, env, workdir, tty, input, on_output)
+                            .vm_exec_interactive_io(
+                                command, env, workdir, None, tty, input, on_output,
+                            )
                             .unwrap_or_else(|e| {
                                 tracing::warn!(error = ?e, "interactive: vm exec failed");
                                 -1
@@ -1417,7 +1419,15 @@ mod interactive_tests {
                         let _ = out_tx.blocking_send(o);
                     };
                     AgentClient::from_stream(client_stream)
-                        .vm_exec_interactive_io(command, Vec::new(), None, tty, input, on_output)
+                        .vm_exec_interactive_io(
+                            command,
+                            Vec::new(),
+                            None,
+                            None,
+                            tty,
+                            input,
+                            on_output,
+                        )
                         .unwrap_or(-1)
                 })
                 .await
