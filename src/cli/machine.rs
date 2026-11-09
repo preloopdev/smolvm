@@ -445,6 +445,10 @@ pub enum MachineCmd {
     /// Copy files between host and machine
     Cp(CpCmd),
 
+    /// Relay stdin and stdout to a TCP port on a running machine's loopback
+    #[command(name = "port-connect")]
+    PortConnect(super::port_connect::PortConnectCmd),
+
     /// Synchronize guest-local staged mounts back to their host directories
     Sync(SyncCmd),
 
@@ -509,6 +513,7 @@ impl MachineCmd {
             MachineCmd::Prune(cmd) => cmd.run(),
             MachineCmd::Shell(cmd) => cmd.run(),
             MachineCmd::Cp(cmd) => cmd.run(),
+            MachineCmd::PortConnect(cmd) => cmd.run(),
             MachineCmd::Sync(cmd) => cmd.run(),
             MachineCmd::Monitor(cmd) => cmd.run(),
             MachineCmd::NetworkTest(cmd) => cmd.run(),
@@ -4130,6 +4135,23 @@ pub struct ExecCmd {
     #[arg(short = 't', long)]
     pub tty: bool,
 
+    /// Carry stdin and stdout as framed events instead of raw bytes.
+    ///
+    /// For drivers that own the process's streams: client frames are STDIN,
+    /// RESIZE, EOF and SIGNAL; server frames are OUTPUT, STDERR, EXIT and
+    /// ERROR. Each frame is a type byte, a 4-byte big-endian length, and at
+    /// most 64 KiB of payload.
+    #[arg(long, conflicts_with_all = ["stream", "detach"])]
+    pub frames: bool,
+
+    /// Initial terminal width for --frames with --tty (default: 80)
+    #[arg(long, value_name = "N", requires_all = ["frames", "tty"])]
+    pub cols: Option<u16>,
+
+    /// Initial terminal height for --frames with --tty (default: 24)
+    #[arg(long, value_name = "N", requires_all = ["frames", "tty"])]
+    pub rows: Option<u16>,
+
     /// Stream output in real-time (prints as it arrives)
     #[arg(long)]
     pub stream: bool,
@@ -4150,6 +4172,12 @@ impl ExecCmd {
         // any early return (failed exec, timeout, client signal) triggers
         // AgentManager::Drop which calls stop() and kills the VM.
         manager.detach();
+
+        let frame_options = smolvm::cli::frames::SessionOptions {
+            tty: self.tty,
+            cols: self.cols.unwrap_or(80),
+            rows: self.rows.unwrap_or(24),
+        };
 
         let env = parse_env_list(&self.env);
 
@@ -4245,6 +4273,20 @@ impl ExecCmd {
                 println!("{pid}");
                 return Ok(());
             }
+            if self.frames {
+                let config = smolvm::agent::RunConfig::new(image, self.command.clone())
+                    .with_env(defaults.env.clone())
+                    .with_workdir(defaults.workdir.clone())
+                    .with_user(defaults.user.clone())
+                    .with_mounts(mount_bindings)
+                    .with_timeout(self.timeout)
+                    .with_tty(self.tty)
+                    .with_s3_volumes(exec_s3_volumes.clone())
+                    .with_persistent_overlay(Some(overlay_owner.clone()));
+                smolvm::cli::frames::run(frame_options, move |input, on_output| {
+                    client.run_interactive_io(config, input, on_output)
+                });
+            }
             if self.interactive || self.tty {
                 let config = smolvm::agent::RunConfig::new(image, self.command.clone())
                     .with_env(defaults.env.clone())
@@ -4314,6 +4356,19 @@ impl ExecCmd {
                 let pid = client.vm_exec_background(self.command.clone(), env, workdir.clone())?;
                 println!("{pid}");
                 return Ok(());
+            }
+            if self.frames {
+                smolvm::cli::frames::run(frame_options, move |input, on_output| {
+                    client.vm_exec_interactive_io(
+                        self.command.clone(),
+                        env.clone(),
+                        workdir.clone(),
+                        self.timeout,
+                        self.tty,
+                        input,
+                        on_output,
+                    )
+                });
             }
             if self.interactive || self.tty {
                 let exit_code = client.vm_exec_interactive(
@@ -4411,6 +4466,9 @@ impl ShellCmd {
             timeout: None,
             interactive: true,
             tty: true,
+            frames: false,
+            cols: None,
+            rows: None,
             stream: false,
             detach: false,
         }

@@ -3,12 +3,14 @@
 pub mod cleanup_ephemeral;
 pub mod completion;
 pub mod config;
+pub mod frames;
 pub mod host_network;
 pub mod machine;
 pub mod openapi;
 pub mod pack;
 pub mod pack_run;
 pub mod parsers;
+pub mod port_connect;
 pub mod port_listen;
 pub mod proxy_opts;
 pub mod serve;

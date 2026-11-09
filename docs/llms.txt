@@ -35,5 +35,6 @@
 - [browser-display.md](browser-display.md): a machine's display in the browser or a VNC client, with keyboard and pointer
 - [hardware-video.md](hardware-video.md): H.264 streaming of a machine's browser display
 - [kubernetes.md](kubernetes.md): pods as microVMs through a `RuntimeClass`
+- [framed-exec.md](framed-exec.md): framed exec for drivers, and a relay to a guest loopback port
 - [usage-journal.md](usage-journal.md): the local record of machine lifecycle events, and how to read, disable or share it
 - [install-arch.md](install-arch.md), [install-debian.md](install-debian.md), [install-fedora.md](install-fedora.md), [install-nix.md](install-nix.md): the packaged installs
