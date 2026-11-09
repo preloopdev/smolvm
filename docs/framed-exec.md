@@ -50,6 +50,11 @@ guest then kills the command tree with SIGKILL, and the `EXIT` frame carries
 137. Use the framed stream for a command that exits on its own or on SIGINT;
 tear down anything else by closing the stream.
 
+`EOF` closes the command's stdin; on a PTY the guest writes the terminal's EOF
+character, so a reader such as `cat` exits. A shell that runs its own line
+editor on the terminal (busybox ash) does not: it treats the EOF frame as more
+input, so end such a shell with an `exit` command or a SIGNAL frame.
+
 ## Port connect
 
 ```sh
