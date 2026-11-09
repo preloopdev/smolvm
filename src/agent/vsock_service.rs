@@ -114,9 +114,10 @@ impl VsockService for DockerSocketService {
     }
 }
 
-/// Live port forwarding for machines without virtio-net: the host's
-/// forwarder connects in, and the guest relays each connection to the guest
-/// port it names.
+/// Live port forwarding: the host connects in and the guest relays each
+/// connection to the guest port it names. `machine update -p` uses it for
+/// machines without virtio-net, and `machine port-connect` uses it on every
+/// machine to reach a guest loopback port.
 struct PortForwardService;
 impl VsockService for PortForwardService {
     fn resolve<'a>(&self, inputs: &VsockServiceInputs<'a>) -> Option<ActiveVsockService<'a>> {
