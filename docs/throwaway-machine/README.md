@@ -110,6 +110,24 @@ path. It implies `--net`, the Smolfile form is `[network] allow_udp`, and `machi
 --allow-udp` / `--remove-allow-udp` change it, live on a machine started with an allow list, as
 `--allow-cidr` does.
 
+`--deny-tcp-port <PORT>[-<END>]` refuses TCP egress to a destination port on every address, IPv4
+and IPv6, and implies `--net`. Unlike a CIDR rule it says nothing about the address, so it closes a
+service class for every destination; repeat it to name several ports. It is checked after
+`--deny-cidr` and before every allow, so an allow list cannot re-open it accidentally. An operator
+can carve a scoped exception with `--allow-tcp <CIDR>[:<PORT>[-<END>]]`, which is evaluated before
+the port deny but after `--deny-cidr`; a CIDR deny therefore stays absolute. For example, this
+blocks the submission ports a workload does not use while letting a relay at a known address submit:
+
+```console
+$ smolvm machine run --net --image alpine \
+    --deny-tcp-port 25 --deny-tcp-port 465 --deny-tcp-port 587 \
+    --allow-tcp 203.0.113.10:587 -- \
+    my-workload
+```
+
+`machine update --deny-tcp-port` / `--allow-tcp` apply the same rules to an existing machine, and
+the stored rule order (CIDR deny, TCP exception, port deny, other allows) survives restarts.
+
 ```console
 $ smolvm machine run --net --image alpine --allow-host registry.npmjs.org -- \
     wget -q -O /dev/null https://registry.npmjs.org

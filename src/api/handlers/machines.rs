@@ -7432,6 +7432,10 @@ pub async fn update_machine_egress(
         reset_allow_list: req.reset_allow_list,
         allow_udp: parse_udp(&req.allow_udp)?,
         remove_allow_udp: parse_udp(&req.remove_allow_udp)?,
+        // TCP port rules are CLI-only until the API exposes them; keep the
+        // shared initializer explicit so a new field cannot be forgotten.
+        allow_tcp: Vec::new(),
+        deny_tcp_ports: Vec::new(),
     };
     let next = record
         .updated_egress(&update)
