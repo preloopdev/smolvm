@@ -3632,6 +3632,10 @@ pub fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
     });
     let fields = obj.as_object_mut().unwrap();
     fields.insert("network".into(), serde_json::json!(record.network));
+    fields.insert(
+        "egress_rules".into(),
+        serde_json::json!(record.egress_rules),
+    );
     // The egress allow list, present only when one is set, in the stored form
     // `machine update` accepts back: `=host` exact, `*.domain` wildcard, bare
     // `host` for a name and its subdomains, plus CIDRs. Lets a client read the
