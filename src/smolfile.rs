@@ -105,10 +105,25 @@ pub fn parse_cidr(s: &str) -> Result<String, String> {
 
 #[allow(missing_docs)]
 pub fn parse_allow_udp(s: &str) -> Result<smolvm_protocol::EgressRule, String> {
+    parse_port_allow(s, smolvm_protocol::FlowTransport::Udp, "UDP")
+}
+
+#[allow(missing_docs)]
+pub fn parse_allow_tcp(s: &str) -> Result<smolvm_protocol::EgressRule, String> {
+    parse_port_allow(s, smolvm_protocol::FlowTransport::Tcp, "TCP")
+}
+
+/// Parse `CIDR[:PORT[-END]]` into one allow rule for `transport` (the same
+/// shape `--allow-udp` accepts), so TCP has an equivalent scoped exception.
+fn parse_port_allow(
+    s: &str,
+    transport: smolvm_protocol::FlowTransport,
+    transport_name: &str,
+) -> Result<smolvm_protocol::EgressRule, String> {
     let invalid = |reason: String| {
         format!(
-            "invalid UDP allow '{s}': {reason}; expected CIDR[:PORT[-END]], like 10.0.0.0/8, \
-             1.1.1.1:123, 192.0.2.0/24:3478-3480 or [2001:db8::1]:443"
+            "invalid {transport_name} allow '{s}': {reason}; expected CIDR[:PORT[-END]], like \
+             10.0.0.0/8, 1.1.1.1:123, 192.0.2.0/24:3478-3480 or [2001:db8::1]:443"
         )
     };
     let (cidr, ports) = if let Some(bracketed) = s.strip_prefix('[') {
@@ -132,17 +147,19 @@ pub fn parse_allow_udp(s: &str) -> Result<smolvm_protocol::EgressRule, String> {
         (parse_cidr(address).map_err(invalid)?, Some(ports))
     };
     let ports = ports
-        .map(|spec| parse_udp_port_range(spec).map_err(invalid))
+        .map(|spec| parse_port_range(spec).map_err(invalid))
         .transpose()?;
     Ok(smolvm_protocol::EgressRule {
-        transport: Some(smolvm_protocol::FlowTransport::Udp),
+        transport: Some(transport),
         cidr: Some(cidr),
         ports,
         action: smolvm_protocol::RuleAction::Allow,
     })
 }
 
-fn parse_udp_port_range(spec: &str) -> Result<smolvm_protocol::PortRange, String> {
+/// Parse one `PORT` or `PORT-END` destination-port range, 1 through 65535.
+#[allow(missing_docs)]
+pub fn parse_port_range(spec: &str) -> Result<smolvm_protocol::PortRange, String> {
     let port = |text: &str| match text.parse::<u16>() {
         Ok(0) | Err(_) => Err(format!("'{text}' is not a port from 1 to 65535")),
         Ok(port) => Ok(port),
@@ -168,6 +185,24 @@ pub fn udp_allow_label(rule: &smolvm_protocol::EgressRule) -> String {
         Some(ports) if ports.start == ports.end => format!("{cidr}:{}", ports.start),
         Some(ports) => format!("{cidr}:{}-{}", ports.start, ports.end),
     }
+}
+
+/// One `Deny` rule per port range, matching TCP to any destination address
+/// (IPv4 or IPv6). The rule list's first match wins, so callers must place
+/// these before the allow rules they are meant to constrain.
+#[allow(missing_docs)]
+pub fn deny_tcp_port_rules(
+    ports: &[smolvm_protocol::PortRange],
+) -> Vec<smolvm_protocol::EgressRule> {
+    ports
+        .iter()
+        .map(|ports| smolvm_protocol::EgressRule {
+            transport: Some(smolvm_protocol::FlowTransport::Tcp),
+            cidr: None,
+            ports: Some(*ports),
+            action: smolvm_protocol::RuleAction::Deny,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -328,6 +363,62 @@ init = ["echo hello"]
                 Err(error) => error,
             };
             assert!(error.contains("CIDR[:PORT[-END]]"), "{value}: {error}");
+        }
+    }
+
+    #[test]
+    fn allow_tcp_is_the_tcp_twin_of_allow_udp() {
+        assert_eq!(
+            parse_allow_tcp("203.0.113.0/24:587").unwrap(),
+            smolvm_protocol::EgressRule {
+                transport: Some(smolvm_protocol::FlowTransport::Tcp),
+                cidr: Some("203.0.113.0/24".to_string()),
+                ports: Some(smolvm_protocol::PortRange {
+                    start: 587,
+                    end: 587
+                }),
+                action: smolvm_protocol::RuleAction::Allow,
+            }
+        );
+        assert_eq!(
+            parse_allow_tcp("[2001:db8::1]:25-587").unwrap(),
+            smolvm_protocol::EgressRule {
+                transport: Some(smolvm_protocol::FlowTransport::Tcp),
+                cidr: Some("2001:db8::1/128".to_string()),
+                ports: Some(smolvm_protocol::PortRange {
+                    start: 25,
+                    end: 587
+                }),
+                action: smolvm_protocol::RuleAction::Allow,
+            }
+        );
+        let error = parse_allow_tcp("1.1.1.1:0").unwrap_err();
+        assert!(error.contains("invalid TCP allow"), "{error}");
+    }
+
+    #[test]
+    fn deny_tcp_port_rules_match_any_destination_on_the_tcp_port() {
+        let ranges = [
+            parse_port_range("25").unwrap(),
+            parse_port_range("465-587").unwrap(),
+        ];
+        let rules = deny_tcp_port_rules(&ranges);
+        assert_eq!(rules.len(), 2);
+        assert_eq!(
+            rules[0],
+            smolvm_protocol::EgressRule {
+                transport: Some(smolvm_protocol::FlowTransport::Tcp),
+                cidr: None,
+                ports: Some(smolvm_protocol::PortRange { start: 25, end: 25 }),
+                action: smolvm_protocol::RuleAction::Deny,
+            }
+        );
+        assert_eq!(rules[1].ports.unwrap().end, 587);
+        for value in ["0", "65536", "587-465", "", "dns", "10-"] {
+            assert!(
+                parse_port_range(value).is_err(),
+                "'{value}' must not parse as a port range"
+            );
         }
     }
 }

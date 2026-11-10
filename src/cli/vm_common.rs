@@ -2320,6 +2320,44 @@ pub struct DefaultVmOverrides {
     pub rosetta: bool,
 }
 
+/// Apply `machine start --deny-tcp-port` before the VM boots.
+///
+/// A machine whose record has networking off is left alone: the flag must never
+/// turn an offline machine online. A machine with networking on gains the port
+/// deny even when it was created by an older build that had no such rule, which
+/// is what closes the gap for an existing unprotected machine before it is
+/// handed to a workload.
+pub fn apply_start_deny_tcp_ports(
+    name: &str,
+    ports: &[smolvm_protocol::PortRange],
+) -> smolvm::Result<()> {
+    let db = smolvm::db::SmolvmDb::open()?;
+    let Some(record) = db.get_vm(name)? else {
+        return Ok(());
+    };
+    if !record.network || ports.is_empty() {
+        return Ok(());
+    }
+    let update = smolvm::config::EgressUpdate {
+        deny_tcp_ports: ports.to_vec(),
+        ..Default::default()
+    };
+    let Some(next) = record.updated_egress(&update)? else {
+        return Ok(());
+    };
+    db.update_vm(name, |r| {
+        r.egress_rules = next.egress_rules.clone();
+        r.network = next.network;
+    })?
+    .ok_or_else(|| {
+        smolvm::Error::config(
+            "machine start",
+            format!("machine '{name}' disappeared while applying its egress floor"),
+        )
+    })?;
+    Ok(())
+}
+
 /// One `Deny` egress rule per CIDR, in order.
 pub fn deny_cidr_rules(cidrs: &[String]) -> Vec<smolvm_protocol::EgressRule> {
     cidrs
@@ -2334,13 +2372,29 @@ pub fn deny_cidr_rules(cidrs: &[String]) -> Vec<smolvm_protocol::EgressRule> {
 }
 
 impl CreateVmParams {
-    /// Put deny rules for `cidrs` ahead of every other rule, so a deny wins
-    /// over any allow. Denying implies networking, like allowing does.
-    pub fn prepend_deny_cidrs(&mut self, cidrs: &[String]) {
-        if cidrs.is_empty() {
+    /// Put the deny rules ahead of the allow rules they constrain, in the
+    /// fixed order the policy's first-match evaluation needs:
+    ///
+    /// 1. `deny_cidrs` — a CIDR deny stays absolute;
+    /// 2. `allow_tcp` — operator-scoped exceptions to the port deny below;
+    /// 3. `deny_tcp_ports` — a destination-port deny on every address;
+    /// 4. whatever the caller already supplied (`--allow-udp`, host patterns,
+    ///    rules from the API).
+    ///
+    /// Any of the three implies networking, as allowing does. Deny ports are
+    /// TCP-only and carry no CIDR, so they cover IPv4 and IPv6 alike.
+    pub fn apply_egress_denies(
+        &mut self,
+        deny_cidrs: &[String],
+        allow_tcp: &[smolvm_protocol::EgressRule],
+        deny_tcp_ports: &[smolvm_protocol::PortRange],
+    ) {
+        if deny_cidrs.is_empty() && allow_tcp.is_empty() && deny_tcp_ports.is_empty() {
             return;
         }
-        let mut rules = deny_cidr_rules(cidrs);
+        let mut rules = deny_cidr_rules(deny_cidrs);
+        rules.extend_from_slice(allow_tcp);
+        rules.extend(smolvm::smolfile::deny_tcp_port_rules(deny_tcp_ports));
         rules.append(&mut self.egress_rules);
         self.egress_rules = rules;
         self.net = true;

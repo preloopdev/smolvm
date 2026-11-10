@@ -565,7 +565,7 @@ pub struct RunCmd {
     #[arg(
         long,
         value_name = "PATH",
-        conflicts_with_all = ["image", "smolfile", "detach", "name", "gpu", "gpu_vram_mib", "oci_platform", "allow_cidr", "deny_cidr", "allow_udp", "allow_host", "allow_host_pattern", "outbound_localhost_only", "secret_env", "secret_file", "secret_keychain"],
+        conflicts_with_all = ["image", "smolfile", "detach", "name", "gpu", "gpu_vram_mib", "oci_platform", "allow_cidr", "deny_cidr", "deny_tcp_port", "allow_tcp", "allow_udp", "allow_host", "allow_host_pattern", "outbound_localhost_only", "secret_env", "secret_file", "secret_keychain"],
         help_heading = "Machine source"
     )]
     pub from: Option<PathBuf>,
@@ -700,6 +700,18 @@ pub struct RunCmd {
     /// Deny egress to a CIDR range, checked before anything is allowed (can be used multiple times, implies --net)
     #[arg(long = "deny-cidr", value_parser = parse_cidr, value_name = "CIDR", help_heading = "Network")]
     pub deny_cidr: Vec<String>,
+
+    /// Deny TCP egress to a destination port or range on every address, IPv4 and IPv6
+    /// (can be used multiple times, implies --net). Checked after --deny-cidr and
+    /// before every allow; --allow-tcp carves a scoped exception.
+    #[arg(long = "deny-tcp-port", value_parser = smolvm::smolfile::parse_port_range, value_name = "PORT[-END]", help_heading = "Network")]
+    pub deny_tcp_port: Vec<smolvm_protocol::PortRange>,
+
+    /// Allow TCP egress to a CIDR, optionally on one port or a range, ahead of
+    /// --deny-tcp-port (can be used multiple times, implies --net). Unlike
+    /// --deny-cidr, which stays absolute.
+    #[arg(long = "allow-tcp", value_parser = smolvm::smolfile::parse_allow_tcp, value_name = "CIDR[:PORT[-END]]", help_heading = "Network")]
+    pub allow_tcp: Vec<smolvm_protocol::EgressRule>,
 
     #[arg(long = "allow-udp", value_parser = smolvm::smolfile::parse_allow_udp, value_name = "CIDR[:PORT[-END]]", help_heading = "Network", help = "Allow UDP to a CIDR, optionally on one port or a range, also under an egress interceptor; checked after every deny, DNS keeps its own path (can be used multiple times, implies --net)")]
     pub allow_udp: Vec<smolvm_protocol::EgressRule>,
@@ -1533,7 +1545,7 @@ impl RunCmd {
         // `--dns-option` is CLI-only (a Smolfile has no resolver options key).
         params.dns_options = self.dns_option.clone();
         params.shm_size = self.shm_size.clone();
-        params.prepend_deny_cidrs(&self.deny_cidr);
+        params.apply_egress_denies(&self.deny_cidr, &self.allow_tcp, &self.deny_tcp_port);
         params.append_allow_udp(&self.allow_udp);
         // `build_create_params` fills resources from the Smolfile, so a CLI-only
         // flag has to be merged here or it never reaches the record.
@@ -3750,6 +3762,139 @@ mod tests {
     }
 
     #[test]
+    fn deny_tcp_port_and_allow_tcp_are_parsed_on_run_create_and_update() {
+        use smolvm::config::VmRecord;
+
+        let denied: Vec<smolvm_protocol::PortRange> = ["25", "465", "587"]
+            .iter()
+            .map(|spec| smolvm::smolfile::parse_port_range(spec).unwrap())
+            .collect();
+        let exception = smolvm::smolfile::parse_allow_tcp("203.0.113.0/24:587").unwrap();
+
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "run",
+            "--deny-tcp-port",
+            "25",
+            "--deny-tcp-port",
+            "465",
+            "--deny-tcp-port",
+            "587",
+            "--allow-tcp",
+            "203.0.113.0/24:587",
+            "--",
+            "true",
+        ]);
+        let MachineCmd::Run(cmd) = cli.command else {
+            panic!("expected machine run command");
+        };
+        assert_eq!(cmd.deny_tcp_port, denied);
+        assert_eq!(cmd.allow_tcp, vec![exception.clone()]);
+
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "create",
+            "--name",
+            "mail",
+            "--deny-tcp-port",
+            "25-587",
+            "--allow-tcp",
+            "203.0.113.0/24:587",
+        ]);
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create command");
+        };
+        assert_eq!(
+            cmd.deny_tcp_port,
+            vec![smolvm::smolfile::parse_port_range("25-587").unwrap()]
+        );
+        assert_eq!(cmd.allow_tcp, vec![exception.clone()]);
+
+        let parse_update = |argv: &[&str]| {
+            let cli = TestMachineCli::parse_from(argv);
+            let MachineCmd::Update(cmd) = cli.command else {
+                panic!("expected machine update command");
+            };
+            cmd
+        };
+        // An existing CIDR deny stays first; the TCP exception comes next,
+        // and the port deny precedes the pre-existing allow.
+        let cidr_deny = smolvm_protocol::EgressRule {
+            transport: None,
+            cidr: Some("10.0.0.0/8".to_string()),
+            ports: None,
+            action: smolvm_protocol::RuleAction::Deny,
+        };
+        let existing_allow = smolvm_protocol::EgressRule {
+            transport: None,
+            cidr: Some("198.51.100.0/24".to_string()),
+            ports: None,
+            action: smolvm_protocol::RuleAction::Allow,
+        };
+        let mut record = VmRecord::new("mail".to_string(), 1, 512, vec![], vec![], true);
+        record.egress_rules = vec![cidr_deny.clone(), existing_allow.clone()];
+
+        let cmd = parse_update(&[
+            "machine",
+            "update",
+            "--name",
+            "mail",
+            "--deny-tcp-port",
+            "25-587",
+            "--allow-tcp",
+            "203.0.113.0/24:587",
+        ]);
+        assert!(cmd.changes_only_egress());
+        let next = cmd.next_egress(&record).unwrap().unwrap();
+        assert_eq!(
+            next.egress_rules,
+            vec![
+                cidr_deny,
+                exception,
+                smolvm::smolfile::deny_tcp_port_rules(&[smolvm::smolfile::parse_port_range(
+                    "25-587"
+                )
+                .unwrap()])[0]
+                    .clone(),
+                existing_allow,
+            ]
+        );
+        assert!(next.network);
+
+        for argv in [
+            &["machine", "run", "--deny-tcp-port", "0"][..],
+            &["machine", "create", "--deny-tcp-port", "25-465-587"][..],
+            &[
+                "machine",
+                "update",
+                "--name",
+                "mail",
+                "--deny-tcp-port",
+                "587-465",
+            ][..],
+            &[
+                "machine",
+                "update",
+                "--name",
+                "mail",
+                "--allow-tcp",
+                "1.1.1.1:0",
+            ][..],
+            &[
+                "machine",
+                "update",
+                "--name",
+                "mail",
+                "--no-net",
+                "--deny-tcp-port",
+                "25",
+            ][..],
+        ] {
+            assert!(TestMachineCli::try_parse_from(argv).is_err(), "{argv:?}");
+        }
+    }
+
+    #[test]
     fn update_outbound_localhost_only_adds_the_loopback_cidrs() {
         use smolvm::config::VmRecord;
 
@@ -4655,6 +4800,18 @@ pub struct CreateCmd {
     #[arg(long = "deny-cidr", value_parser = parse_cidr, value_name = "CIDR")]
     pub deny_cidr: Vec<String>,
 
+    /// Deny TCP egress to a destination port or range on every address, IPv4 and IPv6
+    /// (can be used multiple times, implies --net). Checked after --deny-cidr and
+    /// before every allow; --allow-tcp carves a scoped exception.
+    #[arg(long = "deny-tcp-port", value_parser = smolvm::smolfile::parse_port_range, value_name = "PORT[-END]")]
+    pub deny_tcp_port: Vec<smolvm_protocol::PortRange>,
+
+    /// Allow TCP egress to a CIDR, optionally on one port or a range, ahead of
+    /// --deny-tcp-port (can be used multiple times, implies --net). Unlike
+    /// --deny-cidr, which stays absolute.
+    #[arg(long = "allow-tcp", value_parser = smolvm::smolfile::parse_allow_tcp, value_name = "CIDR[:PORT[-END]]")]
+    pub allow_tcp: Vec<smolvm_protocol::EgressRule>,
+
     #[arg(long = "allow-udp", value_parser = smolvm::smolfile::parse_allow_udp, value_name = "CIDR[:PORT[-END]]", help = "Allow UDP to a CIDR, optionally on one port or a range, also under an egress interceptor; checked after every deny, DNS keeps its own path (can be used multiple times, implies --net)")]
     pub allow_udp: Vec<smolvm_protocol::EgressRule>,
 
@@ -5000,7 +5157,7 @@ impl CreateCmd {
         // `--dns-option` is CLI-only (a Smolfile has no resolver options key).
         params.dns_options = self.dns_option.clone();
         params.shm_size = self.shm_size.clone();
-        params.prepend_deny_cidrs(&self.deny_cidr);
+        params.apply_egress_denies(&self.deny_cidr, &self.allow_tcp, &self.deny_tcp_port);
         params.append_allow_udp(&self.allow_udp);
         // `build_create_params` fills resources from the Smolfile, so a CLI-only
         // flag has to be merged here or it never reaches the record.
@@ -5540,7 +5697,7 @@ impl CreateCmd {
                     .is_some_and(|checkpoint| checkpoint.packed_layers.is_some()))
             .then_some(canonical_path),
         };
-        params.prepend_deny_cidrs(&self.deny_cidr);
+        params.apply_egress_denies(&self.deny_cidr, &self.allow_tcp, &self.deny_tcp_port);
         params.append_allow_udp(&self.allow_udp);
         merge_cli_credentials(&mut params, &self.credential)?;
 
@@ -5812,6 +5969,13 @@ pub struct StartCmd {
     #[arg(long = "no-workload", hide = true)]
     pub no_workload: bool,
 
+    /// Deny TCP egress to a destination port or range on every address before
+    /// starting, as `machine create --deny-tcp-port` records it (repeatable).
+    /// Applied only to a machine whose record already has networking on: this
+    /// flag must never turn an offline machine online.
+    #[arg(long = "deny-tcp-port", value_parser = smolvm::smolfile::parse_port_range, value_name = "PORT[-END]")]
+    pub deny_tcp_port: Vec<smolvm_protocol::PortRange>,
+
     /// Read registry credentials for the first start's image pull as one JSON
     /// line (`{"username":…,"password":…}`) on stdin. Used by the image seed
     /// builder for a private image whose credentials came with an API start;
@@ -5855,6 +6019,9 @@ impl StartCmd {
         )?;
         let explicit_name = self.name.is_some();
         let name = self.name.unwrap_or_else(|| "default".to_string());
+        if !self.deny_tcp_port.is_empty() {
+            vm_common::apply_start_deny_tcp_ports(&name, &self.deny_tcp_port)?;
+        }
         let proxy = self.proxy_opts.resolved_proxy()?;
         let no_proxy = self.proxy_opts.no_proxy();
         let registry_auth = if self.registry_auth_stdin {
@@ -6848,6 +7015,28 @@ pub struct UpdateCmd {
     #[arg(long = "remove-allow-cidr", value_parser = parse_cidr, value_name = "CIDR")]
     pub remove_allow_cidr: Vec<String>,
 
+    /// Deny TCP egress to a destination port or range on every address, IPv4
+    /// and IPv6, as `machine create --deny-tcp-port` does (can be used
+    /// multiple times).
+    #[arg(
+        long = "deny-tcp-port",
+        value_parser = smolvm::smolfile::parse_port_range,
+        value_name = "PORT[-END]",
+        conflicts_with = "no_net"
+    )]
+    pub deny_tcp_port: Vec<smolvm_protocol::PortRange>,
+
+    /// Allow TCP egress to a CIDR, optionally on one port or a range, ahead of
+    /// --deny-tcp-port, as `machine create --allow-tcp` does (can be used
+    /// multiple times).
+    #[arg(
+        long = "allow-tcp",
+        value_parser = smolvm::smolfile::parse_allow_tcp,
+        value_name = "CIDR[:PORT[-END]]",
+        conflicts_with = "no_net"
+    )]
+    pub allow_tcp: Vec<smolvm_protocol::EgressRule>,
+
     #[arg(
         long = "allow-udp",
         value_parser = smolvm::smolfile::parse_allow_udp,
@@ -6955,6 +7144,8 @@ impl UpdateCmd {
             outbound_localhost_only: self.outbound_localhost_only,
             allow_all: self.net,
             reset_allow_list: self.reset_allow_list,
+            allow_tcp: self.allow_tcp.clone(),
+            deny_tcp_ports: self.deny_tcp_port.clone(),
             allow_udp: self.allow_udp.clone(),
             remove_allow_udp: self.remove_allow_udp.clone(),
         })
@@ -6991,6 +7182,8 @@ impl UpdateCmd {
             outbound_localhost_only,
             remove_allow_host,
             remove_allow_cidr,
+            deny_tcp_port,
+            allow_tcp,
             allow_udp,
             remove_allow_udp,
             reset_allow_list,
@@ -7016,6 +7209,8 @@ impl UpdateCmd {
             || !allow_cidr.is_empty()
             || !remove_allow_host.is_empty()
             || !remove_allow_cidr.is_empty()
+            || !deny_tcp_port.is_empty()
+            || !allow_tcp.is_empty()
             || !allow_udp.is_empty()
             || !remove_allow_udp.is_empty()
             || *reset_allow_list;
