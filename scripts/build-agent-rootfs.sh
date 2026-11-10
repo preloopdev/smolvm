@@ -395,6 +395,16 @@ normalize_owner_only_modes() {
     # known paths and hard-failing on the rest means a later Alpine bump that adds
     # a fifth one stops the build here — instead of shipping a rootfs that cannot
     # be packed, or widening something nobody looked at.
+    #
+    # macOS builds install packages through `smolvm machine run -v`: the
+    # virtiofs mount writes every guest-created file with the host builder's
+    # mode, so ordinary 0644 package files land as 0600 and this check fails.
+    # The tree is a fresh Alpine artifact with no secrets (the build installs
+    # none), so widen it wholesale there; the named paths above are widened
+    # either way.
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        chmod -R a+rX "$rootfs_dir"
+    fi
     local owner_only
     owner_only="$(find "$rootfs_dir" \
         \( -type f ! -perm -o=r \) -o \( -type d ! -perm -o=rx \) 2>/dev/null || true)"
