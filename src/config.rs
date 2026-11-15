@@ -396,12 +396,24 @@ pub struct EgressUpdate {
     pub allow_udp: Vec<smolvm_protocol::EgressRule>,
     #[allow(missing_docs)]
     pub remove_allow_udp: Vec<smolvm_protocol::EgressRule>,
+    /// Scoped TCP allow exceptions, evaluated ahead of [`Self::deny_tcp_ports`].
+    #[allow(missing_docs)]
+    pub allow_tcp: Vec<smolvm_protocol::EgressRule>,
+    /// TCP destination-port ranges denied on every address.
+    #[allow(missing_docs)]
+    pub deny_tcp_ports: Vec<smolvm_protocol::PortRange>,
 }
 
 impl EgressUpdate {
     #[allow(missing_docs)]
     pub fn changes_udp_rules(&self) -> bool {
         !self.allow_udp.is_empty() || !self.remove_allow_udp.is_empty()
+    }
+
+    /// Whether this update changes the ordered TCP rules (allow exceptions or
+    /// the destination-port deny).
+    pub fn changes_tcp_rules(&self) -> bool {
+        !self.allow_tcp.is_empty() || !self.deny_tcp_ports.is_empty()
     }
 
     /// Whether this update changes nothing.
@@ -414,6 +426,7 @@ impl EgressUpdate {
             && self.remove_allow_cidrs.is_empty()
             && !self.reset_allow_list
             && !self.changes_udp_rules()
+            && !self.changes_tcp_rules()
     }
 }
 
@@ -1606,6 +1619,58 @@ impl VmRecord {
             }
         }
 
+        let is_tcp_allow = |rule: &smolvm_protocol::EgressRule| {
+            rule.transport == Some(smolvm_protocol::FlowTransport::Tcp)
+                && rule.action == smolvm_protocol::RuleAction::Allow
+                && rule.cidr.is_some()
+        };
+        let is_port_deny = |rule: &smolvm_protocol::EgressRule| {
+            rule.transport == Some(smolvm_protocol::FlowTransport::Tcp)
+                && rule.action == smolvm_protocol::RuleAction::Deny
+                && rule.cidr.is_none()
+                && rule.ports.is_some()
+        };
+        for rule in &update.allow_tcp {
+            if !is_tcp_allow(rule) {
+                return Err(crate::Error::config(
+                    "allow tcp",
+                    "a TCP allow must have the TCP transport, a CIDR and the allow action",
+                ));
+            }
+            if rules.contains(rule) {
+                continue;
+            }
+            // The exception must be evaluated before the port deny it carves
+            // out of, and before any other allow rule.
+            let position = rules
+                .iter()
+                .position(is_port_deny)
+                .or_else(|| {
+                    rules
+                        .iter()
+                        .position(|stored| stored.action == smolvm_protocol::RuleAction::Allow)
+                })
+                .unwrap_or(rules.len());
+            rules.insert(position, rule.clone());
+        }
+        if !update.deny_tcp_ports.is_empty() {
+            // Keep deny-CIDR and allow-TCP prefixes ahead: a port-level deny
+            // starts where the unconstrained allow rules start.
+            let mut position = rules
+                .iter()
+                .position(|stored| {
+                    !((stored.action == smolvm_protocol::RuleAction::Deny && stored.cidr.is_some())
+                        || is_tcp_allow(stored))
+                })
+                .unwrap_or(rules.len());
+            for rule in crate::smolfile::deny_tcp_port_rules(&update.deny_tcp_ports) {
+                if !rules.contains(&rule) {
+                    rules.insert(position, rule);
+                    position += 1;
+                }
+            }
+        }
+
         if was_restricted && hosts.is_empty() && cidrs.is_empty() && !update.allow_all {
             return Err(crate::Error::config(
                 "update",
@@ -1861,6 +1926,77 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(removed.egress_rules, vec![deny.clone()]);
+    }
+
+    #[test]
+    fn updated_egress_puts_tcp_exceptions_before_the_port_deny_and_other_allows() {
+        let mut record = VmRecord::new("mail".to_string(), 1, 512, vec![], vec![], true);
+        let cidr_deny = smolvm_protocol::EgressRule {
+            transport: None,
+            cidr: Some("10.0.0.0/8".to_string()),
+            ports: None,
+            action: smolvm_protocol::RuleAction::Deny,
+        };
+        let existing_allow = smolvm_protocol::EgressRule {
+            transport: None,
+            cidr: Some("198.51.100.0/24".to_string()),
+            ports: None,
+            action: smolvm_protocol::RuleAction::Allow,
+        };
+        record.egress_rules = vec![cidr_deny.clone(), existing_allow.clone()];
+
+        let exception = crate::smolfile::parse_allow_tcp("203.0.113.0/24:587").unwrap();
+        let port_deny = crate::smolfile::deny_tcp_port_rules(&[
+            crate::smolfile::parse_port_range("25").unwrap(),
+            crate::smolfile::parse_port_range("465").unwrap(),
+            crate::smolfile::parse_port_range("587").unwrap(),
+        ]);
+        let next = record
+            .updated_egress(&EgressUpdate {
+                allow_tcp: vec![exception.clone(), exception.clone()],
+                deny_tcp_ports: vec![
+                    crate::smolfile::parse_port_range("25").unwrap(),
+                    crate::smolfile::parse_port_range("465").unwrap(),
+                    crate::smolfile::parse_port_range("587").unwrap(),
+                ],
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+        let mut expected = vec![cidr_deny, exception];
+        expected.extend(port_deny);
+        expected.push(existing_allow);
+        assert_eq!(next.egress_rules, expected);
+        assert!(next.network);
+
+        // Repeating the same update is idempotent.
+        let again = next
+            .updated_egress(&EgressUpdate {
+                allow_tcp: vec![crate::smolfile::parse_allow_tcp("203.0.113.0/24:587").unwrap()],
+                deny_tcp_ports: vec![crate::smolfile::parse_port_range("25").unwrap()],
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.egress_rules, expected);
+
+        // An allow with no CIDR is not a scoped exception.
+        let err = record
+            .updated_egress(&EgressUpdate {
+                allow_tcp: vec![smolvm_protocol::EgressRule {
+                    transport: Some(smolvm_protocol::FlowTransport::Tcp),
+                    cidr: None,
+                    ports: Some(smolvm_protocol::PortRange {
+                        start: 587,
+                        end: 587,
+                    }),
+                    action: smolvm_protocol::RuleAction::Allow,
+                }],
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("CIDR"), "{err}");
     }
 
     #[test]

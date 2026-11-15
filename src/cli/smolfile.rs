@@ -873,7 +873,7 @@ init = ["echo init"]
 
         let mut params = build_from_smolfile(path).unwrap();
         assert!(params.net, "a deny list implies networking");
-        params.prepend_deny_cidrs(&["192.168.0.0/16".to_string()]);
+        params.apply_egress_denies(&["192.168.0.0/16".to_string()], &[], &[]);
 
         let cidrs: Vec<_> = params
             .egress_rules
@@ -918,7 +918,7 @@ init = ["echo init"]
 
         let mut params = build_from_smolfile(path).unwrap();
         assert!(params.net, "a UDP allow implies networking");
-        params.prepend_deny_cidrs(&["192.168.0.0/16".to_string()]);
+        params.apply_egress_denies(&["192.168.0.0/16".to_string()], &[], &[]);
         params
             .append_allow_udp(&[smolvm::smolfile::parse_allow_udp("203.0.113.0/24:443").unwrap()]);
 

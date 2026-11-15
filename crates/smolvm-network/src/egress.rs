@@ -1123,6 +1123,59 @@ mod tests {
     }
 
     #[test]
+    fn tcp_port_deny_covers_ipv4_ipv6_and_yields_to_a_scoped_exception() {
+        use smolvm_protocol::{EgressRule, FlowTransport, PortRange, RuleAction};
+        let ip = |s: &str| -> std::net::IpAddr { s.parse().unwrap() };
+        let deny = |port: u16| EgressRule {
+            transport: Some(FlowTransport::Tcp),
+            cidr: None,
+            ports: Some(PortRange {
+                start: port,
+                end: port,
+            }),
+            action: RuleAction::Deny,
+        };
+        let exception = EgressRule {
+            transport: Some(FlowTransport::Tcp),
+            cidr: Some("203.0.113.0/24".into()),
+            ports: Some(PortRange {
+                start: 587,
+                end: 587,
+            }),
+            action: RuleAction::Allow,
+        };
+        // Preloop's order: the operator exception first, then the port floor.
+        let policy = EgressPolicy::unrestricted()
+            .with_rules(&[exception, deny(25), deny(465), deny(587)])
+            .unwrap();
+        for destination in ["1.1.1.1", "2001:db8::1", "::ffff:1.1.1.1"] {
+            for port in [25u16, 465, 587] {
+                assert!(
+                    !policy.allows_flow(FlowTransport::Tcp, ip(destination), Some(port)),
+                    "{destination}:{port} must be denied"
+                );
+            }
+            assert!(
+                policy.allows_flow(FlowTransport::Tcp, ip(destination), Some(443)),
+                "only the denied ports are affected"
+            );
+            assert!(
+                policy.allows_flow(FlowTransport::Udp, ip(destination), Some(25)),
+                "the deny is TCP-only"
+            );
+        }
+        assert!(
+            policy.allows_flow(FlowTransport::Tcp, ip("203.0.113.9"), Some(587)),
+            "the operator's scoped exception wins over the port deny"
+        );
+        assert!(!policy.allows_flow(FlowTransport::Tcp, ip("203.0.114.9"), Some(587)));
+        assert!(
+            !policy.allows_flow(FlowTransport::Tcp, ip("2001:db8::9"), Some(587)),
+            "the exception is the CIDR that was named, not every IPv6 address"
+        );
+    }
+
+    #[test]
     fn invalid_rules_fail_launch_and_strict_floor_cannot_be_overridden() {
         use smolvm_protocol::{EgressRule, FlowTransport, PortRange, RuleAction};
         let allow = |cidr: &str| EgressRule {
